@@ -19,5 +19,22 @@ FetchContent_Declare(doctest
 )
 FetchContent_MakeAvailable(doctest)
 
-# Additional deps are fetched as their modules need them (Decision 04+).
-# Keeping the initial dependency graph minimal to prove the build works first.
+# ---- fmt — string formatting (bridge until std::format is universal) --------
+FetchContent_Declare(fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG        11.1.1
+    GIT_SHALLOW    ON
+    SYSTEM
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(fmt)
+
+# ---- expected-lite — C++20-compatible std::expected ------------------------
+FetchContent_Declare(expected_lite
+    GIT_REPOSITORY https://github.com/martinmoene/expected-lite.git
+    GIT_TAG        v0.9.0
+    GIT_SHALLOW    ON
+    SYSTEM
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(expected_lite)
