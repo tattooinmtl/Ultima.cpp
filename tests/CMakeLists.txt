@@ -6,12 +6,20 @@ add_executable(ultima_test
     unit/test_sanity.cpp
     unit/test_version.cpp
     unit/test_gguf_loader.cpp
+    unit/test_aligned_alloc.cpp
+    unit/test_tensor.cpp
+    unit/test_thread_pool.cpp
+    unit/test_cpu_features.cpp
+    unit/test_matvec.cpp
 )
 
 target_link_libraries(ultima_test
     PRIVATE
         ultima_core
         ultima_model
+        ultima_tensor
+        ultima_runtime
+        ultima_kernels
         ultima_warnings
         doctest::doctest
 )

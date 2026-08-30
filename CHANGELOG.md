@@ -26,3 +26,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   - Dependencies added: `fmt` 11.1.1, `expected-lite` v0.9.0 (both vendored, pinned, via FetchContent).
   - 7 unit tests covering: valid load, bad magic, unsupported version, truncated file, split-file naming rejected, missing required key, inspect summary.
   - All tests pass (11/11), no warnings under `/W4 /WX`, taboo gate clean.
+- **M1 chunk 1: tensor engine foundations** (per Decision 05)
+  - `include/ultima/tensor/aligned_alloc.hpp` + `.cpp` — 64-byte-aligned allocator (Windows `_aligned_malloc`, POSIX `posix_memalign`), typed `aligned_alloc_n<T>` helper, `AlignedDeleter` for `unique_ptr`.
+  - `include/ultima/tensor/tensor.hpp` + `.cpp` — `Tensor` class with two storage modes: Owned (mutable, aligned heap) and View (immutable wrapper for mmap'd weights). Move-only, RAII.
+  - `include/ultima/runtime/thread_pool.hpp` + `.cpp` — fixed-size worker pool with blocking `parallel_for(n, work_fn)`. No OpenMP/TBB dependency.
+  - `include/ultima/kernels/cpu_features.hpp` + `.cpp` — `__cpuid`-based feature detection (AVX2, FMA, AVX-512F, SSE2, brand string), cached, thread-safe. `require_v01_baseline_or_die()` for startup gating.
+  - `include/ultima/kernels/matvec.hpp` — kernel declarations
+  - `src/kernels/matvec_f32_f32.cpp` — first kernel: scalar oracle + AVX2+FMA path (8-lane FMA with horizontal reduction, scalar tail) + public dispatcher. `/arch:AVX2` scoped to `src/kernels/` only.
+  - New static libs: `ultima_tensor`, `ultima_runtime`, `ultima_kernels`
+  - 19 new tests: alignment guarantees, calloc zeroing, view immutability, move semantics, parallel-for correctness, no-op safety, CPU feature detection, dispatcher/scalar/AVX2 equivalence with random inputs (max abs err <1e-4).
+  - All 30 tests pass total. Warnings-clean.
