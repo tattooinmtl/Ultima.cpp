@@ -1737,12 +1737,204 @@ Override points:
 
 Say **"go"** and I'll start M1 implementation (aligned allocator + thread pool + Tensor + `cpu_features` + first scalar-only kernel with round-trip test) in the next reply.
 
+# Decision 09 — KV cache & prefix reuse policy
+
+## Scope
+
+Every token generation call the transformer runs has to (a) find or allocate storage for the attention keys/values across all layers, (b) reuse whatever prefix already sits in that storage instead of recomputing it, and (c) release the storage when the session ends. This decision fixes the layout, the reuse model, the persistence story, and what we defer. Wrong choices here get expensive fast: the KV cache is by far the largest live allocation at runtime, and prefix reuse is the single biggest win for chat-style workloads (system prompt + history is identical turn-to-turn).
+
+Ownership: `kv_cache/` subsystem (spec §13). Required before M5 (streaming server). Design in place before M4 (transformer runtime) so the runtime writes to the right shapes on day one.
+
+## 9.1 — What "KV cache" means here
+
+At each transformer layer we compute two tensors per input token:
+- **K**: shape `[n_kv_heads, head_dim]` (Grouped-Query Attention — Qwen2/Qwen3 both use GQA, `n_kv_heads < n_heads`).
+- **V**: shape `[n_kv_heads, head_dim]`.
+
+Attention at position `t` reads **all** K/V from positions `0..t` in the same layer. If we recomputed them for every generated token, generation would be O(t²) per token. The KV cache is the standard fix: append K/V once when a token is first processed, then read the whole prefix on every subsequent step.
+
+The prefix-reuse question is orthogonal but shares the same buffer: if the *user's* next request begins with the same tokens as a previous one, the K/V for those tokens is already valid — we just point `pos` at the end of the match and prefill only the suffix.
+
+## 9.2 — Storage layout
+
+**Per layer, per slot, two contiguous tensors:**
+
+```
+K[layer]  : shape [n_kv_heads, n_ctx, head_dim]  dtype = f16 (default) or q8_0
+V[layer]  : shape [n_kv_heads, n_ctx, head_dim]  dtype = f16 (default) or q8_0
+```
+
+- **Time axis in the middle, not innermost.** Appending token at position `pos` writes one `[n_kv_heads, head_dim]` slab. Reading position range `[0, pos)` for attention reads a contiguous stripe per head. This matches how attention actually consumes the cache and gives us dense inner loops for the matmul.
+- **No paging in v0.1.** Each slot reserves `n_ctx` positions at allocation time. Simpler, no fragmentation, worst-case predictable. Paged attention (vLLM-style block manager) is a v0.3+ concern under long-context work.
+- **Row-major, contiguous, 64-byte aligned** (Decision 05).
+- **KV storage is owned (not mmap)** — the mmap distinction in Decision 05 §5.5 is for weights only. `Tensor` in "owned buffer" mode.
+
+**Sizing formula** (per slot):
+```
+bytes = 2 * n_layers * n_kv_heads * head_dim * n_ctx * dtype_bytes
+```
+
+Reference: Qwen2-7B (n_layers=28, n_kv_heads=4, head_dim=128) at n_ctx=4096, fp16 → **~117 MB / slot**. At n_ctx=32k → ~940 MB / slot. Ryzen 7 5700U reference box (32 GB DDR4) handles a few 4k slots comfortably; long-context slots need Q8_0 KV (see §9.5).
+
+## 9.3 — Slots
+
+**A slot is one allocated KV cache** (all layers, both K and V) plus the metadata needed to reuse or evict it. One slot per concurrent active session.
+
+- **CLI:** 1 slot, allocated at model load, sized to the launcher's `n_ctx` setting.
+- **Server (M5+):** N slots, launcher-configured. **Hard default `N = 2`** on the reference box (single-user + editor-bridge / MCP client). Sizing heuristic (`floor((RAM_budget - weights - overhead) / bytes_per_slot)`) exposed as a "compute slots" button in the launcher for users who want it. All slots pre-allocated at model load — no runtime growth. Rejecting a new session because slots are full is a valid response; oversubscribing memory is not.
+- **Eviction between sessions:** LRU. When a request arrives and no slot is free, the least-recently-used slot's token-id vector is discarded and the slot is reassigned. The K/V buffers are reused in place (no memset — the new prefill overwrites what it needs).
+
+**Metadata per slot:**
+```cpp
+struct KVSlot {
+    std::vector<TokenId> tokens;   // exact token ids currently valid in this slot
+    std::size_t          pos;      // number of valid positions (== tokens.size())
+    SessionId            owner;    // opaque; nullopt when free
+    std::uint64_t        touched_at; // monotonic counter for LRU
+    // K, V buffers live in a side allocation, one pair per layer
+};
+```
+
+## 9.4 — Prefix reuse (the "prompt cache")
+
+**In-session reuse** (same slot, next turn):
+
+1. Tokenize the new full prompt → `new_tokens`.
+2. Find the longest common prefix between `slot.tokens` and `new_tokens`. Call its length `lcp`.
+3. Truncate: `slot.pos = lcp`. The K/V beyond `lcp` is stale but not zeroed — subsequent writes overwrite it.
+4. Prefill only positions `[lcp, new_tokens.size())`. Generate as normal.
+
+This alone eliminates re-processing the system prompt + prior turns for chat workloads. Every mainstream runtime does this; it's the highest-leverage single feature in this whole decision.
+
+**Cross-session reuse** (v0.1, config flag, **off by default**):
+
+Persistent disk store keyed by `(model_id, tokenizer_hash, block_index, block_hash)`:
+- Split the token stream into fixed 256-token blocks.
+- Hash each block's token ids (xxhash64) → `block_hash`.
+- On prefill, look up each leading block; if present, mmap the K/V slab and copy it into the slot. Stop at the first miss.
+- On generation completion, write any new fully-formed blocks back.
+
+**Store layout:**
+```
+$ULTIMA_DATA/kv_cache/<model_id>/
+    index.sqlite               (rowid → (block_hash, layer, offset, len))
+    blocks/00/xx/xxxx.bin      (mmap'd K/V slabs, sharded by first hash bytes)
+```
+
+**Bounds:** on-disk size capped by config (default 8 GB per model). LRU eviction at the block level. Never grows unbounded.
+
+**Invalidation triggers** (drop the whole store for a `model_id`):
+- Model file swapped (mtime/size change on the GGUF).
+- Tokenizer changed (`tokenizer_hash` mismatch on load — hash of the tokenizer vocab + merges).
+- KV dtype changed (fp16 ↔ q8_0 mixing is not safe).
+
+**What does NOT invalidate reuse** (KV cache is pre-sampler):
+- Sampling parameters (temperature, top_p, top_k, min_p, repetition penalty).
+- RNG seed.
+- Max tokens / stop sequences.
+- Streaming vs. non-streaming.
+
+## 9.5 — KV dtype: fp16 and Q8_0 both in v0.1
+
+- **fp16:** default when the loaded weight file uses fp16 or Q8_0 tensors (small models, oracle runs). One dtype path, no per-block dequant on attention read.
+- **Q8_0:** default when the loaded weight file uses **any 4-bit K-quant** (Q4_K_M, Q4_K_S). Halves KV memory (117 MB → 60 MB per slot at Qwen2-7B/4k, ~470 MB at 32k). On the reference box (32 GB, no dGPU, 4-bit quants as the primary target) this is what makes long context practical; quality cost is small and dominated by the 4-bit weight noise anyway.
+- **Auto-selection** based on file quant class; launcher slider can override to `fp16` for correctness debugging.
+- **No fp8** — no portable CPU fp8; revisit with GPU backends.
+- Attention read path handles both dtypes via the same kernel entry point (`attn_read_kv`); the Q8_0 variant fuses dequant into the softmax-input dot product (mirror of the Decision 05 §5.4 fused-dequant policy).
+
+## 9.6 — Long context & RoPE scaling
+
+Qwen2 ships with `n_ctx_train = 32768`. Qwen3 ships with YaRN scaling metadata in GGUF for extending beyond `n_ctx_train`.
+
+- **Default:** cap `n_ctx` at `n_ctx_train`. Loud error if the launcher asks for more without YaRN metadata in the GGUF — never silently clamp (silent clamping produces confusing tokens-per-second numbers and broken long-doc behavior; the user needs to know their request wasn't honored).
+- **YaRN:** if the GGUF declares `rope.scaling.type = yarn`, apply the YaRN factors in the RoPE kernel (Decision 05 §5.4 reserved `rope.hpp` as an entry point; the Qwen3 variant lands with Decision 06).
+- **Sliding window attention:** deferred to v0.3. Qwen2/Qwen3 base models don't use it; Mistral-style windowed attention is a per-architecture toggle we can add when we support such a model.
+
+## 9.7 — API sketch
+
+```cpp
+namespace ultima::kv_cache {
+
+class KVCache {
+public:
+    struct Config {
+        std::size_t n_slots;
+        std::size_t n_ctx;
+        std::size_t n_layers;
+        std::size_t n_kv_heads;
+        std::size_t head_dim;
+        DType       dtype;            // fp16 or q8_0
+    };
+
+    explicit KVCache(const Config&);   // allocates all slots up front
+
+    // Acquire (or steal via LRU) a slot for this session, returning its handle.
+    SlotHandle acquire(SessionId);
+
+    // Longest common prefix of the slot's current tokens and `new_tokens`.
+    // Truncates slot.pos to the LCP as a side effect.
+    std::size_t reuse_prefix(SlotHandle, std::span<const TokenId> new_tokens);
+
+    // Write one token's K/V into the slot at slot.pos, then increment pos.
+    void append(SlotHandle, std::size_t layer, KVView k, KVView v);
+
+    // Read positions [0, slot.pos) for attention at the given layer.
+    KVReadView read(SlotHandle, std::size_t layer) const;
+
+    void release(SlotHandle);
+};
+
+} // namespace ultima::kv_cache
+```
+
+The transformer runtime (Decision 06) is the only caller. The server (M5) never touches `KVCache` directly — it hands the runtime a `SessionId` and lets the runtime pick the slot.
+
+## 9.8 — File layout added at M4
+
+```
+include/ultima/kv_cache/
+    kv_cache.hpp
+    kv_slot.hpp
+    prefix_store.hpp        (persistent block store; off by default)
+
+src/kv_cache/
+    CMakeLists.txt
+    kv_cache.cpp
+    prefix_store.cpp
+
+tests/unit/
+    test_kv_cache_slot.cpp
+    test_prefix_reuse.cpp
+    test_prefix_store.cpp
+```
+
+## 9.9 — What we explicitly defer
+
+- **Paged / block-manager KV** (vLLM-style). Requires attention-kernel changes and a memory manager. v0.3+, tied to long-context work.
+- **Cross-request batching** (sharing prefill work across concurrent requests). v0.3+.
+- **fp8 KV.** No portable CPU fp8; revisit with GPU backends.
+- **Sliding-window attention.** Per-architecture; add with the first model that needs it.
+- **Speculative decoding cache interactions.** Draft-model slot in the registry already reserved (Decision 01e); KV interactions defined when speculative decoding lands.
+- **Live cache introspection / eviction API for tools.** Diagnostic dumps only in v0.1.
+
+## 9.10 — Locked settings (reference box: Ryzen 7 5700U, 32 GB, no dGPU, 4-bit quants primary)
+
+All four override paths **are implemented in v0.1**. Defaults are tuned for this hardware and a single primary user; every default is a launcher-editable knob.
+
+| Setting | Default | Why this default here |
+|---|---|---|
+| **Cross-session persistent store** | **off** | Single user, one machine — hit rate is low across boots, and silent disk growth / stale-cache debugging outweighs the win. Flip on if disk is cheap and system prompts are stable. |
+| **KV dtype** | **auto from weight file** — fp16 for fp16/Q8_0 weights, **Q8_0 for Q4_K_M/Q4_K_S** | 4-bit quants are the primary target. Halving KV to Q8_0 turns "4k context, comfortable" into "16k context, comfortable" on 32 GB. Correctness cost is small relative to the 4-bit weight noise. |
+| **Server slot count** | **2** (single user + one MCP/editor client) | Sizing heuristic exists (`floor(...)`) as a launcher "compute" button for users on bigger boxes; 2 is what the reference box actually wants. |
+| **`n_ctx` above `n_ctx_train` without YaRN metadata** | **loud error** | Silent clamping produces confusing tok/s numbers and broken long-doc runs — user needs to know their request wasn't honored. |
+
+**Locked.** M4 transformer runtime targets this API. Ship-quality but tuned for the reference box; every default is one launcher toggle away from something else.
+
 ## Future decisions (not written yet)
 
 - Decision 06 — Model architecture layer (`IModel`, Qwen2Model, Qwen3Model dispatch) — required before M4
 - Decision 07 — Tokenizer strategy (BPE regex engine, chat template renderer) — required before M3
 - Decision 08 — Sampling
-- Decision 09 — KV cache + long-context (YaRN for Qwen3)
 - Decision 10 — Tools + MCP
 - Decision 11 — Skills
 - Decision 12 — Memory subsystem
