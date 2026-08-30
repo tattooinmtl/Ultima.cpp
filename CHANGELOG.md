@@ -36,3 +36,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   - New static libs: `ultima_tensor`, `ultima_runtime`, `ultima_kernels`
   - 19 new tests: alignment guarantees, calloc zeroing, view immutability, move semantics, parallel-for correctness, no-op safety, CPU feature detection, dispatcher/scalar/AVX2 equivalence with random inputs (max abs err <1e-4).
   - All 30 tests pass total. Warnings-clean.
+- **M1 chunk 2: element-wise, RMSNorm, softmax** (continues Decision 05)
+  - `include/ultima/kernels/elementwise.hpp` — `add_f32`, `mul_f32`, `silu_f32`, `swiglu_f32` (each with scalar oracle + best-available public variant).
+  - `include/ultima/kernels/norms.hpp` — `rmsnorm_f32`(scalar + AVX2). Two-pass: sum-of-squares reduction with FMA, then broadcast multiply.
+  - `include/ultima/kernels/softmax.hpp` — `softmax_f32` numerically stable (max-shift, exp, normalize).
+  - `src/kernels/elementwise.cpp` — AVX2 8-lane loops for add/mul (in-place safe). silu/swiglu use scalar `std::exp` (AVX2 polynomial deferred to v0.2).
+  - `src/kernels/rmsnorm.cpp` — AVX2 sum-of-squares + broadcast, scalar tail for `n % 8`.
+  - `src/kernels/softmax.cpp` — scalar 3-pass (max, exp, normalize). Vector expf deferred.
+  - 16 new tests (46 total): random unaligned equivalence, in-place safety (`y == x`), known small cases (silu(0)=0, uniform softmax=1/N), numerical stability (softmax of [100,101,102] does not overflow), SwiGLU = silu(gate) * up cross-check, RMSNorm known formula for `[1,2,3,4]`, RMSNorm on Qwen-shape `n=896`.
+  - All 46 tests pass. No warnings. Taboo gate clean.

@@ -11,6 +11,9 @@ add_executable(ultima_test
     unit/test_thread_pool.cpp
     unit/test_cpu_features.cpp
     unit/test_matvec.cpp
+    unit/test_elementwise.cpp
+    unit/test_rmsnorm.cpp
+    unit/test_softmax.cpp
 )
 
 target_link_libraries(ultima_test

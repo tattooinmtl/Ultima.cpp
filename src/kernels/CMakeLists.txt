@@ -1,6 +1,9 @@
 add_library(ultima_kernels STATIC
     cpu_features.cpp
     matvec_f32_f32.cpp
+    elementwise.cpp
+    rmsnorm.cpp
+    softmax.cpp
 )
 
 target_include_directories(ultima_kernels
