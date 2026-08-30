@@ -2701,7 +2701,157 @@ Build glue: a small CMake helper (`ultima_bundle_ui.cmake`) reads `ui/testpad/*`
 
 ---
 
-## Future decisions (not written yet)
+# Decision 13 — Adapter stub (LoRA hot-load)
 
-- Decision 13 — Adapter stub (LoRA hot-load)
-- Decision 15 — Editor-bridge reservation (edit-aware endpoints layered on Decision 14)
+## Scope
+
+LoRA adapters let a small delta file re-specialize a base model without retraining the full weights. Ultima's v0.1 coding models (Qwen2.5-Coder, Qwen3-Coder) don't need adapters day one — they're already fine-tuned — but the runtime API surface has to reserve a real seam so v0.2 can add per-project style adapters ("write in this codebase's idioms") without breaking every caller. This decision is a **stub**: the interface ships in v0.1, but the runtime only supports **load-time adapter merging**, not hot-swap. Hot-swap is v0.2.
+
+Ownership: `include/ultima/adapter/*.hpp` + `src/adapter/*.cpp`. Referenced by Decision 06 §6.8 (model layer) and Decision 01e (registry).
+
+## 13.1 — What ships in v0.1
+
+- **File format:** GGUF LoRA files (llama.cpp compatible). Same tooling ecosystem — `convert-lora-to-gguf.py` output loads straight in.
+- **Location:** `<ULTIMA_DATA>/adapters/<name>.gguf` (Windows: `%APPDATA%\Ultima\adapters\<name>.gguf`).
+- **Registry hook (Decision 01e):** each entry in the model registry may declare `adapter: "<name>"`. When present, the loader merges the adapter into the base weights **at load time** — result is a base+adapter combined tensor set in RAM. No adapter mixing at inference time.
+- **Interface:**
+
+  ```cpp
+  namespace ultima::adapter {
+
+  struct AdapterSpec {
+      std::string name;
+      std::filesystem::path path;
+      float alpha = 1.0f;   // scale factor from the GGUF; overridable per-model
+  };
+
+  class Adapter {
+  public:
+      // Load a single adapter into RAM. Small (typically 10–100 MB).
+      static std::unique_ptr<Adapter> load(const AdapterSpec&);
+
+      // Fold into the base tensor set at load time. Modifies the target in place.
+      void merge_into(model::TensorDirectory& base) const;
+
+      const AdapterSpec& spec() const noexcept;
+  };
+
+  } // namespace ultima::adapter
+  ```
+
+- **No runtime hot-swap.** Switching adapters means restarting the model load (launcher handles the reload). No "swap adapter mid-session" API — the interface deliberately omits it in v0.1 so we don't paint ourselves into a corner on how the swap interacts with active KV slots (Decision 09).
+
+## 13.2 — Why stub, not full
+
+- Qwen2.5-Coder-7B-Instruct and Qwen3-Coder cover the shipping coding workload without adapters (Decision 01, 01c).
+- The engineering cost of runtime hot-swap is real: it changes weight-tensor lifetimes, complicates the `IModel` (Decision 06) prefill/decode contract, and interacts with the KV cache (an adapter change *should* invalidate the cache the same way a model swap does — that's Decision 09 §9.4's model_id invalidation trigger, but per-adapter invalidation is a new axis).
+- v0.1 doesn't need any of that. v0.2 opens it with a cleaner "swap active adapter" API once we have real user demand.
+
+## 13.3 — Adapter validity check
+
+At load, verify:
+- Adapter's `general.architecture` matches the base model's (`qwen2` / `qwen3`).
+- Every adapter tensor's name maps to a real base tensor (via Decision 06 §6.5's `TensorSlot` table).
+- Rank + shape sanity on each `(A, B)` pair.
+
+Failure → loud error at load, base model still loads without the adapter (opt-in fail-open configurable in launcher, default fail-closed).
+
+## 13.4 — Files
+
+```
+include/ultima/adapter/
+    adapter.hpp
+
+src/adapter/
+    CMakeLists.txt
+    adapter.cpp
+    gguf_lora.cpp        (parse GGUF LoRA tensor pairs)
+```
+
+## 13.5 — Deferred (v0.2+)
+
+- Runtime hot-swap (switch adapter without model reload).
+- Multi-adapter stacking (`[adapter_a, adapter_b]` merged at load with per-adapter alphas).
+- Adapter training / fine-tuning inside Ultima (that's a Decision 20+ concern if we ever go there).
+- QLoRA-style quantized-base + fp16-adapter arithmetic — for v0.1 both live at the base's dtype after merge.
+
+## 13.6 — Locked
+
+v0.1 ships load-time GGUF LoRA merging behind `Adapter::load` + `merge_into`, gated by a per-model-registry `adapter:` field (Decision 01e). No hot-swap. Interface deliberately narrow so v0.2 can add hot-swap without breaking callers.
+
+---
+
+# Decision 15 — Editor-bridge reservation
+
+## Scope
+
+Ultima's endgame is an AI coding editor. Decision 14 ships the runtime's HTTP surface + a testpad; that surface is what every future editor plugin — VS Code, JetBrains, Zed, a bespoke Tauri front-end — talks to. This decision **reserves the URL space and JSON schemas** for the edit-aware endpoints so v0.1 external editor devs (including a future us) can code against a stable target, without Ultima having to implement them yet.
+
+Nothing here ships as working code in v0.1. Endpoints exist in the routing table returning **HTTP 501 Not Implemented** with a body that names the reserved endpoint and points at this decision. That way `curl` against them documents the intent, and any editor plugin that starts development early against the reserved schema won't need a URL migration when v0.2 turns the lights on.
+
+Ownership: `include/ultima/server/editor_bridge.hpp` (schemas + 501 stubs). Layered on Decision 14's HTTP server.
+
+## 15.1 — Reserved endpoints
+
+All under `/api/editor/*`. All return HTTP 501 in v0.1 with `{"status":"reserved","spec":"Decision 15","endpoint":"<path>"}`.
+
+| Method | Path                              | Purpose (v0.2 implementation) |
+|---|---|---|
+| POST   | `/api/editor/workspace/open`      | Associate a project root with the current session; server computes `project:<hash>` scope (Decision 12 §12.2) and returns it |
+| GET    | `/api/editor/workspace/state`     | Currently open files, cursor position, selection ranges (editor pushes on change) |
+| POST   | `/api/editor/edits/preview`       | Server returns a unified diff for a proposed change without touching disk |
+| POST   | `/api/editor/edits/apply`         | Server writes the diff to disk (respecting Decision 10 §10.3 permissions), returns applied hunks |
+| POST   | `/api/editor/diagnostics`         | Editor pushes compiler / LSP diagnostics; server injects them as `tool` messages so the model can react |
+| POST   | `/api/editor/completions/inline`  | Cursor-context completions ("finish this line") — separate from `/v1/chat/completions` because the request shape is completion-style (prefix + suffix), not chat |
+| WS     | `/api/editor/events`              | Bidirectional stream: file change, cursor move, buffer edit; server broadcasts model events (tool call, streaming token) |
+
+Two knobs are important upfront and belong to this decision, not the implementation:
+
+- **Scope pinning:** every editor-bridge request carries `X-Ultima-Workspace: <project_hash>` (issued by `/api/editor/workspace/open`). Server pins the KV slot to the project scope, so memory reads (Decision 12) auto-scope, KV prefix reuse (Decision 09 §9.4) doesn't cross-contaminate, and per-project skills (Decision 11 §11.2 root #1) surface first.
+- **Trust boundary:** editor-bridge endpoints are subject to Decision 14 §14.4's auth, plus an editor-specific origin allow-list (`vscode-webview://*`, `vscode-file://*`, `jetbrains://*`, `tauri://*`) so a random browser tab can't spoof edits.
+
+## 15.2 — v0.1 stub deliverable
+
+- `include/ultima/server/editor_bridge.hpp` declares `register_editor_bridge_stubs(HttpServer&)`.
+- `src/server/editor_bridge_stubs.cpp` implements it: registers every path above with the 501 handler.
+- `ui/testpad/` gains a **"Reserved endpoints"** collapsible panel listing them for discoverability.
+- A short spec document `docs/editor-bridge-spec.md` (written when v0.2 starts) will formalize request/response schemas. v0.1 ships only the URL reservation + a one-line description per endpoint.
+
+## 15.3 — Why reserve, not implement
+
+- v0.1's job is to *prove the .cpp runtime is worth building an editor on*. That's Decision 14's testpad and the llama.cpp head-to-head bench.
+- Every editor endpoint above needs a design pass wide enough to be its own decision (`edits/apply` has a whole permission + undo story; `completions/inline` has its own request shape and streaming rules; `diagnostics` needs a schema translator per LSP flavor).
+- Freezing the URL space now costs nothing and unblocks parallel editor-plugin work by anyone (including future us) the moment v0.1 ships.
+
+## 15.4 — Files
+
+```
+include/ultima/server/
+    editor_bridge.hpp     (register_editor_bridge_stubs)
+
+src/server/
+    editor_bridge_stubs.cpp  (HTTP 501 handlers per §15.1)
+```
+
+## 15.5 — Deferred to v0.2 (the actual bridge)
+
+Every endpoint in §15.1. Plus:
+
+- Request/response JSON schemas (formalized in `docs/editor-bridge-spec.md` when work starts).
+- Undo/redo journal for `edits/apply` (probably a small SQLite table alongside `memory.db`).
+- LSP diagnostic translators (start with tsserver + clangd + rust-analyzer since those cover the shipping code footprint).
+- Editor-side reference implementation — a thin VS Code extension in `editor-plugins/vscode/` demoing the full loop.
+
+## 15.6 — Locked
+
+Seven `/api/editor/*` endpoints reserved. Every one returns HTTP 501 with a discoverable body in v0.1. `X-Ultima-Workspace` header + editor-origin allow-list pinned as invariants so v0.2 doesn't have to redo the trust model. First-class implementation is v0.2.
+
+---
+
+## All decisions written
+
+The design phase for v0.1 is complete. Decisions 01–15 (skipping 09-was-numbered-earlier is not a real gap — see below) cover every subsystem the runtime needs. The implementation milestones (M2 GGUF loader → M3 tokenizer → M4 transformer runtime + KV cache + sampler → M5 server + testpad) all have locked designs to target.
+
+Written and locked: 01, 01b, 01c, 01d, 01e, 01f, 02, 03, 03b, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15.
+
+No unwritten decisions remain in the "Future decisions" slot; new decisions from here on out are numbered from 16.
