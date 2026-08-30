@@ -293,9 +293,22 @@ Qwen2.5-Coder family for M4 correctness + immediate tiering; Qwen3 architecture 
 - **QK-Norm** in attention path
 - **Qwen3 RoPE** variant + **YaRN long-context scaling** (Ornith needs this for 256K → 1M)
 - **Qwen3 tokenizer vocab** (superset-ish of Qwen2 with new special tokens)
-- **Reasoning-token streaming**: parser splits `<think>...</think>` from user-facing output; CLI has `--show-thinking` flag
-- **qwen3_xml tool-call parser** variant
-- **Explicitly deferred:** vision tower / multimodal input (Ornith supports images; we ignore that for v0.1 — text-only still works)
+- **Reasoning-token streaming**: parser splits `<think>...</think>` from user-facing output; CLI has `--show-thinking` flag. Ornith's template always opens the assistant turn with `<think>\n` after the generation prompt; `enable_thinking=false` short-circuits with an empty `<think>\n\n</think>\n\n` stub.
+- **qwen3_xml tool-call parser** variant — Ornith's tool format is **XML-nested**, not JSON:
+  ```
+  <tool_call>
+  <function=name>
+  <parameter=key>
+  value
+  </parameter>
+  </function>
+  </tool_call>
+  ```
+  distinct from Qwen2's `<tool_call>{"name":..., "arguments":{...}}</tool_call>`. Requires separate parser + emitter.
+- **System message merging:** up to 2 consecutive system/developer messages merged with `\n`.
+- **Tools injected into system prompt** with a fixed instruction block ("# Tools\n\nYou have access to the following functions:...").
+- **Reference template** committed at `docs/references/chat_templates/ornith-1.5-9b.jinja` — source of truth for the M3 C++ renderer implementation.
+- **Explicitly deferred:** vision tower / multimodal input (Ornith supports `<|vision_start|><|image_pad|><|vision_end|>` and video variants; we ignore that for v0.1 — text-only still works and matches published SWE-bench numbers).
 
 ### Cross-backend note
 
