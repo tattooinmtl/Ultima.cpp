@@ -10,6 +10,11 @@ target_link_libraries(ultima
     PRIVATE
         ultima_core
         ultima_model
+        ultima_kv_cache
+        ultima_runtime
+        ultima_sampler
+        ultima_tokenizer
+        ultima_server
         ultima_warnings
         fmt::fmt
 )

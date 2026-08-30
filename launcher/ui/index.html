@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ultima launcher</title>
+<style>
+  :root {
+    --bg:#0e0f13; --panel:#161821; --border:#252836;
+    --fg:#e6e8ee; --muted:#8b90a1;
+    --accent:#66d9ef; --ok:#7bd88f; --err:#ff6b6b; --warn:#e6a44a;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:var(--sans); }
+  header {
+    display:flex; align-items:center; gap:16px;
+    padding:12px 18px; border-bottom:1px solid var(--border); background:var(--panel);
+  }
+  header h1 { margin:0; font-size:15px; font-weight:600; letter-spacing:.02em; }
+  header .status { margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--muted); }
+  header .status b { color:var(--fg); }
+  .container { max-width:1080px; margin:0 auto; padding:16px 18px; }
+
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:24px 0 8px; }
+  h2:first-child { margin-top:0; }
+
+  .roots {
+    display:flex; flex-wrap:wrap; gap:8px 12px;
+    padding:10px 12px; background:var(--panel); border:1px solid var(--border); border-radius:8px;
+    font-family:var(--mono); font-size:12px;
+  }
+  .roots .root { padding:2px 8px; border:1px solid var(--border); border-radius:4px; color:var(--muted); }
+  .roots .root b { color:var(--fg); font-weight:600; }
+
+  .toolbar { display:flex; gap:8px; margin:8px 0; }
+  button { background:var(--accent); color:#0e0f13; border:0; border-radius:6px; padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.secondary { background:var(--border); color:var(--fg); }
+  button:disabled { opacity:.45; cursor:default; }
+
+  table.models { width:100%; border-collapse:collapse; margin-top:8px;
+                 background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  table.models th, table.models td { padding:9px 12px; text-align:left; font-size:13px; }
+  table.models th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+                     background:#12141c; border-bottom:1px solid var(--border); }
+  table.models td { border-bottom:1px solid var(--border); font-family:var(--mono); }
+  table.models tr:last-child td { border-bottom:0; }
+  table.models tr.loaded td { background:#161e18; }
+  table.models tr.loaded .dot { color:var(--ok); }
+  .dot { display:inline-block; width:8px; text-align:center; margin-right:4px; color:var(--muted); }
+  .row-actions button { padding:4px 8px; font-size:11px; }
+
+  .err { color:var(--err); font-family:var(--mono); font-size:12px; margin:8px 0; min-height:16px; }
+  .settings { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-top:8px; }
+  .settings label { display:block; font-size:11px; color:var(--muted); margin-bottom:3px; text-transform:uppercase; letter-spacing:.06em; }
+  .settings input, .settings textarea {
+    width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--border);
+    border-radius:4px; padding:6px 8px; font-family:var(--mono); font-size:12px;
+  }
+  .settings textarea { grid-column:1/-1; min-height:56px; resize:vertical; }
+  .settings .checkbox { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); }
+  .settings .checkbox input { width:auto; }
+  footer { text-align:center; color:var(--muted); font-size:11px; padding:16px; font-family:var(--mono); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Ultima launcher</h1>
+  <div class="status" id="status">runtime: <b>idle</b></div>
+</header>
+
+<div class="container">
+  <h2>Model roots (Decision 03c §3c.1)</h2>
+  <div class="roots" id="roots"></div>
+
+  <h2>Discovered models</h2>
+  <div class="toolbar">
+    <button id="rescan" class="secondary">Rescan</button>
+    <button id="open-testpad" class="secondary" disabled>Open testpad</button>
+    <button id="unload" class="secondary" disabled>Unload runtime</button>
+  </div>
+  <div class="err" id="err"></div>
+  <table class="models" id="models">
+    <thead>
+      <tr><th></th><th>Name</th><th>Size</th><th>Path</th><th></th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Settings</h2>
+  <div class="settings" id="settings">
+    <div><label>runtime host</label><input id="runtime_host" type="text" /></div>
+    <div><label>runtime port</label><input id="runtime_port" type="number" /></div>
+    <div><label>n_ctx</label><input id="runtime_n_ctx" type="number" /></div>
+    <div><label>n_threads (0=auto)</label><input id="runtime_n_threads" type="number" /></div>
+    <div class="checkbox"><input id="open_testpad_on_load" type="checkbox" /><label for="open_testpad_on_load" style="margin:0;text-transform:none;color:var(--fg);">open testpad on load</label></div>
+    <div class="checkbox"><input id="autoload_default_on_launch" type="checkbox" /><label for="autoload_default_on_launch" style="margin:0;text-transform:none;color:var(--fg);">autoload default model on launch</label></div>
+    <div><label>default model path</label><input id="default_model_path" type="text" /></div>
+    <div><label>&nbsp;</label><button id="save-config" class="secondary">Save config</button></div>
+    <label style="grid-column:1/-1;">model roots (one per line — Ollama / LM Studio dirs autodetected)</label>
+    <textarea id="model_roots"></textarea>
+  </div>
+</div>
+
+<footer>ultima-launcher — HTTP UI (v0.2 upgrade to Wails native window per Decision 03)</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentConfig = null;
+let loadedInfo = null;
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json()).error || ('HTTP ' + r.status));
+  return r.json();
+}
+
+function humanTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+async function refresh() {
+  try {
+    const j = await api('GET', '/api/models');
+    renderRoots(j.roots || []);
+    renderModels(j.models || [], j.loaded || {});
+  } catch (e) {
+    $('err').textContent = e.message;
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const s = await api('GET', '/api/status');
+    loadedInfo = s;
+    if (s.pid) {
+      $('status').innerHTML = `runtime: <b style="color:var(--ok)">running</b> · pid ${s.pid} · ${s.host}:${s.port}`;
+      $('open-testpad').disabled = false;
+      $('unload').disabled = false;
+    } else {
+      $('status').innerHTML = 'runtime: <b>idle</b>';
+      $('open-testpad').disabled = true;
+      $('unload').disabled = true;
+    }
+  } catch (e) {
+    $('status').innerHTML = 'runtime: <b style="color:var(--err)">unreachable</b>';
+  }
+}
+setInterval(refreshStatus, 2000);
+
+function renderRoots(roots) {
+  $('roots').innerHTML = roots.map((r, i) =>
+    `<div class="root"><b>${i+1}</b> ${escapeHtml(r)}</div>`
+  ).join('');
+}
+
+function renderModels(models, loaded) {
+  const tbody = $('models').querySelector('tbody');
+  const loadedPath = loaded?.path || '';
+  if (!models.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px;">No .gguf files found in the configured roots.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = models.map((m) => {
+    const isLoaded = m.path === loadedPath;
+    return `
+      <tr class="${isLoaded ? 'loaded' : ''}">
+        <td><span class="dot">${isLoaded ? '●' : '○'}</span></td>
+        <td>${escapeHtml(m.name)}</td>
+        <td>${escapeHtml(m.size_human || '')}</td>
+        <td style="color:var(--muted);">${escapeHtml(m.path)}</td>
+        <td class="row-actions">
+          <button data-path="${escapeAttr(m.path)}" class="load-btn">${isLoaded ? 'Reload &amp; test' : 'Load &amp; test'}</button>
+        </td>
+      </tr>`;
+  }).join('');
+  tbody.querySelectorAll('.load-btn').forEach(b => {
+    b.onclick = () => loadModel(b.dataset.path);
+  });
+}
+
+async function loadModel(path) {
+  $('err').textContent = '';
+  const btns = document.querySelectorAll('.load-btn');
+  btns.forEach(b => b.disabled = true);
+  try {
+    const j = await api('POST', '/api/load', { path });
+    // Success — refresh model list and status.
+    await refresh();
+    await refreshStatus();
+  } catch (e) {
+    $('err').textContent = e.message;
+  } finally {
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+$('rescan').onclick = refresh;
+$('open-testpad').onclick = async () => {
+  try { await api('POST', '/api/open'); } catch (e) { $('err').textContent = e.message; }
+};
+$('unload').onclick = async () => {
+  try { await api('POST', '/api/unload'); await refresh(); await refreshStatus(); }
+  catch (e) { $('err').textContent = e.message; }
+};
+
+async function loadConfig() {
+  const c = await api('GET', '/api/config');
+  currentConfig = c;
+  $('runtime_host').value = c.runtime_host || '127.0.0.1';
+  $('runtime_port').value = c.runtime_port || 11434;
+  $('runtime_n_ctx').value = c.runtime_n_ctx || 4096;
+  $('runtime_n_threads').value = c.runtime_n_threads || 0;
+  $('open_testpad_on_load').checked = !!c.open_testpad_on_load;
+  $('autoload_default_on_launch').checked = !!c.autoload_default_on_launch;
+  $('default_model_path').value = c.default_model_path || '';
+  $('model_roots').value = (c.model_roots || []).join('\n');
+}
+
+$('save-config').onclick = async () => {
+  const c = { ...(currentConfig || {}),
+    runtime_host: $('runtime_host').value.trim(),
+    runtime_port: parseInt($('runtime_port').value, 10),
+    runtime_n_ctx: parseInt($('runtime_n_ctx').value, 10),
+    runtime_n_threads: parseInt($('runtime_n_threads').value, 10),
+    open_testpad_on_load: $('open_testpad_on_load').checked,
+    autoload_default_on_launch: $('autoload_default_on_launch').checked,
+    default_model_path: $('default_model_path').value.trim(),
+    model_roots: $('model_roots').value.split('\n').map(s => s.trim()).filter(Boolean),
+  };
+  try {
+    await api('POST', '/api/config', c);
+    currentConfig = c;
+    await refresh();
+  } catch (e) { $('err').textContent = e.message; }
+};
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, ch => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[ch]);
+}
+function escapeAttr(s) { return escapeHtml(s).replace(/`/g, '&#96;'); }
+
+loadConfig().then(refresh).then(refreshStatus);
+</script>
+</body>
+</html>
