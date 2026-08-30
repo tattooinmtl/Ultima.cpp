@@ -98,8 +98,26 @@ public:
     void append(SlotHandle slot, std::size_t layer,
                 const void* k, const void* v);
 
+    // Explicit-position variant used by the transformer forward pass. Writes
+    // into the slot's (layer, position) slab without advancing pos or
+    // toggling any per-layer "written" flags — the runtime writes at
+    // `pos` first, then reads up to `pos+1` for attention, and finally
+    // calls commit_token() to advance the slot.
+    void write_at(SlotHandle slot, std::size_t layer, std::size_t position,
+                  const void* k, const void* v);
+
+    // Advance pos by 1 and record the token id (for prefix-reuse LCP).
+    // Idempotent when the caller has already advanced via append().
+    void commit_token(SlotHandle slot, TokenId token);
+
     // Read view for attention at this layer. positions [0, pos) are valid.
     LayerView read(SlotHandle slot, std::size_t layer) const;
+
+    // Same as read() but returns a view whose .pos = up_to_pos, ignoring
+    // slot.pos. Used by the forward pass to include the K/V just written at
+    // the current position before commit_token() advances the counter.
+    LayerView read_at(SlotHandle slot, std::size_t layer,
+                      std::size_t up_to_pos) const;
 
     // Diagnostics.
     std::size_t n_free_slots()   const noexcept;

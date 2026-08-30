@@ -23,6 +23,8 @@ add_executable(ultima_test
     unit/test_tokenizer.cpp
     unit/test_kv_cache.cpp
     unit/test_sampler.cpp
+    unit/test_qwen_config.cpp
+    unit/test_kv_cache_forward.cpp
 )
 
 target_link_libraries(ultima_test

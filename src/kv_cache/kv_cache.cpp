@@ -204,6 +204,64 @@ void KVCache::append(SlotHandle slot, std::size_t layer,
     s.touched_at = ++impl_->clock;
 }
 
+void KVCache::write_at(SlotHandle slot, std::size_t layer,
+                       std::size_t position,
+                       const void* k, const void* v) {
+    if (!slot.valid() || slot.index() >= impl_->slots.size()) return;
+    if (layer >= impl_->cfg.n_layers) return;
+    if (position >= impl_->cfg.n_ctx) return;
+
+    const std::size_t elt_bytes = dtype_bytes(impl_->cfg.dtype);
+    const std::size_t head_bytes = impl_->cfg.head_dim * elt_bytes;
+    const std::size_t head_stride_bytes =
+        impl_->cfg.n_ctx * impl_->cfg.head_dim * elt_bytes;
+
+    const std::size_t bi = slot.index() * impl_->cfg.n_layers + layer;
+    std::uint8_t* k_dst_base = impl_->k_buf[bi].data();
+    std::uint8_t* v_dst_base = impl_->v_buf[bi].data();
+
+    const std::uint8_t* k_src = static_cast<const std::uint8_t*>(k);
+    const std::uint8_t* v_src = static_cast<const std::uint8_t*>(v);
+
+    for (std::size_t h = 0; h < impl_->cfg.n_kv_heads; ++h) {
+        const std::size_t dst_off = h * head_stride_bytes + position * head_bytes;
+        std::memcpy(k_dst_base + dst_off, k_src + h * head_bytes, head_bytes);
+        std::memcpy(v_dst_base + dst_off, v_src + h * head_bytes, head_bytes);
+    }
+    impl_->slots[slot.index()].touched_at = ++impl_->clock;
+}
+
+void KVCache::commit_token(SlotHandle slot, TokenId token) {
+    if (!slot.valid() || slot.index() >= impl_->slots.size()) return;
+    auto& s = impl_->slots[slot.index()];
+    if (s.pos >= impl_->cfg.n_ctx) return;
+
+    // Only tick pos if we haven't already advanced via append()'s all-layers
+    // completion. The tokens vector length is the source of truth for
+    // reuse_prefix comparisons.
+    if (s.tokens.size() < s.pos + 1) {
+        // typical path: token vector was empty for the just-written position.
+        s.tokens.push_back(token);
+    } else {
+        // Guard against duplicate commit_token: overwrite in place.
+        s.tokens[s.pos] = token;
+    }
+    if (s.pos == s.tokens.size() - 1) {
+        // pos still points at the just-committed slot; advance.
+        s.pos = s.tokens.size();
+    }
+    std::fill(s.layers_written_at_pos.begin(),
+              s.layers_written_at_pos.end(), 0);
+    s.touched_at = ++impl_->clock;
+}
+
+LayerView KVCache::read_at(SlotHandle slot, std::size_t layer,
+                           std::size_t up_to_pos) const {
+    LayerView v = read(slot, layer);
+    v.pos = std::min(up_to_pos, impl_->cfg.n_ctx);
+    return v;
+}
+
 LayerView KVCache::read(SlotHandle slot, std::size_t layer) const {
     LayerView v{};
     if (!slot.valid() || slot.index() >= impl_->slots.size()) return v;
