@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ultima testpad</title>
+<style>
+  :root {
+    --bg:#0e0f13; --panel:#161821; --border:#252836;
+    --fg:#e6e8ee; --muted:#8b90a1;
+    --accent:#66d9ef; --user:#a1e6ff; --assistant:#e6e8ee;
+    --err:#ff6b6b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family:var(--sans); }
+  main { display:grid; grid-template-columns: 1fr 320px; height:100%; }
+  #chat { display:flex; flex-direction:column; overflow:hidden; }
+  #log  { flex:1; overflow-y:auto; padding:16px; }
+  .msg  { margin-bottom:14px; padding:10px 12px; border-radius:8px;
+          background:var(--panel); border:1px solid var(--border); }
+  .msg .role { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; margin-bottom:4px; }
+  .msg.user     .role { color:var(--user); }
+  .msg.assistant .role { color:var(--accent); }
+  .msg .content { white-space:pre-wrap; font-family:var(--mono); font-size:13px; line-height:1.5; }
+  .msg .stats   { color:var(--muted); font-size:11px; margin-top:6px; font-family:var(--mono); }
+
+  #compose { border-top:1px solid var(--border); padding:12px; background:var(--panel); display:flex; gap:8px; }
+  #compose textarea { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--border);
+                       border-radius:6px; padding:8px 10px; font-family:var(--mono); font-size:13px;
+                       resize:vertical; min-height:64px; }
+  #compose button   { background:var(--accent); color:#0e0f13; border:0; border-radius:6px;
+                       padding:0 18px; font-weight:600; cursor:pointer; }
+  #compose button:disabled { opacity:.4; cursor:default; }
+
+  #side { border-left:1px solid var(--border); background:var(--panel); padding:14px; overflow-y:auto; }
+  #side h2 { font-size:12px; text-transform:uppercase; color:var(--muted); letter-spacing:.08em; margin:14px 0 6px; }
+  #side h2:first-child { margin-top:0; }
+  label { display:block; font-size:12px; margin:6px 0 2px; color:var(--muted); }
+  input[type="number"], input[type="text"], textarea.sys {
+    width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--border);
+    border-radius:4px; padding:5px 7px; font-family:var(--mono); font-size:12px;
+  }
+  textarea.sys { resize:vertical; min-height:60px; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+  .health { font-family:var(--mono); font-size:11px; color:var(--muted); line-height:1.7; }
+  .health b { color:var(--fg); font-weight:600; }
+  .err { color:var(--err); font-family:var(--mono); font-size:12px; margin-top:6px; }
+  .header { font-family:var(--mono); font-size:12px; color:var(--muted); padding:10px 14px; border-bottom:1px solid var(--border); }
+  .header b { color:var(--accent); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <section id="chat">
+    <div class="header">Ultima testpad — <b id="hdr-model">…</b></div>
+    <div id="log"></div>
+    <div id="compose">
+      <textarea id="input" placeholder="Message (Ctrl+Enter to send)"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </section>
+
+  <aside id="side">
+    <h2>System</h2>
+    <textarea id="sys" class="sys">You are a helpful coding assistant.</textarea>
+
+    <h2>Sampler</h2>
+    <div class="row">
+      <div><label>temperature</label><input type="number" id="temperature" step="0.05" value="0.2"/></div>
+      <div><label>top_k</label><input type="number" id="top_k" step="1" value="40"/></div>
+      <div><label>top_p</label><input type="number" id="top_p" step="0.05" value="0.95"/></div>
+      <div><label>min_p</label><input type="number" id="min_p" step="0.05" value="0.05"/></div>
+      <div><label>rep_penalty</label><input type="number" id="repetition_penalty" step="0.05" value="1.1"/></div>
+      <div><label>max_tokens</label><input type="number" id="max_tokens" step="16" value="256"/></div>
+      <div><label>seed</label><input type="number" id="seed" placeholder="random" /></div>
+    </div>
+    <button id="reset-defaults" style="width:100%; margin-top:8px; background:var(--border); color:var(--fg); border:0; padding:6px; border-radius:4px; cursor:pointer;">Reset to coding defaults</button>
+
+    <h2>Session</h2>
+    <button id="clear" style="width:100%; background:var(--border); color:var(--fg); border:0; padding:6px; border-radius:4px; cursor:pointer;">Clear history</button>
+
+    <h2>Diagnostics</h2>
+    <div id="health" class="health">connecting…</div>
+    <div id="err" class="err"></div>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { messages: [] };
+
+function addMessage(role, content, stats = null) {
+  const box = document.createElement('div');
+  box.className = 'msg ' + role;
+  box.innerHTML = `<div class="role">${role}</div><div class="content"></div>`;
+  box.querySelector('.content').textContent = content;
+  if (stats) {
+    const s = document.createElement('div');
+    s.className = 'stats';
+    s.textContent = stats;
+    box.appendChild(s);
+  }
+  $('log').appendChild(box);
+  $('log').scrollTop = $('log').scrollHeight;
+  return box;
+}
+
+async function pollHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const j = await r.json();
+    $('hdr-model').textContent = j.model + ' (' + j.arch + ')';
+    $('health').innerHTML =
+      `model:  <b>${j.model}</b><br>` +
+      `arch:   <b>${j.arch}</b><br>` +
+      `slots:  <b>${j.kv_slots.in_use}/${j.kv_slots.total}</b>`;
+  } catch (e) {
+    $('health').textContent = 'runtime unreachable';
+  }
+}
+setInterval(pollHealth, 2000);
+pollHealth();
+
+function readParams() {
+  const num = (id) => {
+    const v = $(id).value;
+    return v === '' ? undefined : Number(v);
+  };
+  const p = {
+    temperature: num('temperature'),
+    top_k: num('top_k'),
+    top_p: num('top_p'),
+    min_p: num('min_p'),
+    repetition_penalty: num('repetition_penalty'),
+    max_tokens: num('max_tokens'),
+  };
+  const s = num('seed');
+  if (s !== undefined) p.seed = s;
+  return p;
+}
+
+$('reset-defaults').onclick = () => {
+  $('temperature').value = 0.2;
+  $('top_k').value = 40;
+  $('top_p').value = 0.95;
+  $('min_p').value = 0.05;
+  $('repetition_penalty').value = 1.1;
+  $('max_tokens').value = 256;
+  $('seed').value = '';
+};
+
+$('clear').onclick = () => { state.messages = []; $('log').innerHTML = ''; };
+
+async function send() {
+  const text = $('input').value.trim();
+  if (!text) return;
+  $('input').value = '';
+  $('send').disabled = true;
+  $('err').textContent = '';
+
+  state.messages.push({ role: 'user', content: text });
+  addMessage('user', text);
+
+  const sysText = $('sys').value.trim();
+  const messages = sysText
+    ? [{ role: 'system', content: sysText }, ...state.messages]
+    : state.messages;
+
+  const body = { model: 'ultima', messages, ...readParams() };
+  const started = performance.now();
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const wall = ((performance.now() - started) / 1000).toFixed(2);
+    const content = j.choices?.[0]?.message?.content ?? '';
+    const u = j.ultima || {};
+    const stats = `first ${u.first_token_ms?.toFixed?.(0) || '?'} ms · ` +
+                  `${u.decode_toks || 0} tok · ` +
+                  `${u.decode_tps?.toFixed?.(1) || '?'} tok/s · ` +
+                  `seed ${u.seed} · wall ${wall}s`;
+    state.messages.push({ role: 'assistant', content });
+    addMessage('assistant', content, stats);
+  } catch (e) {
+    $('err').textContent = 'error: ' + e.message;
+  } finally {
+    $('send').disabled = false;
+    $('input').focus();
+  }
+}
+
+$('send').onclick = send;
+$('input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+});
+</script>
+</body>
+</html>
