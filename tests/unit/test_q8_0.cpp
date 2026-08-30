@@ -4,6 +4,7 @@
 #include "ultima/kernels/matvec.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -89,6 +90,39 @@ TEST_CASE("matvec_q8_0_f32: dot product against ones") {
     std::vector<float> y(1, 0.0f);
     ultima::kernels::matvec_q8_0_f32(row.data(), x.data(), y.data(), 1, 32);
     CHECK(y[0] == doctest::Approx(32.0f));
+}
+
+TEST_CASE("dequant_q8_0: subnormal fp16 scale round-trips at correct magnitude") {
+    // Regression: earlier the subnormal exponent formula was off by one and
+    // returned 2x the correct magnitude. Build a block whose fp16 d is a
+    // subnormal and confirm dequant matches the exact bit-pattern value.
+    //
+    // fp16 subnormal with raw bits (sign=0, exp=0, mant=1) = 2^-24.
+    // With qs[i] = 1, dequant should yield exactly 2^-24.
+    std::array<std::uint8_t, 34> block{};
+    block[0] = 0x01u;   // low byte: mant=1, exp=0, sign=0
+    block[1] = 0x00u;   // high byte
+    std::array<std::int8_t, 32> qs{};
+    for (auto& v : qs) v = 1;
+    std::memcpy(&block[2], qs.data(), 32);
+
+    float out[32]{};
+    ultima::kernels::dequant_q8_0_block(block.data(), out);
+    const float expected = std::ldexp(1.0f, -24);   // 2^-24
+    for (int i = 0; i < 32; ++i) {
+        CHECK(out[i] == doctest::Approx(expected));
+    }
+
+    // Mid-range subnormal: raw bits 0x00FF => mant=255, exp=0. Value = 255*2^-24.
+    // With the pre-fix formula this returned 510*2^-24 (2x). Confirms the
+    // fix works across the whole subnormal range, not just the smallest value.
+    block[0] = 0xFFu;
+    block[1] = 0x00u;
+    ultima::kernels::dequant_q8_0_block(block.data(), out);
+    const float expected_255 = std::ldexp(255.0f, -24);
+    for (int i = 0; i < 32; ++i) {
+        CHECK(out[i] == doctest::Approx(expected_255).epsilon(1e-6));
+    }
 }
 
 TEST_CASE("matvec_q8_0_f32: two rows, two blocks per row") {
