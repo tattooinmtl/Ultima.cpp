@@ -1155,6 +1155,120 @@ Override points:
 
 ---
 
+# Decision 03c — Launcher model paths + load-and-test flow
+
+## Scope
+
+Fills two gaps Decision 03 §3.5 only sketched: **where the launcher looks for GGUF files on disk**, and **how one click on the Models tab goes from "selected GGUF" to "browser tab open on Decision 14's testpad, ready to prompt"**. Both are day-one usability requirements — if loading a model requires editing a JSON file, testing whether Ultima beats llama.cpp turns into a bad time.
+
+Ownership: `launcher/` (Go/Wails, per Decision 03). Wires into the runtime's HTTP surface (Decision 14) via `/v1/models`, `/api/health`, and the process-lifetime IPC.
+
+## 3c.1 — Model discovery roots
+
+Launcher scans multiple roots on startup (first-match-wins on filename collisions) so users don't have to re-download or hand-copy GGUFs they already have:
+
+1. **Ultima's own store** — `%APPDATA%\Ultima\models\` (Windows), `~/.ultima/models/` (Linux/macOS). Where the launcher's downloader lands files.
+2. **Portable folder co-location** — `<launcher_dir>\models\` (relative to `ultima-launcher.exe`). Ships-with-USB-stick mode.
+3. **Ollama** — `%USERPROFILE%\.ollama\models\` (Windows) / `~/.ollama/models/`. Reads Ollama's manifest layout so entries surface with real names, not blob hashes.
+4. **LM Studio** — `%USERPROFILE%\.cache\lm-studio\models\` / `~/.cache/lm-studio/models/`. Flat layout, scanned recursively.
+5. **User-added paths** — any number of additional roots the user picks via the Models tab "Add folder" button. Persisted in `config.json` under `model_roots: []`.
+
+Discovery cache: launcher stores `<APPDATA>\Ultima\models.index.json` — one line per discovered GGUF with `{path, size, mtime, arch, tokenizer_hash, tensor_summary}`. Rebuilt when any root's directory mtime changes, or on manual "Rescan" button. This means opening the Models tab is instant (loads from the cache), not "wait 10 s while I stat 200 files."
+
+## 3c.2 — Models tab layout (v0.1)
+
+Replaces Decision 03 §3.5 item 2 with the concrete design:
+
+```
++-- Models tab -------------------------------------------------+
+| [ Add folder ]  [ Rescan ]  [ Download... ]                   |
+|                                                                |
+| Model roots:                                                  |
+|   ✓ C:\Users\Erik\AppData\Roaming\Ultima\models  (3 files)    |
+|   ✓ C:\Users\Erik\.ollama\models                 (7 files)    |
+|   ✓ D:\LLMs\coding                               (12 files)   |
+|   [+ Add ...]                                                 |
+|                                                                |
+| Discovered models:                                            |
+| ┌────────────────────────────────────────────────────────────┐|
+| │ ● Qwen2.5-Coder-7B-Instruct       Q4_K_M  4.5 GB  qwen2   ▸│|
+| │   D:\LLMs\coding\qwen2.5-coder-7b-instruct-q4_k_m.gguf     │|
+| │   [ Load & Test ] [ Set as default ] [ Delete ]            │|
+| │                                                             │|
+| │ ○ Qwen3-Coder-14B                  Q4_K_M  8.2 GB  qwen3  ▸│|
+| │ ○ bge-base-en                      f16      438 MB embed  ▸│|
+| │ ○ (unknown-arch)                   Q4_K_M  6.9 GB   ---   ▸│|
+| └────────────────────────────────────────────────────────────┘|
++---------------------------------------------------------------+
+```
+
+Row states:
+- **●** — currently loaded in the runtime (bold row).
+- **○** — recognized architecture, loadable.
+- **---** — unknown architecture; launcher shows the row but the "Load & Test" button is disabled with a tooltip.
+
+Per-row actions:
+- **Load & Test** — the one-click flow from §3c.3.
+- **Set as default** — writes to `config.json` so the next launcher start auto-loads it.
+- **Delete** — moves the file to the OS recycle bin (never `unlink` directly); typed-confirm if the file is outside Ultima's own store.
+
+## 3c.3 — Load & Test flow (one button)
+
+The single action that turns "I have this GGUF" into "I can chat with it right now":
+
+1. Launcher POSTs `POST /api/model/load {"path": "<gguf>"}` to the runtime (starts the runtime process first if it isn't running per Decision 03 §3.4).
+2. Runtime unloads whatever is currently loaded (releases KV slots per Decision 09 §9.3), mmaps the new GGUF, initializes the model per its arch (Decision 06), and returns `{"status":"loaded","model":"<id>","n_ctx":<n>,"kv_dtype":"..."}`.
+3. Launcher polls `GET /api/health` until `kv_slots.total > 0` (typically <2 s on the reference box for a 7B Q4_K_M — mmap + preheat).
+4. Launcher opens the default browser at `http://127.0.0.1:11434/?bench=1` — testpad opens with the freshly loaded model preselected and Decision 14 §14.5.1's bench mode toggled on. Two more clicks: pick prompt fixture, run.
+
+If the load fails at any step, launcher surfaces the runtime's error string (arch unsupported, corrupted tensor, out of memory) and leaves the previously loaded model live.
+
+## 3c.4 — Settings entries (in `config.json`)
+
+New keys on top of Decision 03 §3.5's set. All editable via the Models tab; the JSON is the source of truth.
+
+```json
+{
+  "model_roots": [
+    "%APPDATA%\\Ultima\\models",
+    "%USERPROFILE%\\.ollama\\models",
+    "D:\\LLMs\\coding"
+  ],
+  "default_model_path": "D:\\LLMs\\coding\\qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+  "autoload_default_on_launch": true,
+  "open_testpad_on_load": true,
+  "models_index_cache_ttl_s": 300
+}
+```
+
+- **`autoload_default_on_launch`** — if true, the launcher's Home tab [Launch] button also runs the Load & Test flow for `default_model_path`. Cuts the "I just want to prompt something" flow to one button, once configured.
+- **`open_testpad_on_load`** — if false, Load & Test still loads the model but doesn't open the browser (for users running via an external client — Continue, aider).
+- **`models_index_cache_ttl_s`** — how often to auto-rescan roots even without an mtime change. 300 s catches file adds you did outside the launcher.
+
+## 3c.5 — Runtime-side endpoints this decision adds
+
+Two endpoints on top of Decision 14's set — model lifecycle isn't a chat/completion concern:
+
+| Method | Path                          | Purpose |
+|---|---|---|
+| POST   | `/api/model/load`             | Load a GGUF at `path`; unload the previous one. Body: `{path, n_ctx?, adapter?}`. |
+| POST   | `/api/model/unload`           | Release the current model + all KV slots. Runtime idles. |
+
+Both are launcher-only in v0.1 (bearer-token gated + `X-Ultima-Client: launcher` header check); a user swapping models mid-session from an external client is a v0.2 concern.
+
+## 3c.6 — Deferred
+
+- **Model download from within the launcher** for GGUFs that aren't in the registry (Decision 01e) — user pastes HuggingFace URL, launcher fetches with progress. Nice to have; v0.2.
+- **Two models loaded simultaneously** (coder + embed) — Decision 09 §9.3 allocates KV per model; single-model v0.1.
+- **Live model swap without dropping active KV sessions** — impossible by design (weights change → KV invalid), so this stays a hard swap forever.
+- **GGUF quality preview** (per-tensor sanity + expected RAM before commit) — v0.2 alongside the audit script (Decision 11 §11.5).
+
+## 3c.7 — Locked
+
+Five discovery roots, models.index.json cache, one-button "Load & Test" that ends in the browser on Decision 14's testpad with bench mode on. `/api/model/{load,unload}` are the launcher-runtime seam. `config.json` gains five keys; every one editable in the Models tab.
+
+---
+
 # Decision 03b — Chat UI hosting: browser-only
 
 ## DECIDED: Approach A — pure browser-served webui, no native window wrap
