@@ -3,8 +3,11 @@ add_library(ultima_kernels STATIC
     matvec_f32_f32.cpp
     matvec_q4k_f32.cpp
     matvec_q8_0_f32.cpp
+    matvec_q6k_f32.cpp
+    matvec_threaded.cpp
     dequant_q4k.cpp
     dequant_q8_0.cpp
+    dequant_q6k.cpp
     elementwise.cpp
     rmsnorm.cpp
     softmax.cpp
@@ -19,6 +22,7 @@ target_link_libraries(ultima_kernels
     PUBLIC
         ultima_core
         ultima_flags
+        ultima_runtime
     PRIVATE
         ultima_warnings
 )
