@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ultima::runtime { class ThreadPool; }
+
 namespace ultima::kernels {
 
 // y[m] = sum_k W[m,k] * x[k]     row-major W of shape [M, K], x length K
@@ -46,5 +48,27 @@ void matvec_q6k_f32       (const std::uint8_t* w, const float* x, float* y,
                            std::size_t M, std::size_t K) noexcept;
 void matvec_q6k_f32_scalar(const std::uint8_t* w, const float* x, float* y,
                            std::size_t M, std::size_t K) noexcept;
+
+// ---- Threaded variants ------------------------------------------------------
+// Each splits [0, M) contiguously across the pool's workers and calls the
+// per-row SIMD kernel. Callers own the pool. For M below a small threshold
+// (currently 2 * pool.size()) the call runs synchronously to skip dispatch
+// overhead — this matches the M ~ n_heads regime that generation hits.
+
+void matvec_f32_f32_threaded(ultima::runtime::ThreadPool& pool,
+                             const float* w, const float* x, float* y,
+                             std::size_t M, std::size_t K) noexcept;
+
+void matvec_q4k_f32_threaded(ultima::runtime::ThreadPool& pool,
+                             const std::uint8_t* w, const float* x, float* y,
+                             std::size_t M, std::size_t K) noexcept;
+
+void matvec_q6k_f32_threaded(ultima::runtime::ThreadPool& pool,
+                             const std::uint8_t* w, const float* x, float* y,
+                             std::size_t M, std::size_t K) noexcept;
+
+void matvec_q8_0_f32_threaded(ultima::runtime::ThreadPool& pool,
+                              const std::uint8_t* w, const float* x, float* y,
+                              std::size_t M, std::size_t K) noexcept;
 
 } // namespace ultima::kernels
