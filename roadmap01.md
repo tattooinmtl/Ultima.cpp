@@ -2417,9 +2417,291 @@ SKILL.md frontmatter compatible with the existing `examples/knowledge/patterns/`
 
 ---
 
+# Decision 12 — Memory subsystem (fast, reliable, coding-aware)
+
+## Scope
+
+Persistent per-user memory the model can read and write across turns and across sessions. Six tools declared in Decision 10 (`memory_read`, `memory_write`, `memory_str_replace`, `memory_append`, `memory_delete`, `memory_list`) plus a search side-channel the launcher UI exposes. Memory is the difference between "the model forgot we already fixed this last week" and "the model recalls the last three bugs in this file" — so it has to be fast (in the tool call hot path — every message can trigger reads), reliable (survives crashes and reboots), and scoped so a note about repo A doesn't leak into repo B.
+
+Ultima's endgame is an AI coding editor. This decision ships the runtime memory layer that the future editor UI (Decision 15's editor-bridge) will read and write; the model, tools, and eventual IDE plugin all hit the same store.
+
+Ownership: `include/ultima/memory/*.hpp` + `src/memory/*.cpp`. Wires into the tool layer.
+
+## 12.1 — Storage engine: SQLite in WAL mode
+
+**Choice: bundled SQLite (amalgamation build), WAL mode, `synchronous = NORMAL`.**
+
+- **Fast:** in-process, no IPC; WAL keeps readers non-blocking while a write is in progress. Typical local key lookup is sub-millisecond.
+- **Reliable:** ACID transactions, WAL journals survive power loss up to the last fsync, and `synchronous = NORMAL` (fsync at checkpoint, not per-commit) is the right trade for a single-user desktop — a full-durability `FULL` setting adds 5–10 ms per write with no meaningful reliability win at this scale.
+- **Coding-editor friendly:** FTS5 virtual tables give full-text search on `value` for "find the memory that mentions this error" without a second search engine.
+- **Zero external deps:** SQLite ships as a single .c file — dropped under `third_party/sqlite/` (Decision 02 §policy).
+
+No LevelDB, no LMDB, no Redis. Every extra dep is a launcher headache and a Windows-install-time footgun.
+
+## 12.2 — Schema
+
+Single `memory.db` file under `<ULTIMA_DATA>/memory.db` (Windows: `%APPDATA%\Ultima\memory.db`).
+
+```sql
+CREATE TABLE memories (
+    scope       TEXT NOT NULL,           -- "global" | "session:<id>" | "project:<hash>"
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'text',  -- "text" | "code" | "json"
+    updated_at  INTEGER NOT NULL,        -- unix seconds
+    PRIMARY KEY (scope, key)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_memories_updated ON memories(scope, updated_at DESC);
+
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+    scope UNINDEXED,
+    key   UNINDEXED,
+    value,
+    content='memories',
+    content_rowid='rowid'
+);
+
+CREATE TABLE meta (
+    k TEXT PRIMARY KEY, v TEXT NOT NULL
+);
+```
+
+Scope prefixes:
+- **`global`** — cross-project user preferences ("prefer tabs over spaces", "always suggest ripgrep over grep").
+- **`session:<id>`** — one chat session; evicted when the session slot is released (Decision 09 §9.3).
+- **`project:<hash>`** — per-repo memory keyed by a stable hash of the project root path. This is the coding-editor unlock: memories about repo A never surface in repo B.
+
+`kind` is metadata for the eventual editor UI to render (code memories get syntax highlighting, JSON pretty-printing).
+
+## 12.3 — In-process cache: `memory.cache`
+
+A small LRU cache in front of SQLite catches the hot working set without a DB round-trip. Sized at 4 MB by default (~a few thousand small memories).
+
+- **Read path:** cache → SQLite; cache-miss populates on read.
+- **Write path:** write-through — SQLite first (so a crash never loses a written memory), then cache update.
+- **Invalidation:** every mutation invalidates its `(scope, key)` cache entry.
+- **Bounds:** LRU eviction on entry count or byte budget, whichever hits first.
+
+## 12.4 — Search index: `memory.index`
+
+The FTS5 virtual table `memories_fts` is the search index. Rebuilt from source via `INSERT INTO memories_fts(memories_fts) VALUES('rebuild');` if `memory.db` file hash mismatches its stored `meta.fts_source_hash` at startup — self-healing without user intervention.
+
+Backing files SQLite creates alongside:
+- `memory.db`             — main file
+- `memory.db-wal`         — WAL journal (auto-checkpointed)
+- `memory.db-shm`         — WAL shared-memory (transient)
+
+The launcher's Data tab surfaces the location, size, and a "compact" button that runs `VACUUM`.
+
+## 12.5 — Concurrency
+
+Single writer, many readers — WAL's native model. Runtime instantiates one `MemoryStore` per process; every session shares it. Prepared statements are per-thread (WAL allows concurrent reads); the write mutex serializes mutations.
+
+## 12.6 — Reliability posture
+
+- `PRAGMA journal_mode = WAL`
+- `PRAGMA synchronous = NORMAL`
+- `PRAGMA foreign_keys = ON`
+- `PRAGMA busy_timeout = 5000` (waits before erroring on a lock)
+- WAL auto-checkpoint at 1000 pages
+- Automatic snapshot to `memory.db.bak.<yyyymmdd-hhmm>` on graceful shutdown; keep last 5 snapshots (rolling).
+- Corruption recovery: if `PRAGMA integrity_check` fails at startup, rename `memory.db` → `memory.db.corrupt.<ts>`, re-open the newest good snapshot, log loud.
+
+## 12.7 — Tool implementations
+
+Each tool is a thin wrapper over a prepared statement plus cache update. All accept an implicit `scope` derived from the calling session (default `session:<id>`; explicit `scope` override for global/project memories).
+
+- `memory_read(key, scope?)` — `SELECT value, kind, updated_at FROM memories WHERE scope=? AND key=?`
+- `memory_write(key, value, scope?, kind?)` — `INSERT OR REPLACE`
+- `memory_str_replace(key, old, new, scope?)` — read + string replace + write; refuses ambiguous matches (>1 occurrence)
+- `memory_append(key, text, scope?)` — read + append + write (single transaction)
+- `memory_delete(key, scope?)` — `DELETE FROM memories WHERE scope=? AND key=?`
+- `memory_list(prefix?, scope?, limit=50)` — `SELECT key, updated_at FROM memories WHERE scope=? AND key LIKE prefix||'%' ORDER BY updated_at DESC LIMIT ?`
+
+Plus one non-model-facing helper for the launcher/editor:
+- `memory_search(query, scope?, limit=20)` — FTS5 `MATCH` query with snippet extraction.
+
+## 12.8 — Files
+
+```
+include/ultima/memory/
+    memory_store.hpp     (MemoryStore + Scope helpers)
+
+src/memory/
+    CMakeLists.txt
+    memory_store.cpp
+    lru_cache.cpp        (bounded LRU used by MemoryStore)
+    scope.cpp            (project_hash from path, session id issuance)
+
+third_party/sqlite/
+    sqlite3.c
+    sqlite3.h
+```
+
+## 12.9 — Deferred
+
+- **Vector search** (embeddings-based "find similar memories"). Interesting for a coding editor but requires an embed model (Decision 01b) already wired into the runtime — Decision 12 stays lexical/FTS5 for v0.1.
+- **Cross-machine sync.** Local file only in v0.1; v0.3+ could push encrypted snapshots to a user-chosen sync target.
+- **Memory expiration / TTL.** No auto-purge in v0.1; the launcher's "compact" button plus manual `memory_delete` are enough.
+- **Structured schemas per memory kind.** `kind` is metadata only in v0.1; v0.2 could type-validate JSON kinds.
+- **Encryption at rest.** Filesystem-level trust in v0.1; SQLite SEE / SQLCipher is a v0.3 concern if the machine leaves the desk.
+
+## 12.10 — Locked
+
+SQLite WAL + FTS5, three scopes (global / session / project), in-process LRU cache with write-through, rolling snapshots on shutdown, corruption self-recovery from newest good snapshot. Six model-facing tools + one launcher-facing search. `memory.db`, `memory.db-wal`, `memory.db-shm`, `memory.db.bak.*` under `%APPDATA%\Ultima\` — one place, one file family, plain SQLite tooling works on it if the runtime ever isn't around.
+
+---
+
+# Decision 14 — HTTP server + testpad webui
+
+## Scope
+
+The .cpp runtime needs a way for a human to actually *use* it — send a prompt, watch tokens stream back, tweak sampling knobs, and see whether the model is any good on the reference box. That's the immediate goal. It also needs to look like a normal OpenAI-compatible server so any existing coding tool (Continue, aider, Cline, VS Code extensions) can point at it right away without a shim. And it needs to be the surface the eventual coding editor plugs into (Decision 15's editor-bridge reuses these endpoints).
+
+Ownership: `include/ultima/server/*.hpp` + `src/server/*.cpp` + `ui/testpad/*`. Depends on M4 (runtime + KV cache); this is M5.
+
+## 14.1 — HTTP library: cpp-httplib (header-only)
+
+**Choice: `cpp-httplib` (Yuji Hirose, MIT).** Header-only, blocking-thread-per-connection, SSE support out of the box, ~350 lines to hello-world.
+
+Rejected alternatives:
+- **Crow / Drogon** — much larger, async-heavy. Overkill for a single-user local server with 2 slots (Decision 09 §9.3).
+- **Boost.Beast** — pulls in Boost. Non-starter given the "third_party is vendored single-header when possible" thread from Decision 02.
+- **Rolling our own on Winsock/BSD sockets** — the "just to get streaming right" cost erases the shipping speed.
+
+Under `third_party/httplib/httplib.h`. Wrapped in `include/ultima/server/http_server.hpp` so we can swap it later without touching handler code.
+
+## 14.2 — Endpoints (v0.1)
+
+Two families: **OpenAI-compatible** (drop-in for any existing client) and **Ultima-native** (diagnostics + dev tools).
+
+### OpenAI-compatible
+
+| Method | Path                            | Notes |
+|---|---|---|
+| POST   | `/v1/chat/completions`          | Chat with tools + streaming (`stream: true` → SSE, `text/event-stream`) |
+| POST   | `/v1/completions`               | Legacy text completion |
+| GET    | `/v1/models`                    | List loaded model(s) with the same JSON shape OpenAI ships |
+
+Request/response shape matches OpenAI's April-2024 schema (chat + tool-calling). Fields Ultima doesn't implement (`logprobs`, `response_format` beyond `text`/`json_object`) are accepted-and-ignored with a `X-Ultima-Ignored: field1,field2` response header so clients don't silently mis-behave.
+
+### Ultima-native
+
+| Method | Path                     | Notes |
+|---|---|---|
+| GET    | `/api/health`            | `{"status":"ok","model":"<id>","kv_slots":{"total":2,"in_use":1}}` |
+| GET    | `/api/slots`             | KV slot occupancy per Decision 09 §9.3 |
+| POST   | `/api/tokenize`          | `{tokens:[...], count:N}` — dev/UI use |
+| POST   | `/api/detokenize`        | `{text:"..."}` |
+| GET    | `/api/skills`            | Enumerates discovered skills (Decision 11) |
+| GET    | `/api/tools`             | Enumerates built-in + MCP tools (Decision 10) |
+| GET    | `/`                      | Serves the testpad webui (§14.5) |
+| GET    | `/static/*`              | Static assets under `<install>/ui/testpad/` |
+
+## 14.3 — Streaming
+
+SSE (`text/event-stream`) for `stream: true` chat requests. Chunk format matches OpenAI's `data: {...}\n\n` framing with a terminating `data: [DONE]\n\n`. Per-token flush; server sets `X-Accel-Buffering: no` to defeat any reverse-proxy buffering if the user later fronts Ultima with nginx.
+
+Under the hood: the runtime's decode loop yields tokens through a bounded channel; the HTTP handler drains and writes each frame. A slow client (channel full) blocks the decoder for that slot — bounded RAM, no runaway queue.
+
+## 14.4 — Bind + auth
+
+- **Default bind:** `127.0.0.1:11434` (mnemonic to Ollama, so existing clients pointed at that port just work).
+- **LAN mode:** launcher toggle opens the port on `0.0.0.0`; forces bearer-token auth on.
+- **Auth token:** generated at first boot (`crypto_random 32 bytes → base64url`), stored in `%APPDATA%\Ultima\auth.token`. Launcher shows a "copy token" button and a QR code. Model-request handlers check `Authorization: Bearer <tok>`; missing/wrong → 401. Local (127.0.0.1) traffic bypasses auth **only** when LAN mode is off — makes the day-one testpad frictionless.
+- **CORS:** allow `http://localhost:*` and `http://127.0.0.1:*` by default (so the testpad works). LAN mode narrows to an explicit allow-list configured in the launcher.
+
+## 14.5 — Testpad webui (v0.1)
+
+**Not the eventual coding editor.** A single-file HTML page under `ui/testpad/index.html` — vanilla JS, no build step, no framework, embedded CSS. Bundled into the binary as a resource so a fresh install has zero external assets to serve.
+
+What it ships with:
+
+- **Model select** dropdown (populated from `/v1/models`).
+- **Chat pane** — messages, streaming display, tokens/s counter, first-token latency, KV slot indicator.
+- **Sampler panel** — temperature, top-k, top-p, min-p, rep-penalty, seed. Defaults from Decision 08 §8.2. "Reset to coding defaults" button.
+- **System prompt** field with the current chat template preview underneath.
+- **Session controls** — new session (releases the slot), clear history, copy-as-cURL, copy-as-OpenAI-JSON.
+- **Live diagnostics** — right-side collapsible pane showing `/api/health` + `/api/slots` polled every 2 s.
+
+Deliberately not shipping in v0.1: file tree, code editor, terminal, diff view. Those belong to the coding editor build; the testpad is the seed that proves the runtime is worth building an editor around.
+
+The testpad's JS talks to the same `/v1/chat/completions` endpoint an external client uses — no back-door API. This keeps the "if the testpad works, external clients work" invariant.
+
+## 14.5.1 — Benchmark support (Ultima vs llama.cpp head-to-head)
+
+The whole point of ship-day is proving Ultima runs the same GGUFs faster and/or better than llama.cpp on the reference box. Server + testpad ship with the fixtures and knobs to make that measurement fair:
+
+- **Bench mode** in the testpad (top-right toggle): fixes seed, temperature, top-p, top-k, min-p, and prompt content to a per-model preset. Two clicks: pick model, run bench.
+- **Prompt fixtures** under `ui/testpad/bench/*.md` — a short pack that stresses the paths that matter for coding: a 512-token "explain this function" prompt, a 4k-token "refactor this file" prompt, and a 16k-token "read this whole module and find the bug" prompt (Q4_K_M + Q8_0 KV → 16k should fit on the reference box). Same fixtures the user can point llama.cpp at.
+- **Reported metrics** per run: prompt tokens, generated tokens, first-token latency (ms), decode throughput (tok/s), prompt-processing throughput (tok/s), peak RSS (RAM), KV bytes used, sampler settings, seed. Emitted both in the UI and to `events.log` (§14.8) as one JSON line per run so a script can plot ten runs.
+- **`GET /api/bench/last`** returns the most recent run's metrics as JSON — external harness scripts don't need to scrape the UI.
+- **Warmup**: bench mode always discards the first run (loads weights + primes the OS page cache), reports run #2 onward. Otherwise the first-run number lies about steady state.
+
+Quality comparison is by-eye in v0.1 — the testpad's "duplicate to compare" button opens a second chat pane side-by-side (same prompt, same seed) so the user can eyeball Qwen2.5-Coder output from Ultima against a llama.cpp `curl` window running the same GGUF. An automated eval harness is a v0.2 concern (needs Decision 08's `logprobs` too).
+
+
+
+One HTTP worker thread per KV slot from Decision 09 §9.3 (default 2). Requests wait in a small bounded queue when all workers are busy; queue full → HTTP 429 with `Retry-After`. Per-slot decoder runs sequentially — no cross-request batching in v0.1 (deferred in Decision 09 §9.9).
+
+## 14.7 — Tool call flow (server side)
+
+1. Model emits a tool-call block per Qwen2/Qwen3 chat template (Decision 07 §7.3).
+2. Handler parses; runs built-in tools synchronously in-process; forwards MCP tool calls through the launcher IPC (Decision 10 §10.1).
+3. Tool result appended as `tool` role message; decode resumes reusing the KV prefix (Decision 09 §9.4).
+4. Streaming response inserts `tool_calls` chunks matching OpenAI's schema so clients that render tool activity (Continue, Cline) work unmodified.
+
+## 14.8 — Compression + logging
+
+- Response compression: gzip when the client sends `Accept-Encoding: gzip`. Small win locally, big win over LAN.
+- Access log: newline-delimited JSON to `%APPDATA%\Ultima\logs\server.log`, rotated at 10 MB, keep last 5.
+- Structured event log: separate `events.log` file with `{ts, session, event, tokens_in, tokens_out, ms_first_token, ms_total, sampler}` per completed request — this is what powers the launcher's Performance tab.
+
+## 14.9 — Files
+
+```
+include/ultima/server/
+    http_server.hpp
+    openai_shim.hpp        (request/response schema translation)
+    sse_stream.hpp
+    testpad_bundle.hpp     (embedded HTML/JS/CSS)
+
+src/server/
+    CMakeLists.txt
+    http_server.cpp
+    handlers_openai.cpp
+    handlers_ultima.cpp
+    sse_stream.cpp
+    testpad_bundle.cpp     (generated at build time from ui/testpad/*)
+
+ui/testpad/
+    index.html
+    app.js
+    styles.css
+
+third_party/httplib/
+    httplib.h
+```
+
+Build glue: a small CMake helper (`ultima_bundle_ui.cmake`) reads `ui/testpad/*` at configure time and emits a `.cpp` with a `std::string_view` per file. No runtime filesystem dependency for the testpad.
+
+## 14.10 — Deferred
+
+- **`logprobs`** in chat completions — matters for evals, add in v0.2.
+- **Multi-model hot-swap** in one process — v0.1 loads one model at a time; the launcher restarts the runtime to switch.
+- **WebSocket transport** (some clients prefer WS over SSE) — v0.2.
+- **Rate-limiting / quotas** — single-user machine doesn't need it.
+- **`response_format: json_schema`** — needs Decision 08's guided-decoding v0.3+ item.
+- **Editor-bridge protocol** — that's Decision 15 (separate). The HTTP surface here is the substrate; the editor bridge adds edit-aware endpoints (`/api/edits/apply`, `/api/diagnostics`) on top.
+
+## 14.11 — Locked
+
+`cpp-httplib` + SSE, OpenAI-compatible schema (Ollama-port `11434` for zero-config existing clients), single-file vanilla-JS testpad bundled into the binary, one worker per KV slot, bearer-token auth (auto-generated) with local bypass off by default, gzip + structured logs. Ship-quality server the future coding editor plugs into via the same endpoints.
+
+---
+
 ## Future decisions (not written yet)
 
-- Decision 12 — Memory subsystem (memory.db / memory.index / memory.cache)
 - Decision 13 — Adapter stub (LoRA hot-load)
-- Decision 14 — HTTP server + webui (OpenAI-compatible, SSE streaming)
-- Decision 15 — Editor-bridge reservation
+- Decision 15 — Editor-bridge reservation (edit-aware endpoints layered on Decision 14)
