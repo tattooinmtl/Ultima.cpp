@@ -14,6 +14,9 @@ add_executable(ultima_test
     unit/test_elementwise.cpp
     unit/test_rmsnorm.cpp
     unit/test_softmax.cpp
+    unit/test_rope.cpp
+    unit/test_dequant_q4k.cpp
+    unit/test_matvec_q4k.cpp
 )
 
 target_link_libraries(ultima_test
