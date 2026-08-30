@@ -1227,18 +1227,326 @@ Registry of every future-phase commitment made so far. Nothing in this section b
 
 ---
 
+---
+
+# Decision 04 — GGUF loader + mmap strategy
+
+## Deliverable
+
+A **`ultima --inspect <path.gguf>`** command that opens a real GGUF v3 file, memory-maps it, parses the header and metadata, walks the tensor directory, and prints a human-readable summary. No inference yet — this proves the whole file-loading pipeline works and is the prerequisite for every downstream module.
+
+Example expected output:
+
+```
+$ ultima --inspect qwen2.5-coder-0.5b-instruct-q4_k_m.gguf
+File:         qwen2.5-coder-0.5b-instruct-q4_k_m.gguf
+Size:         386.7 MiB
+Alignment:    32 bytes
+GGUF version: 3
+
+Metadata (48 keys):
+  general.architecture           = qwen2
+  general.name                   = Qwen2.5-Coder-0.5B-Instruct
+  general.file_type              = 15 (MOSTLY_Q4_K_M)
+  qwen2.block_count              = 24
+  qwen2.context_length           = 32768
+  qwen2.embedding_length         = 896
+  qwen2.feed_forward_length      = 4864
+  qwen2.attention.head_count     = 14
+  qwen2.attention.head_count_kv  = 2
+  qwen2.rope.freq_base           = 1000000
+  qwen2.rope.dimension_count     = 64
+  tokenizer.ggml.model           = gpt2
+  tokenizer.ggml.tokens          = <151936 entries>
+  ... (43 more)
+
+Tensors (291 total):
+  token_embd.weight              [896, 151936]   Q6_K       81.6 MiB
+  blk.0.attn_norm.weight         [896]           F32        3.5 KiB
+  blk.0.attn_q.weight            [896, 896]      Q4_K       471 KiB
+  blk.0.attn_q.bias              [896]           F32        3.5 KiB
+  ... (287 more)
+  output_norm.weight             [896]           F32        3.5 KiB
+
+Summary:
+  Architecture:      qwen2
+  Parameters:        494 M (approx.)
+  Quantization:      Q4_K_M
+  Context length:    32768
+  Vocab size:        151936
+  Total tensor size: 383.4 MiB
+```
+
+## 4.1 — GGUF v3 file format (public spec)
+
+GGUF (GPT-Generated Unified Format) is documented at https://github.com/ggerganov/gguf (spec repository — we reference the spec, not code). Layout, little-endian throughout:
+
+```
++---------------------------------------------------+
+|  Header                                           |
+|    u32  magic         = 0x46554747 ("GGUF")       |
+|    u32  version       = 3                         |
+|    u64  tensor_count                              |
+|    u64  metadata_kv_count                         |
++---------------------------------------------------+
+|  Metadata KV pairs (metadata_kv_count entries)    |
+|    Each: key (gguf_string) + value_type (u32)     |
+|          + value (variable, per value_type)       |
++---------------------------------------------------+
+|  Tensor infos (tensor_count entries)              |
+|    Each: name (gguf_string)                       |
+|          n_dims (u32)                             |
+|          dims[n_dims] (u64 each)                  |
+|          type (u32, ggml_type enum value)         |
+|          offset (u64, from tensor_data_base)      |
++---------------------------------------------------+
+|  Padding to `alignment` (default 32 bytes)        |
++---------------------------------------------------+
+|  Tensor data blob                                 |
+|    Contiguous, tensors packed at their offsets    |
++---------------------------------------------------+
+```
+
+**Value types** we support in v0.1: u8/i8/u16/i16/u32/i32/u64/i64/f32/f64, bool, string, array-of-any-of-the-above (recursive one level).
+
+**Tensor types (`ggml_type` enum)** we recognize by numeric value — we implement handlers for these in v0.1 (mapped to our own `DataType` enum so the banned name never appears in code):
+
+| GGUF type value | Our name       | Notes                                |
+|-----------------|----------------|--------------------------------------|
+| 0               | `DataType::F32`  | full precision (norms, biases)     |
+| 1               | `DataType::F16`  | half precision                     |
+| 8               | `DataType::Q8_0` | 32-block, F16 scale                |
+| 12              | `DataType::Q4_K` | K-quants super-block (256 elements) |
+| 14              | `DataType::Q6_K` | K-quants super-block               |
+
+All other numeric type values are logged as "unsupported quant type N, tensor <name> skipped" — the loader still enumerates them, we just can't dequant them in v0.1. This lets `--inspect` succeed on models with mixed exotic quants.
+
+**Little-endian only.** GGUF spec permits big-endian but no shipping model uses it. If magic bytes are `47 47 55 46` (byte-reversed), we reject with a clear error.
+
+## 4.2 — mmap strategy
+
+**Whole-file mmap, read-only, private mapping.** Windows: `CreateFileMappingW` + `MapViewOfFile`. Linux/macOS (reserved): `mmap(PROT_READ, MAP_PRIVATE)`.
+
+**Rationale:**
+- Instant "load" — OS pages in weights lazily as we touch them during forward pass
+- Multiple runs share the OS page cache — warm restarts are free
+- The kernel handles paging pressure; we never run out of RAM by loading a model larger than free memory
+- No copy from disk to userspace — the tensor's `.data()` pointer aims into the mmap
+- Works with files larger than free RAM (as long as they fit in virtual address space, which for 64-bit Windows is many TB)
+
+**No fallback to `fread`-based loading in v0.1.** If mmap fails (network drive, exotic FS), we return an error. Post-v0.1 we can add a slow copy-into-heap path.
+
+**Windows-specific detail:** `CreateFileMappingW` requires the file handle to be open with `FILE_SHARE_READ` so `ultima models verify` can run concurrently.
+
+**Lifetime rule:** the `LoadedModel` owns the mmap. All `TensorView` objects it hands out are non-owning references into that mapping. Closing the `LoadedModel` unmaps everything and invalidates every `TensorView`. No dangling — enforced by returning views through a `LoadedModel&` accessor, so views can't outlive the model.
+
+## 4.3 — Metadata parsing
+
+Parser is a straight linear read of the metadata section. For each KV:
+
+1. Read `key` (gguf_string: u64 length + UTF-8 bytes, no null terminator)
+2. Read `value_type` (u32)
+3. Dispatch on type to read the value (scalars are fixed-size; strings and arrays are length-prefixed)
+
+Values are stored in a `MetadataStore` — a `std::unordered_map<std::string, MetadataValue>` where `MetadataValue` is a `std::variant` over the supported types. Array-of-string is a special case (used for `tokenizer.ggml.tokens` with 151K entries) — stored as `std::vector<std::string>` inside the variant.
+
+**Selective materialization:** for very large arrays (>1 MB when materialized), we do not copy — we store an offset+count and lazily provide a view when accessed. The 151K-token vocab is the primary case. `--inspect` prints `<N entries>` for these; a future `--inspect --dump-vocab` would materialize on demand.
+
+**Required keys** (loader fails with a clear error if missing):
+- `general.architecture` — string, drives model dispatch
+- `general.file_type` — u32, tells us the dominant quant
+- `<arch>.block_count` — u32/u64, layer count
+- `<arch>.embedding_length` — u32/u64
+- `<arch>.attention.head_count` — u32/u64
+- `tokenizer.ggml.model` — string
+
+Everything else is optional. Missing optional keys are logged at INFO, not errors.
+
+## 4.4 — Tensor directory walk
+
+Each entry: name + ndims + dims + type + offset.
+
+We validate:
+1. Name is non-empty valid UTF-8 (no NULs, <256 chars)
+2. `ndims` ≤ 8 (spec bound; realistic max is 4)
+3. Each dim > 0
+4. Type is in the recognized enum values
+5. `offset` is aligned to `general.alignment` (default 32)
+6. `offset + size_bytes` ≤ file size
+
+Bad entries are rejected with `ErrorCode::InvalidModel` and a message naming the offending tensor.
+
+Tensor size in bytes is computed from `type` + `dims`. For K-quants (Q4_K, Q6_K), the block is 256 elements, so the product of dims must be divisible by 256 or we reject.
+
+Stored in a `TensorDirectory` — `std::vector<TensorInfo>` plus a `std::unordered_map<std::string, size_t>` for name-lookup.
+
+## 4.5 — Verification
+
+**SHA-256 verification is not the loader's job.** That belongs to the model registry (Decision 01e) — it checks the downloaded file against the registry's expected hash *before* handing the path to the loader. The loader assumes its input has already been verified.
+
+For v0.1, the loader only does:
+- Magic byte check (`GGUF`)
+- Version check (must be 3)
+- Structural validation (all offsets in-bounds, types recognized, dims positive)
+
+No mmap-time hashing. No repeated hashing per load.
+
+## 4.6 — Split (multi-file) GGUFs — deferred
+
+Large models on Hugging Face sometimes ship as `model-00001-of-00003.gguf` etc. v0.1 supports only single-file GGUFs — files matching the split pattern are rejected with a clear message: `"multi-file GGUFs not supported in v0.1; use a single-file quant"`. Post-v0.1 adds a `SplitGgufLoader` behind the same `IModelLoader` interface.
+
+## 4.7 — Interface
+
+Header: `include/ultima/model/i_model_loader.hpp`
+
+```cpp
+namespace ultima::model {
+
+enum class DataType {
+    F32, F16, Q8_0, Q4_K, Q6_K,
+    // Extended post-v0.1
+};
+
+struct TensorInfo {
+    std::string           name;
+    std::vector<uint64_t> dims;      // ndims <= 4 in practice
+    DataType              dtype;
+    uint64_t              offset;    // absolute byte offset in the file
+    uint64_t              size_bytes;
+};
+
+class TensorView {
+public:
+    const TensorInfo& info() const noexcept;
+    const void*       data() const noexcept;   // points into mmap; do not free
+};
+
+class LoadedModel {
+public:
+    virtual ~LoadedModel();
+
+    virtual const std::string&                          architecture() const = 0;
+    virtual const class MetadataStore&                  metadata()     const = 0;
+    virtual const std::vector<TensorInfo>&              tensor_infos() const = 0;
+    virtual std::optional<TensorView>                   tensor(std::string_view name) const = 0;
+
+    virtual uint64_t                                    file_size_bytes() const = 0;
+    virtual uint64_t                                    alignment()       const = 0;
+};
+
+class IModelLoader {
+public:
+    virtual ~IModelLoader() = default;
+
+    // Cheap: reads header only. Does not mmap the tensor blob. Good for
+    // registry inspection and pre-flight checks.
+    virtual tl::expected<class ModelMetadata, Error>
+        inspect(const std::filesystem::path& path) = 0;
+
+    // Full load: mmaps the file, validates the tensor directory. Fast — mmap
+    // is O(1); the linear walks are O(tensor_count) plus O(metadata_count).
+    virtual tl::expected<std::unique_ptr<LoadedModel>, Error>
+        load(const std::filesystem::path& path) = 0;
+};
+
+// Concrete implementation for v0.1
+std::unique_ptr<IModelLoader> make_gguf_loader();
+
+} // namespace ultima::model
+```
+
+Note the earlier decision to swap `tl::expected` for `nonstd::expected` (from expected-lite) — the interface uses whichever alias we settle on in the actual implementation. Signature shape is stable.
+
+## 4.8 — Files added to the repo for M2
+
+```
+include/ultima/model/
+    dtype.hpp
+    tensor_info.hpp
+    tensor_view.hpp
+    metadata_store.hpp
+    loaded_model.hpp
+    i_model_loader.hpp
+
+src/model/
+    CMakeLists.txt
+    gguf/
+        gguf_loader.hpp       (concrete class GgufLoader : IModelLoader)
+        gguf_loader.cpp
+        gguf_reader.hpp       (low-level byte reader over the mmap)
+        gguf_reader.cpp
+        gguf_types.hpp        (spec enum values, DataType mapping)
+        gguf_metadata.cpp     (metadata KV parse)
+        gguf_tensors.cpp      (tensor directory parse + validate)
+    mmap/
+        mmap_file.hpp         (platform-neutral RAII mmap handle)
+        mmap_file_windows.cpp
+        mmap_file_posix.cpp   (stub for v0.1, real for Linux/mac later)
+
+apps/ultima-cli/
+    main.cpp                  (add --inspect subcommand)
+
+tests/unit/
+    test_gguf_reader.cpp      (fixture-driven: tiny hand-crafted GGUF blobs)
+    test_gguf_loader.cpp      (asserts specific keys/tensors present)
+
+tests/fixtures/gguf/
+    tiny_valid.gguf           (100-byte hand-crafted, 1 tensor, no data)
+    tiny_bad_magic.gguf       (magic wrong)
+    tiny_bad_version.gguf     (version 99)
+    tiny_truncated.gguf       (file cut mid-tensor-directory)
+```
+
+Fixtures are hex-encoded in `.gguf.hex` files checked into git and reconstructed to binary at test-configure time by a small CMake helper (keeps binary blobs out of the repo).
+
+## 4.9 — Dependencies pulled in by M2
+
+Adds to `cmake/UltimaDeps.cmake`:
+- **nonstd::expected** (`martinmoene/expected-lite`, pinned) — error-carrying return values
+- **fmt** (already planned, pinned) — used by the error/log messages
+- No JSON dep yet — GGUF metadata is not JSON
+
+xxhash and cpp-httplib remain queued for later modules (model registry, HTTP server).
+
+## 4.10 — Cross-backend note
+
+| Concern | CPU (v0.1) | Vulkan | CUDA | Metal |
+|---|---|---|---|---|
+| mmap | Win: `CreateFileMappingW` / Posix: `mmap` | same | same | same |
+| Tensor data access | `TensorView.data()` returns host pointer | must be copied to device buffer before use | pinned host → async H2D | unified memory on Apple Silicon (no copy) |
+| Metadata parsing | pure CPU | pure CPU | pure CPU | pure CPU |
+| Loader interface | `IModelLoader` unchanged | unchanged | unchanged | unchanged |
+
+Adding a GPU backend later touches only *tensor upload*, not the loader. `LoadedModel::tensor(name)` still returns a host `TensorView`; the GPU backend copies from it on demand.
+
+## 4.11 — Definition of done for Decision 04 / M2
+
+- `ultima --inspect <path.gguf>` runs on real Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf and prints correct metadata + tensor list
+- Loader rejects bad-magic, bad-version, and truncated fixtures with clear errors
+- Unit tests cover: valid parse, missing required keys, out-of-bounds tensor offset, unsupported dtype (warns not errors), string vs. array-of-string values
+- No banned identifiers in any new file (CI taboo gate passes)
+- Build stays warnings-clean under `/W4 /WX`
+
 ## Please decide
 
-**Question 4:** ready to move to **Decision 04: GGUF loader + mmap strategy** (first actual runtime module we implement)?
+**Question 5:** Lock Decision 04 as written and start implementing M2 in the next reply?
 
-That decision covers:
-- Whole-file `mmap` vs. lazy per-tensor loading
-- GGUF v3 header + metadata parsing
-- Tensor directory walk, alignment enforcement
-- SHA-256 or xxhash verification on load
-- Multi-file (split GGUF) handling
-- Endianness (little-endian only for v0.1)
-- Which metadata keys we require vs. ignore
-- Exact `IModelLoader` interface signatures
+Override points:
+- **`--inspect` vs. `models inspect <path>`** — my pick is a top-level `--inspect` flag now, refactored into `ultima models inspect` when the models subcommand exists. Say if you'd rather skip the top-level flag.
+- **Fixture format** — I picked hex-encoded blobs reconstructed at build time. Alternative: commit small binary `.gguf` fixtures directly. Hex keeps `git diff` readable and repo textual.
 
-Say **"go"**.
+Say **"go"** and I write the M2 code + commit.
+
+## Future decisions (not written yet)
+
+- Decision 05 — CPU kernel policy (SIMD level, threading, dequant approach) — required before M1 tensor engine
+- Decision 06 — Model architecture layer (`IModel`, Qwen2Model, Qwen3Model dispatch) — required before M4
+- Decision 07 — Tokenizer strategy (BPE regex engine, chat template renderer) — required before M3
+- Decision 08 — Sampling
+- Decision 09 — KV cache + long-context (YaRN for Qwen3)
+- Decision 10 — Tools + MCP
+- Decision 11 — Skills
+- Decision 12 — Memory subsystem
+- Decision 13 — Adapter stub
+- Decision 14 — HTTP server + webui
+- Decision 15 — Editor-bridge reservation
