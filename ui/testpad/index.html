@@ -168,8 +168,14 @@ async function send() {
     ? [{ role: 'system', content: sysText }, ...state.messages]
     : state.messages;
 
-  const body = { model: 'ultima', messages, ...readParams() };
+  const body = { model: 'ultima', messages, stream: true, ...readParams() };
   const started = performance.now();
+
+  // Create the assistant bubble up front and stream content into it.
+  const bubble = addMessage('assistant', '');
+  const contentEl = bubble.querySelector('.content');
+  let content = '';
+
   try {
     const r = await fetch('/v1/chat/completions', {
       method: 'POST',
@@ -177,16 +183,59 @@ async function send() {
       body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const j = await r.json();
-    const wall = ((performance.now() - started) / 1000).toFixed(2);
-    const content = j.choices?.[0]?.message?.content ?? '';
-    const u = j.ultima || {};
-    const stats = `first ${u.first_token_ms?.toFixed?.(0) || '?'} ms · ` +
+    if (!r.body) throw new Error('no response body (SSE unsupported here?)');
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let finalStats = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Extract complete SSE events (delimited by "\n\n").
+      let sep;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const raw = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        // Each event may span multiple `data:` lines.
+        const dataLines = raw.split('\n')
+          .filter(l => l.startsWith('data: '))
+          .map(l => l.slice(6));
+        if (!dataLines.length) continue;
+        const payload = dataLines.join('\n');
+        if (payload === '[DONE]') continue;
+        try {
+          const j = JSON.parse(payload);
+          const delta = j.choices?.[0]?.delta;
+          if (delta && typeof delta.content === 'string') {
+            content += delta.content;
+            contentEl.textContent = content;
+            $('log').scrollTop = $('log').scrollHeight;
+          }
+          if (j.usage || j.ultima) finalStats = j;
+        } catch { /* skip malformed frame */ }
+      }
+    }
+
+    // Attach the final stats line.
+    let statsText = 'streamed';
+    if (finalStats?.ultima) {
+      const u = finalStats.ultima;
+      const wall = ((performance.now() - started) / 1000).toFixed(2);
+      statsText = `first ${u.first_token_ms?.toFixed?.(0) || '?'} ms · ` +
                   `${u.decode_toks || 0} tok · ` +
                   `${u.decode_tps?.toFixed?.(1) || '?'} tok/s · ` +
                   `seed ${u.seed} · wall ${wall}s`;
+    }
+    const s = document.createElement('div');
+    s.className = 'stats';
+    s.textContent = statsText;
+    bubble.appendChild(s);
+
     state.messages.push({ role: 'assistant', content });
-    addMessage('assistant', content, stats);
   } catch (e) {
     $('err').textContent = 'error: ' + e.message;
   } finally {
