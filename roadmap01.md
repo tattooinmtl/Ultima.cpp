@@ -1552,9 +1552,193 @@ Override points:
 
 Say **"go"** and I write the M2 code + commit.
 
+---
+
+# Decision 05 — CPU kernel policy
+
+## Scope
+
+Every arithmetic kernel Ultima runs on the CPU flows through the choices made here: SIMD level, alignment, threading, dequant approach, tensor storage layout. Wrong choices are expensive to reverse once forward passes exist.
+
+## 5.1 — SIMD baseline: AVX2 required, scalar fallback
+
+**Required at runtime on x86-64:** AVX2 + FMA. Detected via `__cpuid` at startup. If missing, exit with a clear error naming the missing feature.
+
+- Every mainstream desktop/laptop CPU from 2014 onward has AVX2.
+- Reference machine (Ryzen 7 5700U, Zen 2) has AVX2, no AVX-512.
+- Zen 4 has AVX-512 but we're not tuning for it in v0.1 (marginal on our reference box).
+
+**Scalar fallback path** for every hot kernel exists at compile time. Not shipped by default (dead code stripped), but the same source-level function is compilable in a scalar variant. Two reasons:
+1. Correctness oracle: golden tests run the scalar variant to cross-check the SIMD variant on the same inputs.
+2. Non-x86 platforms later (ARM64 for Apple Silicon, Raspberry Pi 5) — scalar is the fallback until NEON kernels exist.
+
+**No AVX-512 code in v0.1.** Zen 4 desktops would get a boost from it, but that's a v0.2 opt-in flag.
+
+**Intrinsics, not inline asm.** `<immintrin.h>` for MSVC/GCC/Clang. Portable across the three compilers, debuggable, no ABI landmines.
+
+## 5.2 — Alignment
+
+- All tensor storage aligned to **64 bytes** (one cache line, one AVX-512 register worth — future-proof, cheap).
+- Custom aligned allocator in `include/ultima/tensor/aligned_alloc.hpp`.
+- The mmap'd GGUF weights are aligned per the file's `general.alignment` (default 32). We do NOT re-copy them for alignment — we read via unaligned loads (`_mm256_loadu_si256`) inside dequant kernels. Zen 2 handles unaligned AVX2 loads at full throughput; the cost is a myth for our workload.
+- Activations/scratch tensors allocated by us get 64-byte alignment.
+
+## 5.3 — Threading model
+
+**Choice:** hand-rolled fixed-size thread pool. No OpenMP, no TBB, no `std::async`.
+
+**Rationale:**
+- One place to reason about all parallelism.
+- We control thread count precisely (matches launcher's Hardware tab slider).
+- Cross-platform without conditional builds.
+- OpenMP dependency spread would infect every consumer of a kernel; TBB adds a linkage.
+
+**API sketch:**
+
+```cpp
+class ThreadPool {
+public:
+    explicit ThreadPool(std::size_t n_threads);
+    ~ThreadPool();
+
+    // Parallel-for over [0, n). Blocking. work_fn is called with the range
+    // [start, end) each thread should process. Auto-chunks contiguously.
+    void parallel_for(std::size_t n, std::function<void(std::size_t, std::size_t)> work_fn);
+};
+```
+
+**Default thread count:** number of *physical* cores (not logical). On a Ryzen 7 5700U that's 8. Hyperthreading rarely helps compute-bound matmul; overrides via config for the curious.
+
+**Parallelism scope:** per-op, coarse-grained. A matmul splits its output rows across threads. No task-graph scheduling in v0.1 — that's an M6+ concern if we want operator fusion.
+
+## 5.4 — Dequantization approach
+
+Two possible strategies:
+
+| Approach | Description | Verdict |
+|---|---|---|
+| **A. Dequant-then-matmul** | Dequant a block to F32, then FMA into accumulator | Simple, general, wasteful — writes F32 scratch that immediately gets consumed |
+| **B. Fused dequant+matmul** | Dequant a block inline inside the matmul inner loop, no intermediate F32 storage | The right approach for a Q4×F32 matvec. Standard technique. Every mainstream local runtime does this. |
+
+**Choice: B (fused).** Non-negotiable for perf. A block of Q4_K weights (256 elements, 144 bytes) is unpacked into a register, immediately dotted with the corresponding activation slice, accumulated. No F32 weight buffer ever exists.
+
+**Kernel shapes we implement in M1:**
+- `matvec_q4k_f32` — Q4_K weight matrix × F32 activation vector → F32 output. **This is the generation-time hot path** (token-by-token forward pass runs this at every layer).
+- `matvec_q6k_f32` — same shape, Q6_K weight (used by embedding/output projection when file_type is Q4_K_M).
+- `matvec_q8_0_f32` — same shape, Q8_0 weight (some GGUFs keep certain tensors at Q8_0).
+- `matmul_f32_f32` — F32 × F32 for norms, biases, computed KV.
+- No mat-mat (batched N>1) Q4×F32 kernel in v0.1 — prompt processing runs the mat-vec kernel in a loop over tokens. Slower for long prompts but simpler code. Batched matmul is a v0.2 optimization.
+
+**Element-wise kernels:** `add`, `mul`, `silu`, `swiglu`, `rmsnorm`, `rope`, `softmax`. All F32-in, F32-out, AVX2-vectorized where the shape allows.
+
+## 5.5 — Tensor storage layout
+
+- **Row-major.** All dims listed outer-to-inner as they appear in the GGUF tensor directory.
+- **Contiguous.** No strides in v0.1 (all our tensors are freshly allocated with tight packing).
+- **Weights are read-only mmap views**, not copies. `Tensor` internally distinguishes "owned buffer" (activations, KV cache) from "view over mmap" (weights). Both types implement the same public interface.
+
+## 5.6 — Correctness harness
+
+Every SIMD kernel has a scalar counterpart and a golden test that:
+1. Generates random inputs at a fixed seed
+2. Runs the scalar variant → reference output
+3. Runs the SIMD variant → tested output
+4. Asserts max absolute error < 1e-4 (F32 kernels) or exact match (integer/dequant kernels)
+
+Test suite name: `test_kernels_correctness`. Runs in <1 second in Debug.
+
+**Later (before M4):** a second oracle test compares Ultima's per-layer outputs against reference outputs captured from `transformers` on the same GGUF, ensuring bit-close (max abs err < 1e-3) numerical parity for the whole forward pass. Captured fixtures live under `tests/fixtures/reference_outputs/`.
+
+## 5.7 — Compiler flags impact
+
+Adds to `cmake/UltimaCompilerFlags.cmake` (Decision 02) — kernel translation units only, not the whole project:
+
+- MSVC: `/arch:AVX2` on kernel objects
+- GCC/Clang: `-mavx2 -mfma` on kernel objects, `-march=native` NOT used (breaks portability of the built binary)
+- `-ffast-math` NOT used (breaks NaN handling, reproducibility)
+
+**Per-file flags via CMake `target_compile_options(<lib> PRIVATE ...)` scoped to `src/kernels/`.** Prevents accidental AVX2 in general code that must run on the fallback path.
+
+## 5.8 — File layout added at M1 (before writing kernel code)
+
+```
+include/ultima/tensor/
+    aligned_alloc.hpp
+    tensor.hpp            (owned buffer OR mmap view)
+    dtype_traits.hpp
+
+include/ultima/kernels/
+    matvec.hpp            (matvec_q4k_f32, matvec_q6k_f32, matvec_q8_0_f32, matvec_f32_f32)
+    elementwise.hpp       (add, mul, silu, swiglu)
+    norms.hpp             (rmsnorm)
+    rope.hpp              (Qwen2 variant; Qwen3+YaRN reserved as separate entry point)
+    softmax.hpp
+    cpu_features.hpp      (__cpuid wrapper, feature check at startup)
+
+src/tensor/
+    CMakeLists.txt
+    tensor.cpp
+    aligned_alloc.cpp
+
+src/kernels/
+    CMakeLists.txt        (adds /arch:AVX2 or -mavx2 -mfma scoped here)
+    cpu_features.cpp
+    matvec_q4k_f32.cpp
+    matvec_q6k_f32.cpp
+    matvec_q8_0_f32.cpp
+    matvec_f32_f32.cpp
+    elementwise.cpp
+    rmsnorm.cpp
+    rope.cpp
+    softmax.cpp
+    scalar/               (compiled only when ULTIMA_KERNELS_SCALAR_ONLY=ON, for tests)
+        matvec_q4k_f32_scalar.cpp
+        ... etc
+
+src/runtime/
+    thread_pool.hpp
+    thread_pool.cpp
+
+tests/unit/
+    test_cpu_features.cpp
+    test_thread_pool.cpp
+    test_kernels_correctness.cpp
+    test_aligned_alloc.cpp
+```
+
+## 5.9 — Cross-backend note
+
+| Concern | CPU (v0.1) | Vulkan (v0.2+) | CUDA (v0.3+) | Metal (v0.3+) |
+|---|---|---|---|---|
+| SIMD level | AVX2 + FMA | n/a (SPIR-V) | n/a (SASS) | n/a (MSL) |
+| Threading | ThreadPool (fixed) | queue submits | streams | command buffers |
+| Dequant approach | fused in-register | fused in-shader | fused in-kernel | fused in-shader |
+| Alignment | 64-byte host | device alignment per API | pinned + aligned | unified memory |
+| Kernel dispatch | function pointer per `DataType` | pipeline per shape | kernel per shape | pipeline per shape |
+
+Every kernel we write in v0.1 has a natural Vulkan/CUDA/Metal counterpart later — the dispatch layer (Decision 06) is what routes to the right backend.
+
+## 5.10 — What we explicitly defer
+
+- Batched (mat-mat) Q4×F32 kernels — matvec loop is enough for v0.1
+- AVX-512 code — Zen 4 opt-in, v0.2
+- Operator fusion (e.g., fused attention) — v0.2+
+- KV cache paged / sliding-window optimizations — needed for long context at M4+; scoped in Decision 09 (KV cache)
+- Speculative decoding — v0.3+ under the draft-model slot in the registry
+
+## Please decide
+
+**Question 6:** Lock Decision 05 as written?
+
+Override points:
+- **Threading:** hand-rolled pool is my pick. OpenMP is 3 lines of code and 20% smaller for the parallel_for pattern — argument for it is "less code to maintain," argument against is dependency spread. Say if you want OpenMP.
+- **AVX-512:** ignored in v0.1. If you know users on Zen 4 or newer Intel who'd get a real win, say so and I add a v0.2 opt-in flag now instead of later.
+- **Batched matmul:** deferred. If prompt processing speed matters more than code simplicity, we could add a mat-mat kernel in v0.1 — costs an extra week of implementation and testing.
+
+Say **"go"** and I'll start M1 implementation (aligned allocator + thread pool + Tensor + `cpu_features` + first scalar-only kernel with round-trip test) in the next reply.
+
 ## Future decisions (not written yet)
 
-- Decision 05 — CPU kernel policy (SIMD level, threading, dequant approach) — required before M1 tensor engine
 - Decision 06 — Model architecture layer (`IModel`, Qwen2Model, Qwen3Model dispatch) — required before M4
 - Decision 07 — Tokenizer strategy (BPE regex engine, chat template renderer) — required before M3
 - Decision 08 — Sampling
