@@ -1737,15 +1737,689 @@ Override points:
 
 Say **"go"** and I'll start M1 implementation (aligned allocator + thread pool + Tensor + `cpu_features` + first scalar-only kernel with round-trip test) in the next reply.
 
+# Decision 09 — KV cache & prefix reuse policy
+
+## Scope
+
+Every token generation call the transformer runs has to (a) find or allocate storage for the attention keys/values across all layers, (b) reuse whatever prefix already sits in that storage instead of recomputing it, and (c) release the storage when the session ends. This decision fixes the layout, the reuse model, the persistence story, and what we defer. Wrong choices here get expensive fast: the KV cache is by far the largest live allocation at runtime, and prefix reuse is the single biggest win for chat-style workloads (system prompt + history is identical turn-to-turn).
+
+Ownership: `kv_cache/` subsystem (spec §13). Required before M5 (streaming server). Design in place before M4 (transformer runtime) so the runtime writes to the right shapes on day one.
+
+## 9.1 — What "KV cache" means here
+
+At each transformer layer we compute two tensors per input token:
+- **K**: shape `[n_kv_heads, head_dim]` (Grouped-Query Attention — Qwen2/Qwen3 both use GQA, `n_kv_heads < n_heads`).
+- **V**: shape `[n_kv_heads, head_dim]`.
+
+Attention at position `t` reads **all** K/V from positions `0..t` in the same layer. If we recomputed them for every generated token, generation would be O(t²) per token. The KV cache is the standard fix: append K/V once when a token is first processed, then read the whole prefix on every subsequent step.
+
+The prefix-reuse question is orthogonal but shares the same buffer: if the *user's* next request begins with the same tokens as a previous one, the K/V for those tokens is already valid — we just point `pos` at the end of the match and prefill only the suffix.
+
+## 9.2 — Storage layout
+
+**Per layer, per slot, two contiguous tensors:**
+
+```
+K[layer]  : shape [n_kv_heads, n_ctx, head_dim]  dtype = f16 (default) or q8_0
+V[layer]  : shape [n_kv_heads, n_ctx, head_dim]  dtype = f16 (default) or q8_0
+```
+
+- **Time axis in the middle, not innermost.** Appending token at position `pos` writes one `[n_kv_heads, head_dim]` slab. Reading position range `[0, pos)` for attention reads a contiguous stripe per head. This matches how attention actually consumes the cache and gives us dense inner loops for the matmul.
+- **No paging in v0.1.** Each slot reserves `n_ctx` positions at allocation time. Simpler, no fragmentation, worst-case predictable. Paged attention (vLLM-style block manager) is a v0.3+ concern under long-context work.
+- **Row-major, contiguous, 64-byte aligned** (Decision 05).
+- **KV storage is owned (not mmap)** — the mmap distinction in Decision 05 §5.5 is for weights only. `Tensor` in "owned buffer" mode.
+
+**Sizing formula** (per slot):
+```
+bytes = 2 * n_layers * n_kv_heads * head_dim * n_ctx * dtype_bytes
+```
+
+Reference: Qwen2-7B (n_layers=28, n_kv_heads=4, head_dim=128) at n_ctx=4096, fp16 → **~117 MB / slot**. At n_ctx=32k → ~940 MB / slot. Ryzen 7 5700U reference box (32 GB DDR4) handles a few 4k slots comfortably; long-context slots need Q8_0 KV (see §9.5).
+
+## 9.3 — Slots
+
+**A slot is one allocated KV cache** (all layers, both K and V) plus the metadata needed to reuse or evict it. One slot per concurrent active session.
+
+- **CLI:** 1 slot, allocated at model load, sized to the launcher's `n_ctx` setting.
+- **Server (M5+):** N slots, launcher-configured. **Hard default `N = 2`** on the reference box (single-user + editor-bridge / MCP client). Sizing heuristic (`floor((RAM_budget - weights - overhead) / bytes_per_slot)`) exposed as a "compute slots" button in the launcher for users who want it. All slots pre-allocated at model load — no runtime growth. Rejecting a new session because slots are full is a valid response; oversubscribing memory is not.
+- **Eviction between sessions:** LRU. When a request arrives and no slot is free, the least-recently-used slot's token-id vector is discarded and the slot is reassigned. The K/V buffers are reused in place (no memset — the new prefill overwrites what it needs).
+
+**Metadata per slot:**
+```cpp
+struct KVSlot {
+    std::vector<TokenId> tokens;   // exact token ids currently valid in this slot
+    std::size_t          pos;      // number of valid positions (== tokens.size())
+    SessionId            owner;    // opaque; nullopt when free
+    std::uint64_t        touched_at; // monotonic counter for LRU
+    // K, V buffers live in a side allocation, one pair per layer
+};
+```
+
+## 9.4 — Prefix reuse (the "prompt cache")
+
+**In-session reuse** (same slot, next turn):
+
+1. Tokenize the new full prompt → `new_tokens`.
+2. Find the longest common prefix between `slot.tokens` and `new_tokens`. Call its length `lcp`.
+3. Truncate: `slot.pos = lcp`. The K/V beyond `lcp` is stale but not zeroed — subsequent writes overwrite it.
+4. Prefill only positions `[lcp, new_tokens.size())`. Generate as normal.
+
+This alone eliminates re-processing the system prompt + prior turns for chat workloads. Every mainstream runtime does this; it's the highest-leverage single feature in this whole decision.
+
+**Cross-session reuse** (v0.1, config flag, **off by default**):
+
+Persistent disk store keyed by `(model_id, tokenizer_hash, block_index, block_hash)`:
+- Split the token stream into fixed 256-token blocks.
+- Hash each block's token ids (xxhash64) → `block_hash`.
+- On prefill, look up each leading block; if present, mmap the K/V slab and copy it into the slot. Stop at the first miss.
+- On generation completion, write any new fully-formed blocks back.
+
+**Store layout:**
+```
+$ULTIMA_DATA/kv_cache/<model_id>/
+    index.sqlite               (rowid → (block_hash, layer, offset, len))
+    blocks/00/xx/xxxx.bin      (mmap'd K/V slabs, sharded by first hash bytes)
+```
+
+**Bounds:** on-disk size capped by config (default 8 GB per model). LRU eviction at the block level. Never grows unbounded.
+
+**Invalidation triggers** (drop the whole store for a `model_id`):
+- Model file swapped (mtime/size change on the GGUF).
+- Tokenizer changed (`tokenizer_hash` mismatch on load — hash of the tokenizer vocab + merges).
+- KV dtype changed (fp16 ↔ q8_0 mixing is not safe).
+
+**What does NOT invalidate reuse** (KV cache is pre-sampler):
+- Sampling parameters (temperature, top_p, top_k, min_p, repetition penalty).
+- RNG seed.
+- Max tokens / stop sequences.
+- Streaming vs. non-streaming.
+
+## 9.5 — KV dtype: fp16 and Q8_0 both in v0.1
+
+- **fp16:** default when the loaded weight file uses fp16 or Q8_0 tensors (small models, oracle runs). One dtype path, no per-block dequant on attention read.
+- **Q8_0:** default when the loaded weight file uses **any 4-bit K-quant** (Q4_K_M, Q4_K_S). Halves KV memory (117 MB → 60 MB per slot at Qwen2-7B/4k, ~470 MB at 32k). On the reference box (32 GB, no dGPU, 4-bit quants as the primary target) this is what makes long context practical; quality cost is small and dominated by the 4-bit weight noise anyway.
+- **Auto-selection** based on file quant class; launcher slider can override to `fp16` for correctness debugging.
+- **No fp8** — no portable CPU fp8; revisit with GPU backends.
+- Attention read path handles both dtypes via the same kernel entry point (`attn_read_kv`); the Q8_0 variant fuses dequant into the softmax-input dot product (mirror of the Decision 05 §5.4 fused-dequant policy).
+
+## 9.6 — Long context & RoPE scaling
+
+Qwen2 ships with `n_ctx_train = 32768`. Qwen3 ships with YaRN scaling metadata in GGUF for extending beyond `n_ctx_train`.
+
+- **Default:** cap `n_ctx` at `n_ctx_train`. Loud error if the launcher asks for more without YaRN metadata in the GGUF — never silently clamp (silent clamping produces confusing tokens-per-second numbers and broken long-doc behavior; the user needs to know their request wasn't honored).
+- **YaRN:** if the GGUF declares `rope.scaling.type = yarn`, apply the YaRN factors in the RoPE kernel (Decision 05 §5.4 reserved `rope.hpp` as an entry point; the Qwen3 variant lands with Decision 06).
+- **Sliding window attention:** deferred to v0.3. Qwen2/Qwen3 base models don't use it; Mistral-style windowed attention is a per-architecture toggle we can add when we support such a model.
+
+## 9.7 — API sketch
+
+```cpp
+namespace ultima::kv_cache {
+
+class KVCache {
+public:
+    struct Config {
+        std::size_t n_slots;
+        std::size_t n_ctx;
+        std::size_t n_layers;
+        std::size_t n_kv_heads;
+        std::size_t head_dim;
+        DType       dtype;            // fp16 or q8_0
+    };
+
+    explicit KVCache(const Config&);   // allocates all slots up front
+
+    // Acquire (or steal via LRU) a slot for this session, returning its handle.
+    SlotHandle acquire(SessionId);
+
+    // Longest common prefix of the slot's current tokens and `new_tokens`.
+    // Truncates slot.pos to the LCP as a side effect.
+    std::size_t reuse_prefix(SlotHandle, std::span<const TokenId> new_tokens);
+
+    // Write one token's K/V into the slot at slot.pos, then increment pos.
+    void append(SlotHandle, std::size_t layer, KVView k, KVView v);
+
+    // Read positions [0, slot.pos) for attention at the given layer.
+    KVReadView read(SlotHandle, std::size_t layer) const;
+
+    void release(SlotHandle);
+};
+
+} // namespace ultima::kv_cache
+```
+
+The transformer runtime (Decision 06) is the only caller. The server (M5) never touches `KVCache` directly — it hands the runtime a `SessionId` and lets the runtime pick the slot.
+
+## 9.8 — File layout added at M4
+
+```
+include/ultima/kv_cache/
+    kv_cache.hpp
+    kv_slot.hpp
+    prefix_store.hpp        (persistent block store; off by default)
+
+src/kv_cache/
+    CMakeLists.txt
+    kv_cache.cpp
+    prefix_store.cpp
+
+tests/unit/
+    test_kv_cache_slot.cpp
+    test_prefix_reuse.cpp
+    test_prefix_store.cpp
+```
+
+## 9.9 — What we explicitly defer
+
+- **Paged / block-manager KV** (vLLM-style). Requires attention-kernel changes and a memory manager. v0.3+, tied to long-context work.
+- **Cross-request batching** (sharing prefill work across concurrent requests). v0.3+.
+- **fp8 KV.** No portable CPU fp8; revisit with GPU backends.
+- **Sliding-window attention.** Per-architecture; add with the first model that needs it.
+- **Speculative decoding cache interactions.** Draft-model slot in the registry already reserved (Decision 01e); KV interactions defined when speculative decoding lands.
+- **Live cache introspection / eviction API for tools.** Diagnostic dumps only in v0.1.
+
+## 9.10 — Locked settings (reference box: Ryzen 7 5700U, 32 GB, no dGPU, 4-bit quants primary)
+
+All four override paths **are implemented in v0.1**. Defaults are tuned for this hardware and a single primary user; every default is a launcher-editable knob.
+
+| Setting | Default | Why this default here |
+|---|---|---|
+| **Cross-session persistent store** | **off** | Single user, one machine — hit rate is low across boots, and silent disk growth / stale-cache debugging outweighs the win. Flip on if disk is cheap and system prompts are stable. |
+| **KV dtype** | **auto from weight file** — fp16 for fp16/Q8_0 weights, **Q8_0 for Q4_K_M/Q4_K_S** | 4-bit quants are the primary target. Halving KV to Q8_0 turns "4k context, comfortable" into "16k context, comfortable" on 32 GB. Correctness cost is small relative to the 4-bit weight noise. |
+| **Server slot count** | **2** (single user + one MCP/editor client) | Sizing heuristic exists (`floor(...)`) as a launcher "compute" button for users on bigger boxes; 2 is what the reference box actually wants. |
+| **`n_ctx` above `n_ctx_train` without YaRN metadata** | **loud error** | Silent clamping produces confusing tok/s numbers and broken long-doc runs — user needs to know their request wasn't honored. |
+
+**Locked.** M4 transformer runtime targets this API. Ship-quality but tuned for the reference box; every default is one launcher toggle away from something else.
+
+# Decision 06 — Model architecture layer (`IModel` dispatch)
+
+## Scope
+
+One narrow interface (`IModel`) that the transformer runtime (M4) calls to execute a forward pass and manage KV cache slots (Decision 09). Concrete implementations select themselves from GGUF metadata at load time. v0.1 ships **Qwen2** (which covers Qwen2.5-Coder — the primary coding target) and **Qwen3** (which covers Qwen3-Coder). Both are GQA transformer stacks; the differences are the RoPE flavor, the normalization placement, and a handful of tensor names — small enough to keep in one file per architecture.
+
+Ownership: `include/ultima/model/*.hpp` + `src/model/*.cpp`. Required before M4 code lands.
+
+## 6.1 — Why both, not just Qwen2
+
+Qwen2.5-Coder-7B-Instruct at Q4_K_M is the ship-day coding model (Decision 01). Qwen3-Coder is the same story with slightly better output and YaRN long-context support (Decision 01c). Building the layer with two live architectures on day one is the only way to prove the abstraction is a real seam and not a decoration around one implementation. It's also how the launcher (Decision 03) can offer both without a runtime rebuild.
+
+## 6.2 — The interface
+
+```cpp
+namespace ultima::model {
+
+struct ModelDims {
+    std::size_t n_layers;
+    std::size_t n_heads;      // attention heads
+    std::size_t n_kv_heads;   // grouped-query (Qwen2/3 both use GQA)
+    std::size_t head_dim;
+    std::size_t hidden;       // n_heads * head_dim
+    std::size_t ffn_hidden;   // SwiGLU intermediate size
+    std::size_t vocab;
+    std::size_t n_ctx_train;
+};
+
+struct RopeConfig {
+    float       freq_base;    // 10000 for Qwen2; per-file for Qwen3
+    std::size_t rope_dim;     // == head_dim for both; kept explicit
+    enum class Scaling { None, YaRN } scaling = Scaling::None;
+    float       yarn_factor       = 1.0f;    // set from GGUF when Scaling::YaRN
+    float       yarn_ctx_train    = 0.0f;
+    float       yarn_attn_factor  = 1.0f;
+    float       yarn_beta_fast    = 32.0f;
+    float       yarn_beta_slow    = 1.0f;
+};
+
+class IModel {
+public:
+    virtual ~IModel() = default;
+
+    virtual const ModelDims&  dims()  const noexcept = 0;
+    virtual const RopeConfig& rope()  const noexcept = 0;
+    virtual const char*       arch()  const noexcept = 0;   // "qwen2" | "qwen3"
+
+    // Prefill a run of tokens starting at kv_slot.pos. Advances slot.pos.
+    // logits (last token only) written to `out_logits` [vocab].
+    virtual void prefill(kv_cache::SlotHandle slot,
+                         std::span<const std::int32_t> tokens,
+                         float* out_logits) noexcept = 0;
+
+    // One-token decode using the slot's current state; appends to slot.
+    virtual void decode(kv_cache::SlotHandle slot,
+                        std::int32_t token,
+                        float* out_logits) noexcept = 0;
+};
+
+std::unique_ptr<IModel> load_from_gguf(const model::GgufFile& file,
+                                       kv_cache::KVCache& kv,
+                                       runtime::ThreadPool& pool);
+
+} // namespace ultima::model
+```
+
+Prefill/decode are the only two hot-path methods. Sampling lives outside `IModel` (Decision 08) — the runtime takes `out_logits` and feeds it to the sampler chain.
+
+## 6.3 — Dispatch
+
+`load_from_gguf` reads `general.architecture` from GGUF metadata:
+
+| GGUF `general.architecture` | Concrete class      | Notes |
+|---|---|---|
+| `qwen2`                     | `Qwen2Model`        | Qwen2, Qwen2.5, Qwen2.5-Coder all report `qwen2` |
+| `qwen3`                     | `Qwen3Model`        | Qwen3 and Qwen3-Coder both report `qwen3` |
+| anything else               | error at load       | Do not silently fall back |
+
+Different fine-tunes on the same architecture share the same class — the tokenizer + chat template distinguishes them (Decision 07).
+
+## 6.4 — Architectural differences that matter for v0.1
+
+| Aspect | Qwen2 / Qwen2.5-Coder | Qwen3 / Qwen3-Coder |
+|---|---|---|
+| Positional | RoPE (base 10000), no scaling in base checkpoints | RoPE + YaRN scaling metadata for long context |
+| Norm         | RMSNorm (pre-norm on attention and MLP) | RMSNorm (pre-norm) + Q/K RMSNorm inside attention |
+| Attention    | GQA (n_kv_heads < n_heads) | GQA with Q/K normalization |
+| MLP          | SwiGLU (gate/up/down) | SwiGLU (gate/up/down) |
+| Tie weights  | Some sizes tie embed/lm_head, some don't | Same story |
+| Special toks | `<|im_start|>` / `<|im_end|>` chat markers | Same markers, extended template (thinking tags optional) |
+
+Two concrete classes, one shared `Qwen2Block` layer routine reused with a config flag for Qwen3's Q/K RMSNorm. Tensor-name lookup uses a per-arch table so `blk.{i}.attn_q.weight` and friends resolve without string juggling in the hot path.
+
+## 6.5 — Tensor-name mapping
+
+Fixed table per architecture, filled once at load. Missing tensors are a hard error at load — never silently zero-fill.
+
+```cpp
+struct TensorSlot { const char* name; TensorRef ref; bool required; };
+```
+
+## 6.6 — Long-context / YaRN
+
+RoPE kernel (Decision 05 §5.4) already reserved the entry point. Qwen2 uses the standard RoPE path. Qwen3 reads `rope.scaling.type = yarn` + factors from GGUF and passes them into a `rope_f32_yarn` variant. Behind Decision 09 §9.6: if scaling metadata is present, `n_ctx > n_ctx_train` is allowed; otherwise it's a loud error.
+
+## 6.7 — Files
+
+```
+include/ultima/model/
+    imodel.hpp           (interface + factory)
+    qwen2_model.hpp
+    qwen3_model.hpp
+    tensor_slots.hpp     (name → TensorRef helpers)
+
+src/model/
+    CMakeLists.txt
+    imodel.cpp           (factory / dispatch)
+    qwen2_model.cpp
+    qwen3_model.cpp
+    qwen_block.cpp       (shared attention + MLP block with per-arch flags)
+```
+
+## 6.8 — Deferred
+
+- Non-Qwen architectures (Llama, Mistral, Phi, Gemma). Each is a new concrete class; the interface is the seam.
+- Batched (N>1) prefill. `prefill` takes a token span but processes one-at-a-time via the matvec loop (Decision 05 §5.4). Batched matmul is a v0.2 kernel add.
+- Vision / audio heads. Text-only in v0.1.
+- Adapter / LoRA hot-load (Decision 13 stub).
+
+## 6.9 — Locked
+
+Two architectures, one interface, dispatch by GGUF `general.architecture`. Coding-model priority is Qwen2.5-Coder (via `Qwen2Model`) and Qwen3-Coder (via `Qwen3Model`); every other Qwen fine-tune on the same architecture just works.
+
+---
+
+# Decision 07 — Tokenizer strategy (smallest fast path)
+
+## Scope
+
+Turn a UTF-8 string into a `std::vector<int32_t>` of token ids, and turn ids back into UTF-8. Load the vocabulary and merges from GGUF metadata (no external tokenizer.json). Render Qwen2/Qwen3 chat templates without pulling in Jinja. Every millisecond here is a millisecond the user waits before the first token comes back on the reference box, so this is the smallest-hardware-first design.
+
+Ownership: `include/ultima/tokenizer/*.hpp` + `src/tokenizer/*.cpp`. Required before M3.
+
+## 7.1 — What "fast on small hardware" means concretely
+
+- **Encode ~200k chars/s single-threaded on the reference box.** Prompts of 4–8k tokens (typical coding session) tokenize in well under 100 ms.
+- **Zero external tokenizer files.** GGUF ships the vocab and merges; we read them once at load. No Python, no HuggingFace `tokenizer.json`, no `tokenizers` crate.
+- **No allocations in the encode hot loop.** Thread-local scratch (small `std::vector<int32_t>` reused across calls).
+- **Byte fallback is a table, not a branch.** 256-entry precomputed array of byte-fallback token ids so the encoder never falls off the trie into a slow path.
+
+## 7.2 — Algorithm: byte-level BPE with a trie
+
+Qwen2 and Qwen3 both use byte-level BPE (`tokenizer.model = gpt2`-style with the `Ġ` space marker). Load steps:
+
+1. Read `tokenizer.ggml.tokens` (string list, one per id) and `tokenizer.ggml.merges` (space-separated pairs) from GGUF.
+2. Build a **hash map `token_str → id`** (one lookup for special tokens and byte-fallback).
+3. Build a **merge-rank hash map `(id_a, id_b) → rank`** for the BPE loop.
+4. Build a **256-entry byte-fallback array** mapping every possible input byte to its `<0xXX>` fallback token id.
+5. Cache special-token ids (`<|im_start|>`, `<|im_end|>`, `<|endoftext|>`, and Qwen3's thinking markers).
+
+**Encode:**
+
+1. Regex pre-tokenization (GPT-2 pattern, cached compiled regex).
+2. For each pretoken: seed with byte-fallback ids; iteratively apply the lowest-rank merge until no merge in the sequence has a rank; append to output.
+3. No string interning inside the loop — everything runs on `int32_t` pairs after the initial byte split.
+
+Fast paths:
+- Pretokens ≤ 1 byte: single byte-fallback lookup, no merge loop.
+- Pretokens whose byte sequence exactly matches a full vocab entry: hash lookup shortcut before entering the merge loop.
+
+**Decode:** id → bytes → utf-8 pass-through. Handles the `Ġ` → space conversion. Streaming decode buffers partial multi-byte UTF-8 characters until the next chunk arrives.
+
+## 7.3 — Chat template rendering
+
+Qwen2/Qwen3 templates are simple ChatML-style loops (`<|im_start|>{role}\n{content}<|im_end|>\n`). We do **not** ship a Jinja engine. Instead:
+
+- Two hard-coded renderers (`render_qwen2_chatml`, `render_qwen3_chatml`) selected by GGUF `general.architecture` (dispatch in Decision 06).
+- Each takes `std::span<const ChatMessage>` where `ChatMessage = {role, content, name?, tool_calls?}` and returns a `std::string`.
+- Qwen3 extension: optional `<think>...</think>` block toggled per-request (thinking mode is a decode-time UX choice; the renderer just emits or suppresses).
+- Tool call rendering: JSON-serialized tool descriptions in the system slot when tools are active (wiring lives in Decision 10).
+
+If a user loads a fine-tune with a non-standard template, we fall back to raw text and log a warning. Jinja is a v0.2 concern behind a build flag.
+
+## 7.4 — Special-token handling
+
+Special tokens are never split by the regex or byte fallback. Encode splits the input at the first occurrence of any registered special-token string, emits its id, then continues. A boolean per-call parameter (`allow_special`) gates whether raw input strings can inject specials (default: **off** for user content, **on** for template renderers).
+
+## 7.5 — Files
+
+```
+include/ultima/tokenizer/
+    tokenizer.hpp        (encode/decode + BpeTokenizer class)
+    chat_template.hpp    (render_qwen2_chatml / render_qwen3_chatml)
+    special_tokens.hpp
+
+src/tokenizer/
+    CMakeLists.txt
+    bpe_tokenizer.cpp
+    chat_template_qwen2.cpp
+    chat_template_qwen3.cpp
+    pretokenize.cpp      (regex + fast-path splits)
+```
+
+## 7.6 — Deferred
+
+- Jinja template engine (v0.2 build flag; needed only for non-Qwen fine-tunes).
+- SentencePiece / Unigram tokenizers (needed for Llama-family models).
+- Parallel batch encode (encode is fast enough single-threaded at v0.1 prompt sizes).
+- Vocab loading from external `tokenizer.json` (GGUF is enough for the shipped models).
+
+## 7.7 — Locked
+
+Byte-level BPE loaded from GGUF, trie + merge-rank hashmap, thread-local scratch, hard-coded ChatML renderers for Qwen2 and Qwen3, no Jinja in v0.1. This is the shortest path to sub-100 ms prompt tokenization on the reference box.
+
+---
+
+# Decision 08 — Sampling
+
+## Scope
+
+Everything between "logits vector for the next token" and "int32 token id". Sampling is where most of the "why did the model say that" questions get answered on a small local box — bad defaults here mean the coding model repeats itself, hallucinates identifiers, or gives up early on a hard function. This decision picks the ladder of transforms, the defaults for a coding workload, and the RNG story so runs are reproducible when you want them to be.
+
+Ownership: `include/ultima/sampler/*.hpp` + `src/sampler/*.cpp`. Needed alongside M4.
+
+## 8.1 — The transform ladder (in order)
+
+Each transform is a `Sampler` node. The runtime builds a chain per request and applies it left-to-right to the logits vector before argmax/multinomial.
+
+1. **Logit bias** — add per-token biases (JSON API `logit_bias`).
+2. **Repetition penalty** — divide/multiply logits of recently seen tokens (window: last 64 by default).
+3. **DRY penalty** — pattern-repetition penalty (blocks the "keep echoing the previous line" failure common in code).
+4. **Frequency + presence penalty** — OpenAI-compatible.
+5. **Temperature** — `logits /= temp`. `temp == 0` short-circuits to greedy (no downstream transforms needed).
+6. **Top-k** — keep the top-k logits, zero the rest.
+7. **Top-p (nucleus)** — cumulative-prob cutoff.
+8. **Min-p** — drop tokens below `min_p * max_prob`.
+9. **Softmax + multinomial draw** — RNG from a seeded `std::mt19937_64`.
+
+Chain order matters: penalties apply to raw logits, temperature scales after penalties, filters cut after temperature, softmax happens last. Every transform is a no-op when its config is at the identity.
+
+## 8.2 — Defaults (coding-focused)
+
+| Param | Default | Reason |
+|---|---|---|
+| `temperature`        | 0.2 | Coding wants determinism-ish; 0.7 chat defaults hallucinate identifiers |
+| `top_k`              | 40 | Prunes the tail; cheap; standard |
+| `top_p`              | 0.95 | Nucleus safety net when the model is uncertain |
+| `min_p`              | 0.05 | Kills the long noise tail that top-p sometimes lets through |
+| `repetition_penalty` | 1.1 | Small; larger values break formatted code (variable reuse is legit) |
+| `repeat_last_n`      | 64  | Enough to catch immediate repeats without penalizing valid re-references |
+| `dry_multiplier`     | 0.8 | On by default — dry blocks the "same 3 lines forever" failure mode |
+| `dry_base`           | 1.75 |     |
+| `dry_allowed_len`    | 2   |     |
+| `frequency_penalty`  | 0.0 | Off — redundant with repetition penalty for local use |
+| `presence_penalty`   | 0.0 | Off — same reason |
+| `seed`               | random per request | Set explicitly for reproducibility |
+
+Greedy short-circuit: `temperature == 0` → argmax, skip everything after step 5. All penalty transforms still apply (they only need the recent-token window).
+
+## 8.3 — RNG
+
+- `std::mt19937_64` seeded from the request's `seed` (or `std::random_device()` when unset).
+- One RNG per request/slot (so two concurrent server requests don't interleave draws).
+- Seed is captured and returned in the response metadata — reproducing a run means replaying the seed.
+
+## 8.4 — Streaming interaction
+
+Sampler is stateless across tokens *except* for the recent-token window (for penalties). The window lives in the slot's metadata (Decision 09 §9.3 — `KVSlot.tokens` doubles as the penalty window; no separate ring buffer).
+
+## 8.5 — Files
+
+```
+include/ultima/sampler/
+    sampler.hpp          (Sampler chain + Config)
+    transforms.hpp       (penalty / temp / top-k / top-p / min-p / dry)
+
+src/sampler/
+    CMakeLists.txt
+    sampler.cpp
+    transforms.cpp
+    dry.cpp              (kept separate — matcher is the complex one)
+```
+
+## 8.6 — Deferred
+
+- Mirostat v1/v2 — interesting for chat, not helpful for code; add behind a flag in v0.2.
+- Guided decoding / JSON-schema constrained sampling — v0.3+; useful for tool-calling reliability.
+- Beam search — not applicable to chat/coding, deliberately never.
+- Speculative decoding hookup — belongs to draft-model slot (Decision 01e).
+
+## 8.7 — Locked
+
+Nine-node chain, coding-tuned defaults, one RNG per request, `temp == 0` shortcuts to argmax. Sampler builds per request; slot owns the recent-token window; response returns the seed for reproducibility.
+
+---
+
+# Decision 10 — Tools + MCP
+
+## Scope
+
+What the model can *do* on the user's machine beyond emitting tokens. Two layers: **built-in tools** compiled into the runtime, and **MCP servers** discovered from launcher config. Tools are named, JSON-schema-typed, and offered to the model via the OpenAI-style `tools` array in the chat request. This decision fixes the built-in tool set (matching the user's requested lineup), the MCP host model, and the permission story.
+
+Ownership: `include/ultima/tools/*.hpp` + `src/tools/*.cpp` + `src/mcp/*.cpp`. Wires into M5 (HTTP server) and the launcher (Decision 03).
+
+## 10.1 — MCP host
+
+**Launcher owns MCP subprocess lifetime.** Each MCP server declared in the launcher config is a long-lived stdio child process (per the MCP spec). The Ultima runtime talks to them through the launcher's IPC seam (Decision 03) — the runtime never spawns processes itself, keeping it sandboxable.
+
+- Transport: stdio JSON-RPC (MCP 1.0). WebSocket transport reserved for v0.2.
+- One process per server, restarted on crash with backoff.
+- `initialize` handshake at startup; `tools/list` cached and re-fetched on `notifications/tools/list_changed`.
+- Tool call flow: runtime → launcher → MCP server → response → runtime → model.
+
+## 10.2 — Built-in tool set (v0.1)
+
+Compiled in, no MCP hop. The list matches the user's brief; every tool has a JSON schema, a permission scope, and a rate limit knob.
+
+### File & shell
+- `bash_tool(command, cwd?, timeout_ms?)` → stdout/stderr/exit_code. Sandbox: launcher-configured allow-list of commands; default allow: read-only ops (`ls`, `cat`, `git status`), deny writes.
+- `create_file(path, content, overwrite?)` — under a launcher-configured project root.
+- `str_replace(path, old, new)` — exact-string replacement, refuses ambiguous matches.
+- `view(path, offset?, limit?)` — file view with line numbers.
+- `present_files(paths[])` — surface files back to the UI (no side effect).
+
+### Memory (per-user, persistent — see Decision 12)
+- `memory_read(key)`, `memory_write(key, value)`, `memory_str_replace(key, old, new)`, `memory_append(key, text)`, `memory_delete(key)`, `memory_list(prefix?)`.
+
+### Web & search
+- `web_search(query, limit?)`, `web_fetch(url, max_bytes?)`, `image_search(query, limit?)`.
+- `conversation_search(query)`, `recent_chats(limit?)`, `read_conversation(id)` — over the runtime's own chat history store (Decision 12).
+
+### Visualization widgets (renderers, side-effect-free)
+`chart_display_v0`, `comparison_card_display_v0`, `featured_card_display_v0`, `product_carousel_display_v0`, `itinerary_display_v0`, `places_map_display_v0`, `places_list_display_v0`, `places_search`, `step_card_display_v0`, `options_card_display_v0`, `quiz_display_v0`, `recipe_display_v0`, `translation_display_v0`, `link_preview_display_v0`, `message_compose_v1`, `weather_fetch`, `fetch_sports_data`, `ask_user_input_v0`, `visualize:read_me`, `visualize:show_widget`.
+
+These emit structured payloads the chat UI (Decision 03b) renders inline. The runtime doesn't render anything itself.
+
+### Research / discovery
+`suggest_research`, `suggest_connectors`, `search_mcp_registry`, `search_plugins`, `suggest_plugin_install`, `search_skills`, `suggest_skills`, `recommend_claude_apps`.
+
+### 3D / creative
+- `learn_threejs`, `show_threejs_scene` — the chat UI hosts a Three.js sandbox tab.
+- **Blender bridge** — the Blender MCP server (external addon) exposes `execute_blender_code`, `get_object_detail_summary`, `get_screenshot_of_window_as_image`, etc. Listed here for discovery; the tool bodies live in the addon, not in Ultima. Launcher config lists the Blender socket.
+
+### Conversation control
+- `end_conversation` — signals the runtime to close the current session cleanly.
+
+## 10.3 — Permissions
+
+Three-tier: **allow-always** (compiled-in-safe reads, viz widgets, memory reads), **prompt-once-per-session** (file writes under project root, web fetch, MCP tool calls), **prompt-every-time** (`bash_tool`, `memory_delete`, anything outside project root). Launcher owns the prompts; the runtime blocks until the launcher responds. No token authority for the runtime — every side-effecting call is user-approved.
+
+## 10.4 — Tool call flow (server side)
+
+1. Model emits a tool-call JSON block per Qwen2/Qwen3 chat template.
+2. Server parses; runs the local built-in synchronously, or forwards MCP calls through the launcher.
+3. Result is appended as a `tool` role message; decode resumes with the augmented context (reusing the KV prefix; only the new tool-result tokens are prefilled — Decision 09 §9.4).
+
+## 10.5 — Files
+
+```
+include/ultima/tools/
+    tool.hpp             (Tool trait, JSON-schema-typed input/output)
+    builtin/*.hpp        (one header per group above)
+
+src/tools/
+    CMakeLists.txt
+    tool.cpp
+    builtin/*.cpp
+
+include/ultima/mcp/
+    mcp_client.hpp       (stdio JSON-RPC client)
+src/mcp/
+    mcp_client.cpp
+```
+
+## 10.6 — Deferred
+
+- MCP WebSocket transport (v0.2).
+- Streaming tool results (v0.2 — matters for long file reads).
+- Tool result caching (v0.3).
+- OAuth / API-key vaulting inside the runtime — launcher handles secrets in v0.1.
+
+## 10.7 — Locked
+
+Launcher hosts MCP subprocesses; runtime calls tools through a single seam. Built-in tool set matches the user brief. Three-tier permission model with user-facing prompts owned by the launcher.
+
+---
+
+# Decision 11 — Skills
+
+## Scope
+
+Skills are the packaged "here is how to do X in this project" instructions the model loads on demand. This decision picks the skill file format, the discovery roots, the load model (in-context vs plan-and-dispatch), and the interop story with the user's existing `C:/.skills/` protocol.
+
+Ownership: `include/ultima/skills/*.hpp` + `src/skills/*.cpp`. Wires into the tool layer (Decision 10) via `search_skills` / `use_skill`.
+
+## 11.1 — Skill file format
+
+**Reuse the format already present in `examples/knowledge/patterns/*/SKILL.md`.** YAML frontmatter + Markdown body:
+
+```markdown
+---
+name: cpp-coding
+command: /cpp                # optional slash-command trigger
+description: One-line summary the LLM sees during discovery.
+---
+
+# Body — plain Markdown, no size cap.
+```
+
+Fields:
+- `name` (required, kebab-case, unique within its root).
+- `description` (required, ≤ 200 chars — this is the *only* thing the LLM sees before deciding to load).
+- `command` (optional, `/`-prefixed slash command).
+- `tags` (optional list, for filter).
+- `roots` (optional list of subdirs — a skill with `roots: [src/kernels]` only surfaces when the current work is under that path).
+
+Sibling files under the skill's directory (e.g. `visual-identity.md` alongside `SKILL.md`) are addressable references the body can link to via relative paths.
+
+## 11.2 — Discovery roots (priority order)
+
+Every startup, Ultima scans the following roots (first-match-wins for name collisions):
+
+1. **Project skills** — `<project>/.skills/` (per-repo overrides).
+2. **Project knowledge** — `<project>/examples/knowledge/patterns/` (the shipped tree).
+3. **Cross-agent skills** — `C:/.skills/skills/` (the user's `INDEX.md`-managed pool — 117 skills already migrated across sources).
+4. **Claude Code skills** — `~/.claude/skills/` (VS Code / Claude Code-installed skills like `bevy-voxel-*`, `mmx-cli`).
+5. **Built-in** — `<install>/skills/` (Ultima defaults).
+
+Discovery result is cached to `<user_data>/skills.index.json` and rebuilt on file-hash mismatch at startup.
+
+## 11.3 — Load model
+
+**v0.1 — in-context load.** When the model calls `use_skill("<name>")` or the user types `/<command>`, the skill body is injected into the system message for the current turn. Simple, works with the KV prefix cache (Decision 09 — the injected system content is stable across the session so it hits the reuse path).
+
+**v0.2 — plan-and-dispatch bridge** (later). The user's `C:/.skills/` protocol (`PROTOCOL.md`) is a rotation-based system: plan → dispatch phase-by-phase, each phase starts a new conversation with only its needed skills. v0.2 adds a `skills.dispatch` mode that reads the same `phases.md` / `active-skills.json` files so Ultima can plug into the existing pipeline. Not shipped in v0.1 — the in-context model covers the coding workflow, and dispatching multi-conversation phases needs the server (M5) first.
+
+## 11.4 — Skill discovery for the LLM
+
+Two tools (registered in Decision 10):
+
+- `search_skills(query, limit=10)` → list of `{name, description, root, path}`. Fuzzy match against `name` + `description` + `tags`.
+- `use_skill(name)` → loads the body into the current turn's system context; returns a confirmation with the skill's `description`.
+
+The launcher UI (Decision 03) also surfaces a "Skills" panel that lists everything discovered, grouped by root, with a toggle to preload favorites into every session.
+
+## 11.5 — Adjustments for `examples/knowledge/patterns/*`
+
+The existing SKILL.md files reference `run_shell`, `powershell`, and other-agent-specific tool names. Ultima's `search_skills` returns them verbatim; the LLM adapts to the local tool names using the descriptions in the Decision 10 built-in list. **No forced rewrite of the shipped skill files** — treating them as reference material keeps the user's existing pipeline compatible.
+
+For the M3+ ship, we add one **audit script** (`scripts/audit_skills.py`) that:
+1. Walks every discovery root.
+2. Parses SKILL.md frontmatter; flags missing `name`/`description`.
+3. Grep-flags references to tools not in the built-in list, so the user can rewrite or leave as-is.
+4. Emits a report to `<user_data>/skills.audit.md`.
+
+Non-blocking — audit output is informational, not a load-time gate.
+
+## 11.6 — Files
+
+```
+include/ultima/skills/
+    skill.hpp            (SkillEntry + parse)
+    skill_registry.hpp   (discovery + cache)
+
+src/skills/
+    CMakeLists.txt
+    skill.cpp
+    skill_registry.cpp
+    frontmatter.cpp
+
+scripts/
+    audit_skills.py      (informational; run manually)
+```
+
+## 11.7 — Deferred
+
+- Plan-and-dispatch mode (bridges into `C:/.skills/PROTOCOL.md`) — v0.2.
+- Skill dependencies (`requires: [other-skill]`) — v0.2.
+- Auto-loading skills based on file paths in view — v0.3.
+- Remote skill fetch (Git URL / registry) — v0.3+.
+
+## 11.8 — Locked
+
+SKILL.md frontmatter compatible with the existing `examples/knowledge/patterns/` files. Five-root discovery with priority order. In-context load in v0.1; the user's `C:/.skills/` rotation protocol interoperates in v0.2. `search_skills` + `use_skill` are the LLM entry points; launcher UI is the human entry point. Audit script is opt-in and informational.
+
+---
+
 ## Future decisions (not written yet)
 
-- Decision 06 — Model architecture layer (`IModel`, Qwen2Model, Qwen3Model dispatch) — required before M4
-- Decision 07 — Tokenizer strategy (BPE regex engine, chat template renderer) — required before M3
-- Decision 08 — Sampling
-- Decision 09 — KV cache + long-context (YaRN for Qwen3)
-- Decision 10 — Tools + MCP
-- Decision 11 — Skills
-- Decision 12 — Memory subsystem
-- Decision 13 — Adapter stub
-- Decision 14 — HTTP server + webui
+- Decision 12 — Memory subsystem (memory.db / memory.index / memory.cache)
+- Decision 13 — Adapter stub (LoRA hot-load)
+- Decision 14 — HTTP server + webui (OpenAI-compatible, SSE streaming)
 - Decision 15 — Editor-bridge reservation

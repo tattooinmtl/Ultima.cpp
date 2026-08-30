@@ -18,6 +18,8 @@ add_executable(ultima_test
     unit/test_dequant_q4k.cpp
     unit/test_matvec_q4k.cpp
     unit/test_q8_0.cpp
+    unit/test_q6k.cpp
+    unit/test_kernels_correctness.cpp
 )
 
 target_link_libraries(ultima_test
