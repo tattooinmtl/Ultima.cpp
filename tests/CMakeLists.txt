@@ -21,6 +21,8 @@ add_executable(ultima_test
     unit/test_q6k.cpp
     unit/test_kernels_correctness.cpp
     unit/test_tokenizer.cpp
+    unit/test_kv_cache.cpp
+    unit/test_sampler.cpp
 )
 
 target_link_libraries(ultima_test
@@ -31,6 +33,8 @@ target_link_libraries(ultima_test
         ultima_runtime
         ultima_kernels
         ultima_tokenizer
+        ultima_kv_cache
+        ultima_sampler
         ultima_warnings
         doctest::doctest
 )
