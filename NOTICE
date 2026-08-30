@@ -1,0 +1,37 @@
+Ultima.cpp
+Copyright (c) 2026 tattooinmtl
+
+Licensed under the MIT License. See LICENSE for the full text.
+
+--------------------------------------------------------------------------------
+
+This product depends on the following third-party projects, fetched at build
+time via CMake FetchContent and statically linked:
+
+  doctest         MIT             https://github.com/doctest/doctest
+  fmt             MIT             https://github.com/fmtlib/fmt
+  nlohmann/json   MIT             https://github.com/nlohmann/json
+  cpp-httplib     MIT             https://github.com/yhirose/cpp-httplib
+  xxhash          BSD-2-Clause    https://github.com/Cyan4973/xxHash
+  expected-lite   Boost-1.0       https://github.com/martinmoene/expected-lite
+  libcurl         MIT/X           https://curl.se/            (Windows: vendored, Linux/macOS: system)
+
+--------------------------------------------------------------------------------
+
+External binaries bundled under third_party/bin/<platform>/ (added post-scaffold):
+
+  ripgrep         MIT             https://github.com/BurntSushi/ripgrep
+  fd              MIT / Apache-2  https://github.com/sharkdp/fd
+
+--------------------------------------------------------------------------------
+
+Reference models (downloaded at runtime via the model registry, not bundled
+with the repository):
+
+  Qwen2.5-Coder family        Apache-2.0
+  BGE embedding family        MIT
+  Ornith-1.5-9B               MIT
+  all-MiniLM-L6-v2            Apache-2.0
+
+Each model retains its own license; see the model card on Hugging Face for the
+authoritative text.

@@ -1,0 +1,59 @@
+# Build outputs
+build/
+out/
+_deps/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.aps
+*.ipch
+*.pdb
+*.ilk
+
+# Binaries (allow bundled tools under third_party/bin/**)
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.exp
+!third_party/bin/**/*.exe
+!third_party/bin/**/*.dll
+
+# Wails / Node
+launcher/build/
+launcher/frontend/node_modules/
+launcher/frontend/dist/
+node_modules/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Runtime data — models and user state must never be committed
+models/
+.ultima/
+*.gguf
+*.safetensors
+*.bin
+
+# Test artifacts
+Testing/
+test_results/
+CTestTestfile.cmake

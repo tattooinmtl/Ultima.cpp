@@ -1,0 +1,5 @@
+# Bundled binary version pins. Update via scripts/refresh_bundled_binaries.*
+# Format:  <tool> <upstream-version> <sha256>
+
+ripgrep  (unset)  (unset)
+fd       (unset)  (unset)

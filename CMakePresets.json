@@ -1,0 +1,68 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+
+    "configurePresets": [
+        {
+            "name": "windows-msvc",
+            "displayName": "Windows / MSVC (multi-config)",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/windows-msvc",
+            "cacheVariables": {
+                "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "windows-msvc-release",
+            "inherits": "windows-msvc",
+            "displayName": "Windows / MSVC (Release-only alias)",
+            "binaryDir": "${sourceDir}/build/windows-msvc-release"
+        },
+        {
+            "name": "windows-msvc-debug",
+            "inherits": "windows-msvc",
+            "displayName": "Windows / MSVC (Debug-only alias)",
+            "binaryDir": "${sourceDir}/build/windows-msvc-debug"
+        }
+    ],
+
+    "buildPresets": [
+        {
+            "name": "windows-msvc-release",
+            "configurePreset": "windows-msvc-release",
+            "configuration": "Release"
+        },
+        {
+            "name": "windows-msvc-debug",
+            "configurePreset": "windows-msvc-debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "windows-msvc-relwithdebinfo",
+            "configurePreset": "windows-msvc",
+            "configuration": "RelWithDebInfo"
+        }
+    ],
+
+    "testPresets": [
+        {
+            "name": "windows-msvc-release",
+            "configurePreset": "windows-msvc-release",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true },
+            "execution": { "stopOnFailure": false }
+        },
+        {
+            "name": "windows-msvc-debug",
+            "configurePreset": "windows-msvc-debug",
+            "configuration": "Debug",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}
