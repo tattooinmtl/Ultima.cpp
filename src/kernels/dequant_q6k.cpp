@@ -20,7 +20,7 @@ float fp16_to_float(std::uint16_t h) noexcept {
             unsigned shift = 0;
             while ((mant & 0x0400u) == 0) { mant <<= 1; ++shift; }
             mant &= 0x03FFu;
-            exp   = 127u - 14u - shift + 1u;
+            exp   = 127u - 14u - shift;
             out_bits = sign | (exp << 23) | (mant << 13);
         }
     } else if (exp == 0x1Fu) {
@@ -42,22 +42,35 @@ float read_fp16_le(const std::uint8_t* bytes) noexcept {
 
 } // namespace
 
+// Matches ggml's dequantize_row_q6_K packing.
 void dequant_q6k_block(const std::uint8_t* block, float* out) noexcept {
-    const std::uint8_t* ql     = block + 0;
-    const std::uint8_t* qh     = block + 128;
-    const std::int8_t*  scales = reinterpret_cast<const std::int8_t*>(block + 192);
+    const std::uint8_t* ql_base = block + 0;
+    const std::uint8_t* qh_base = block + 128;
+    const std::int8_t*  sc_base = reinterpret_cast<const std::int8_t*>(block + 192);
     const float d = read_fp16_le(block + 208);
 
-    for (unsigned i = 0; i < 256; ++i) {
-        const unsigned sub   = i >> 4;               // /16
-        const int      scale = scales[sub];
+    for (unsigned half = 0; half < 2; ++half) {
+        const std::uint8_t* ql = ql_base + half * 64u;
+        const std::uint8_t* qh = qh_base + half * 32u;
+        const std::int8_t*  sc = sc_base + half * 8u;
+        float* y = out + half * 128u;
 
-        const unsigned low4  = (ql[i >> 1] >> ((i & 1u) * 4)) & 0x0Fu;
-        const unsigned high2 = (qh[i >> 2] >> ((i & 3u) * 2)) & 0x03u;
-        const unsigned q6    = low4 | (high2 << 4);
-        const int      q6_signed = static_cast<int>(q6) - 32;
+        for (unsigned l = 0; l < 32; ++l) {
+            const unsigned is = l >> 4;   // 0 for l<16, 1 for l>=16
+            const int q1 = static_cast<int>(
+                (ql[l     ] & 0x0Fu) | (((qh[l] >> 0) & 0x03u) << 4)) - 32;
+            const int q2 = static_cast<int>(
+                (ql[l + 32] & 0x0Fu) | (((qh[l] >> 2) & 0x03u) << 4)) - 32;
+            const int q3 = static_cast<int>(
+                (ql[l     ] >> 4)    | (((qh[l] >> 4) & 0x03u) << 4)) - 32;
+            const int q4 = static_cast<int>(
+                (ql[l + 32] >> 4)    | (((qh[l] >> 6) & 0x03u) << 4)) - 32;
 
-        out[i] = d * static_cast<float>(scale) * static_cast<float>(q6_signed);
+            y[l     ] = d * static_cast<float>(sc[is + 0]) * static_cast<float>(q1);
+            y[l + 32] = d * static_cast<float>(sc[is + 2]) * static_cast<float>(q2);
+            y[l + 64] = d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3);
+            y[l + 96] = d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4);
+        }
     }
 }
 

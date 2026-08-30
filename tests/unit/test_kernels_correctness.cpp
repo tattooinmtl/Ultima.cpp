@@ -30,14 +30,21 @@ float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
 // Reduction-order rounding: scalar sums element-by-element, SIMD sums in
 // 8 parallel lanes then horizontally. For random inputs whose partial sums
 // can reach O(1e5)+, an absolute tolerance is meaningless — a bug shows up
-// as a large *relative* deviation, not a large absolute one. This helper
-// scales the tolerance by the magnitude of the reference output.
+// as a large *relative* deviation.
+//
+// Per-element scaling (not per-vector max): dividing every deviation by
+// the single largest ref value lets a big-magnitude row mask a small-
+// magnitude row that's numerically wrong. Comparing each element against
+// its own scale (floored at 1.0 so a near-zero ref doesn't blow up the
+// ratio) catches per-row regressions.
 float max_rel_diff(const std::vector<float>& ref, const std::vector<float>& got) {
     REQUIRE(ref.size() == got.size());
-    float max_abs_ref = 0.0f;
-    for (float v : ref) max_abs_ref = std::max(max_abs_ref, std::abs(v));
-    const float floor_mag = std::max(max_abs_ref, 1.0f);
-    return max_abs_diff(ref, got) / floor_mag;
+    float max_rel = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const float scale = std::max(std::abs(ref[i]), 1.0f);
+        max_rel = std::max(max_rel, std::abs(ref[i] - got[i]) / scale);
+    }
+    return max_rel;
 }
 
 std::vector<float> random_f32(std::size_t n, std::mt19937& rng, float lo, float hi) {
