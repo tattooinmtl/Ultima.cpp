@@ -22,7 +22,7 @@ float fp16_to_float(std::uint16_t h) noexcept {
             unsigned shift = 0;
             while ((mant & 0x0400u) == 0) { mant <<= 1; ++shift; }
             mant &= 0x03FFu;
-            exp   = 127u - 14u - shift + 1u;
+            exp   = 127u - 14u - shift;
             out_bits = sign | (exp << 23) | (mant << 13);
         }
     } else if (exp == 0x1Fu) {
