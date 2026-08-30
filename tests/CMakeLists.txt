@@ -17,6 +17,7 @@ add_executable(ultima_test
     unit/test_rope.cpp
     unit/test_dequant_q4k.cpp
     unit/test_matvec_q4k.cpp
+    unit/test_q8_0.cpp
 )
 
 target_link_libraries(ultima_test

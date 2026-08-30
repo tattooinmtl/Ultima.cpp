@@ -2,7 +2,9 @@ add_library(ultima_kernels STATIC
     cpu_features.cpp
     matvec_f32_f32.cpp
     matvec_q4k_f32.cpp
+    matvec_q8_0_f32.cpp
     dequant_q4k.cpp
+    dequant_q8_0.cpp
     elementwise.cpp
     rmsnorm.cpp
     softmax.cpp

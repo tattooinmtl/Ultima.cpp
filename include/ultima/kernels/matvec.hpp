@@ -33,4 +33,11 @@ void matvec_q4k_f32       (const std::uint8_t* w, const float* x, float* y,
 void matvec_q4k_f32_scalar(const std::uint8_t* w, const float* x, float* y,
                            std::size_t M, std::size_t K) noexcept;
 
+// y[m] = sum_k dequant(W_q8_0)[m, k] * x[k]
+// K must be a multiple of 32 (Q8_0 block size).
+void matvec_q8_0_f32       (const std::uint8_t* w, const float* x, float* y,
+                            std::size_t M, std::size_t K) noexcept;
+void matvec_q8_0_f32_scalar(const std::uint8_t* w, const float* x, float* y,
+                            std::size_t M, std::size_t K) noexcept;
+
 } // namespace ultima::kernels
