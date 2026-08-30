@@ -350,6 +350,7 @@ Users can swap the coder model per project (`--model <path>.gguf`) and get a spe
 - Gemma-2 (different norm placement, logit soft-cap)
 - Phi-3/4 (fused QKV, sliding window)
 - DeepSeek-V2/V3 MoE + MLA (major project)
+- **`qwen35` (Qwopus-style hybrids)** — fused QKV + gated attention + SSM/Mamba layers + custom 248k vocab. Not a Qwen fork despite the name. Requires state-space kernels, fused-QKV path, gated attention variant, custom tokenizer. Realistic cost 4–8 weeks. Correct home: v0.4+ under "recurrent state architectures", not v0.1.
 
 Rationale:
 
@@ -1237,6 +1238,7 @@ Registry of every future-phase commitment made so far. Nothing in this section b
 - Gemma-2 (different norm placement, logit soft-cap)
 - Phi-3/4 (fused QKV, sliding window)
 - DeepSeek-V2/V3 MoE + MLA (major project)
+- `qwen35` / Qwopus hybrids (SSM+attention hybrid, fused QKV, gated attention, 248k custom vocab; v0.4+)
 
 ---
 
