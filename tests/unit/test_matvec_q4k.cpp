@@ -46,11 +46,13 @@ std::array<std::uint8_t, 144> build_block(float d, float dmin,
             b[4u + 4u + idx] = static_cast<std::uint8_t>(b[4u + 4u + idx] | ((mv >> 4) << 6));
         }
     }
-    for (unsigned i = 0; i < 128; ++i) {
-        const unsigned local_i = i % 16;
-        const unsigned lo = (2 * local_i    ) & 0x0Fu;
-        const unsigned hi = (2 * local_i + 1) & 0x0Fu;
-        b[16u + i] = static_cast<std::uint8_t>(lo | (hi << 4));
+    // qs[128] in true ggml layout: sub-block pair (2j, 2j+1) shares 32 bytes
+    // at qs[j*32 .. j*32+32); low nibble -> sub-block 2j, high -> 2j+1.
+    for (unsigned j = 0; j < 4; ++j) {
+        for (unsigned l = 0; l < 32; ++l) {
+            const unsigned nib = l & 0x0Fu;
+            b[16u + j * 32u + l] = static_cast<std::uint8_t>(nib | (nib << 4));
+        }
     }
     return b;
 }

@@ -3,94 +3,434 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Ultima testpad</title>
+<title>Ultima</title>
 <style>
   :root {
-    --bg:#0e0f13; --panel:#161821; --border:#252836;
+    --bg:#0e0f13; --panel:#161821; --panel-2:#12141c; --border:#252836;
     --fg:#e6e8ee; --muted:#8b90a1;
     --accent:#66d9ef; --user:#a1e6ff; --assistant:#e6e8ee;
-    --err:#ff6b6b;
+    --ok:#7bd88f; --warn:#e6a44a; --err:#ff6b6b;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
   }
   * { box-sizing: border-box; }
-  html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family:var(--sans); }
-  main { display:grid; grid-template-columns: 1fr 320px; height:100%; }
-  #chat { display:flex; flex-direction:column; overflow:hidden; }
-  #log  { flex:1; overflow-y:auto; padding:16px; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:var(--sans); overflow:hidden; }
+
+  /* ---- Frame ---- */
+  .frame { display:grid; grid-template-rows: 34px 40px 1fr; height:100%; }
+
+  /* ---- Top menu ---- */
+  .menu { display:flex; align-items:center; gap:2px; padding:0 8px; background:var(--panel);
+          border-bottom:1px solid var(--border); font-size:12px; user-select:none; }
+  .menu .m-item { padding:6px 10px; border-radius:4px; cursor:default; position:relative; }
+  .menu .m-item:hover, .menu .m-item.open { background:var(--border); }
+  .menu .m-item .m-drop {
+    display:none; position:absolute; top:100%; left:0; min-width:220px; background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:4px 0; z-index:100;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  .menu .m-item.open .m-drop { display:block; }
+  .menu .m-drop label { display:flex; align-items:center; gap:8px; padding:6px 12px; cursor:pointer; font-size:12px; }
+  .menu .m-drop label:hover { background:var(--border); }
+  .menu .m-drop label input[type=checkbox] { accent-color: var(--accent); }
+  .menu .m-drop .sep { height:1px; background:var(--border); margin:4px 0; }
+  .menu .m-drop .m-btn { display:block; padding:6px 12px; font-size:12px; cursor:pointer; }
+  .menu .m-drop .m-btn:hover { background:var(--border); }
+  .menu .spacer { flex:1; }
+  .menu .info { font-family:var(--mono); font-size:11px; color:var(--muted); padding:0 10px; }
+  .menu .info b { color:var(--fg); }
+  .menu .info .ok { color:var(--ok); }
+  .menu .info .err { color:var(--err); }
+
+  /* ---- Tab bar ---- */
+  .tabs { display:flex; align-items:center; gap:0; padding:0 8px; background:var(--panel-2);
+          border-bottom:1px solid var(--border); }
+  .tabs .tab { padding:8px 14px; cursor:pointer; font-size:13px; color:var(--muted);
+               border-bottom:2px solid transparent; margin-right:2px; user-select:none; }
+  .tabs .tab:hover { color:var(--fg); }
+  .tabs .tab.active { color:var(--fg); border-bottom-color:var(--accent); background:var(--panel); }
+  .tabs .tab .badge { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:8px;
+                       background:var(--accent); color:#0e0f13; font-size:10px; font-weight:600; }
+  .tabs .spacer { flex:1; }
+  .tabs .carousel-btn { font-size:12px; padding:6px 12px; background:var(--border); border:0;
+                         color:var(--fg); border-radius:4px; cursor:pointer; margin-left:8px; }
+  .tabs .carousel-btn:hover { background:#2f334a; }
+  .tabs .carousel-btn.active { background:var(--accent); color:#0e0f13; }
+
+  /* ---- Content area ---- */
+  .content { position:relative; overflow:hidden; }
+  .tab-view { position:absolute; inset:0; display:none; }
+  .tab-view.active { display:grid; }
+
+  /* Tab layouts */
+  .tab-assistant { grid-template-columns: 1fr 320px; }
+  .tab-coder     { grid-template-columns: 220px 1fr; }
+  .tab-brain     { grid-template-columns: 260px 1fr; }
+  .tab-inspector { grid-template-columns: 1fr; }
+
+  .pane { border-right:1px solid var(--border); display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+  .pane:last-child { border-right:0; }
+  .pane-hidden { display:none !important; }
+
+  /* ---- Assistant pane (chat) ---- */
+  .chat { display:flex; flex-direction:column; height:100%; min-height:0; }
+  .chat #log  { flex:1; overflow-y:auto; padding:16px; }
   .msg  { margin-bottom:14px; padding:10px 12px; border-radius:8px;
           background:var(--panel); border:1px solid var(--border); }
   .msg .role { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; margin-bottom:4px; }
-  .msg.user     .role { color:var(--user); }
+  .msg.user      .role { color:var(--user); }
   .msg.assistant .role { color:var(--accent); }
   .msg .content { white-space:pre-wrap; font-family:var(--mono); font-size:13px; line-height:1.5; }
   .msg .stats   { color:var(--muted); font-size:11px; margin-top:6px; font-family:var(--mono); }
-
   #compose { border-top:1px solid var(--border); padding:12px; background:var(--panel); display:flex; gap:8px; }
   #compose textarea { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--border);
                        border-radius:6px; padding:8px 10px; font-family:var(--mono); font-size:13px;
                        resize:vertical; min-height:64px; }
-  #compose button   { background:var(--accent); color:#0e0f13; border:0; border-radius:6px;
-                       padding:0 18px; font-weight:600; cursor:pointer; }
+  #compose button { background:var(--accent); color:#0e0f13; border:0; border-radius:6px;
+                     padding:0 18px; font-weight:600; cursor:pointer; }
   #compose button:disabled { opacity:.4; cursor:default; }
 
-  #side { border-left:1px solid var(--border); background:var(--panel); padding:14px; overflow-y:auto; }
-  #side h2 { font-size:12px; text-transform:uppercase; color:var(--muted); letter-spacing:.08em; margin:14px 0 6px; }
-  #side h2:first-child { margin-top:0; }
-  label { display:block; font-size:12px; margin:6px 0 2px; color:var(--muted); }
-  input[type="number"], input[type="text"], textarea.sys {
+  /* ---- Side pane (sampler / brain / inspector controls) ---- */
+  .side { background:var(--panel); padding:14px; overflow-y:auto; }
+  .side h2 { font-size:11px; text-transform:uppercase; color:var(--muted); letter-spacing:.08em; margin:14px 0 6px; }
+  .side h2:first-child { margin-top:0; }
+  .side label { display:block; font-size:11px; margin:6px 0 2px; color:var(--muted); }
+  .side input[type=number], .side input[type=text], .side textarea.sys {
     width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--border);
     border-radius:4px; padding:5px 7px; font-family:var(--mono); font-size:12px;
   }
-  textarea.sys { resize:vertical; min-height:60px; }
-  .row { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
-  .health { font-family:var(--mono); font-size:11px; color:var(--muted); line-height:1.7; }
-  .health b { color:var(--fg); font-weight:600; }
-  .err { color:var(--err); font-family:var(--mono); font-size:12px; margin-top:6px; }
-  .header { font-family:var(--mono); font-size:12px; color:var(--muted); padding:10px 14px; border-bottom:1px solid var(--border); }
-  .header b { color:var(--accent); font-weight:600; }
+  .side textarea.sys { resize:vertical; min-height:60px; }
+  .row2 { display:grid; grid-template-columns: 1fr 1fr; gap:6px; }
+  .sec-btn { width:100%; margin-top:8px; background:var(--border); color:var(--fg); border:0; padding:6px; border-radius:4px; cursor:pointer; font-size:12px; }
+  .sec-btn:hover { background:#2f334a; }
+  .err { color:var(--err); font-family:var(--mono); font-size:12px; margin-top:6px; min-height:16px; }
+
+  /* ---- Coder tab ---- */
+  .coder-tree { background:var(--panel); padding:8px 0; overflow-y:auto; font-family:var(--mono); font-size:12px; }
+  .coder-tree .item { padding:4px 12px; cursor:pointer; color:var(--muted); }
+  .coder-tree .item:hover { background:var(--border); color:var(--fg); }
+  .coder-tree .item.active { background:var(--border); color:var(--accent); }
+  .coder-main { display:grid; grid-template-rows: auto 1fr 160px; min-height:0; }
+  .coder-file-tabs { display:flex; overflow-x:auto; background:var(--panel-2); border-bottom:1px solid var(--border); }
+  .coder-file-tabs .ft { padding:6px 12px; font-size:12px; cursor:pointer; color:var(--muted); border-right:1px solid var(--border); white-space:nowrap; }
+  .coder-file-tabs .ft.active { color:var(--fg); background:var(--panel); }
+  .coder-editor { overflow:auto; padding:12px 16px; font-family:var(--mono); font-size:13px; white-space:pre; }
+  .coder-terminal { background:#08090c; color:#c8e3ff; padding:8px 12px; overflow-y:auto; font-family:var(--mono); font-size:12px; border-top:1px solid var(--border); white-space:pre-wrap; }
+
+  /* ---- Brain tab ---- */
+  .brain-list { background:var(--panel); padding:8px 0; overflow-y:auto; font-family:var(--mono); font-size:12px; }
+  .brain-list .b-hdr { padding:6px 12px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .brain-list .item { padding:4px 12px; cursor:pointer; }
+  .brain-list .item:hover { background:var(--border); }
+  .brain-main { padding:16px; overflow-y:auto; font-family:var(--mono); font-size:12px; color:var(--muted); }
+
+  /* ---- Inspector tab ---- */
+  .inspector { padding:16px; overflow-y:auto; }
+  .inspector h3 { color:var(--fg); font-size:13px; margin:16px 0 6px; }
+  .inspector h3:first-child { margin-top:0; }
+  .inspector .card { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:12px; margin-bottom:12px; }
+  .inspector pre { margin:0; font-family:var(--mono); font-size:11px; color:var(--muted); white-space:pre-wrap; }
+
+  /* ---- Carousel mode ---- */
+  .carousel-overlay { position:absolute; inset:0; background:var(--bg); z-index:50;
+                       display:none; align-items:center; justify-content:center; gap:24px; padding:24px; }
+  .carousel-overlay.active { display:flex; }
+  .carousel-nav { background:var(--panel); border:1px solid var(--border); color:var(--fg);
+                   width:44px; height:44px; border-radius:50%; font-size:20px; cursor:pointer;
+                   display:flex; align-items:center; justify-content:center; }
+  .carousel-nav:disabled { opacity:.3; cursor:default; }
+  .carousel-cards { flex:1; display:flex; gap:16px; overflow:hidden; align-items:center; justify-content:center; }
+  .carousel-card {
+    flex:0 0 30%; height:70vh; background:var(--panel); border:2px solid var(--border);
+    border-radius:8px; padding:16px; display:flex; flex-direction:column; cursor:pointer;
+    transition: transform .18s, border-color .18s;
+  }
+  .carousel-card.focused { border-color:var(--accent); transform: scale(1.05); }
+  .carousel-card h4 { margin:0 0 8px; font-size:16px; color:var(--accent); }
+  .carousel-card .desc { color:var(--muted); font-size:12px; }
+  .carousel-hint { position:absolute; bottom:16px; left:0; right:0; text-align:center;
+                    font-family:var(--mono); font-size:11px; color:var(--muted); }
 </style>
 </head>
 <body>
-<main>
-  <section id="chat">
-    <div class="header">Ultima testpad — <b id="hdr-model">…</b></div>
-    <div id="log"></div>
-    <div id="compose">
-      <textarea id="input" placeholder="Message (Ctrl+Enter to send)"></textarea>
-      <button id="send">Send</button>
+<div class="frame">
+
+  <!-- ---- Top menu ---- -->
+  <div class="menu" id="menu">
+    <div class="m-item" data-menu="file">File
+      <div class="m-drop">
+        <div class="m-btn" onclick="alert('New project — v0.2')">New project</div>
+        <div class="m-btn" onclick="alert('Open workspace — v0.2')">Open workspace…</div>
+        <div class="sep"></div>
+        <div class="m-btn" onclick="location.reload()">Refresh</div>
+      </div>
     </div>
-  </section>
-
-  <aside id="side">
-    <h2>System</h2>
-    <textarea id="sys" class="sys">You are a helpful coding assistant.</textarea>
-
-    <h2>Sampler</h2>
-    <div class="row">
-      <div><label>temperature</label><input type="number" id="temperature" step="0.05" value="0.2"/></div>
-      <div><label>top_k</label><input type="number" id="top_k" step="1" value="40"/></div>
-      <div><label>top_p</label><input type="number" id="top_p" step="0.05" value="0.95"/></div>
-      <div><label>min_p</label><input type="number" id="min_p" step="0.05" value="0.05"/></div>
-      <div><label>rep_penalty</label><input type="number" id="repetition_penalty" step="0.05" value="1.1"/></div>
-      <div><label>max_tokens</label><input type="number" id="max_tokens" step="16" value="256"/></div>
-      <div><label>seed</label><input type="number" id="seed" placeholder="random" /></div>
+    <div class="m-item" data-menu="edit">Edit
+      <div class="m-drop">
+        <div class="m-btn" onclick="alert('Undo — v0.2')">Undo</div>
+        <div class="m-btn" onclick="alert('Redo — v0.2')">Redo</div>
+      </div>
     </div>
-    <button id="reset-defaults" style="width:100%; margin-top:8px; background:var(--border); color:var(--fg); border:0; padding:6px; border-radius:4px; cursor:pointer;">Reset to coding defaults</button>
+    <div class="m-item" data-menu="layout">Layout
+      <div class="m-drop" id="layout-menu">
+        <!-- populated dynamically per active tab -->
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="info" id="hdr-model">model: <b>…</b></div>
+    <div class="info" id="hdr-slots">slots: <b>…</b></div>
+  </div>
 
-    <h2>Session</h2>
-    <button id="clear" style="width:100%; background:var(--border); color:var(--fg); border:0; padding:6px; border-radius:4px; cursor:pointer;">Clear history</button>
+  <!-- ---- Tab bar ---- -->
+  <div class="tabs" id="tabs">
+    <div class="tab active" data-tab="assistant">Assistant</div>
+    <div class="tab" data-tab="coder">Coder</div>
+    <div class="tab" data-tab="brain">Brain</div>
+    <div class="tab" data-tab="inspector">Inspector</div>
+    <div class="spacer"></div>
+    <button class="carousel-btn" id="carousel-toggle">⇄ Carousel</button>
+  </div>
 
-    <h2>Diagnostics</h2>
-    <div id="health" class="health">connecting…</div>
-    <div id="err" class="err"></div>
-  </aside>
-</main>
+  <!-- ---- Content ---- -->
+  <div class="content" id="content">
+
+    <!-- Assistant tab -->
+    <div class="tab-view tab-assistant active" data-tab-view="assistant">
+      <section class="pane chat" data-panel="chat">
+        <div id="log"></div>
+        <div id="compose">
+          <textarea id="input" placeholder="Message (Ctrl+Enter to send)"></textarea>
+          <button id="send">Send</button>
+        </div>
+      </section>
+      <aside class="pane side" data-panel="sampler">
+        <h2>System</h2>
+        <textarea id="sys" class="sys">You are a helpful coding assistant.</textarea>
+        <h2>Sampler</h2>
+        <div class="row2">
+          <div><label>temperature</label><input type="number" id="temperature" step="0.05" value="0.2"/></div>
+          <div><label>top_k</label><input type="number" id="top_k" step="1" value="40"/></div>
+          <div><label>top_p</label><input type="number" id="top_p" step="0.05" value="0.95"/></div>
+          <div><label>min_p</label><input type="number" id="min_p" step="0.05" value="0.05"/></div>
+          <div><label>rep_penalty</label><input type="number" id="repetition_penalty" step="0.05" value="1.1"/></div>
+          <div><label>max_tokens</label><input type="number" id="max_tokens" step="16" value="256"/></div>
+          <div><label>seed</label><input type="number" id="seed" placeholder="random"/></div>
+        </div>
+        <button id="reset-defaults" class="sec-btn">Reset to coding defaults</button>
+        <h2>Session</h2>
+        <button id="clear" class="sec-btn">Clear history</button>
+        <div class="err" id="err"></div>
+      </aside>
+    </div>
+
+    <!-- Coder tab -->
+    <div class="tab-view tab-coder" data-tab-view="coder">
+      <aside class="pane coder-tree" data-panel="tree">
+        <div style="padding:6px 12px; color:var(--muted); font-size:11px;">FILES</div>
+        <div class="item" onclick="alert('File tree wires to workspace when Decision 15 lands.')">(empty)</div>
+      </aside>
+      <section class="pane" data-panel="editor">
+        <div class="coder-main">
+          <div class="coder-file-tabs" id="coder-file-tabs">
+            <div class="ft active">no files</div>
+          </div>
+          <div class="coder-editor" id="coder-editor" data-panel="editor-body">// Files written by the model via write_project_file will open here as tabs.</div>
+          <div class="coder-terminal" data-panel="terminal">$ (terminal panel — bash_tool output streams here)</div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Brain tab -->
+    <div class="tab-view tab-brain" data-tab-view="brain">
+      <aside class="pane brain-list" data-panel="brain-list">
+        <div class="b-hdr">Memories (scope: session)</div>
+        <div class="item">(empty)</div>
+        <div class="b-hdr">Skills</div>
+        <div class="item">web-frontend</div>
+        <div class="item">html5-canvas</div>
+        <div class="item">threejs-3d</div>
+        <div class="item">web-anim</div>
+        <div class="item">sandbox-python</div>
+        <div class="item">sandbox-php</div>
+      </aside>
+      <section class="pane brain-main" data-panel="brain-detail">
+        Select a memory or skill on the left to inspect.
+        <br><br>
+        Full memory (Decision 12) + skill registry (Decision 11) wire here in v0.2 once
+        the runtime endpoints land.
+      </section>
+    </div>
+
+    <!-- Inspector tab -->
+    <div class="tab-view tab-inspector" data-tab-view="inspector">
+      <section class="pane" data-panel="inspector-main">
+        <div class="inspector">
+          <h3>Model dims</h3>
+          <div class="card"><pre id="insp-dims">loading…</pre></div>
+          <h3>KV slots</h3>
+          <div class="card"><pre id="insp-slots">loading…</pre></div>
+          <h3>Sampler chain (current defaults)</h3>
+          <div class="card"><pre id="insp-sampler">temp=0.2, top_k=40, top_p=0.95, min_p=0.05, rep_penalty=1.1, DRY on</pre></div>
+          <h3>Last request</h3>
+          <div class="card"><pre id="insp-last">no requests yet</pre></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Carousel overlay -->
+    <div class="carousel-overlay" id="carousel">
+      <button class="carousel-nav" id="car-prev">◀</button>
+      <div class="carousel-cards" id="car-cards"></div>
+      <button class="carousel-nav" id="car-next">▶</button>
+      <div class="carousel-hint">← → to navigate · ↑ to select · Esc to exit</div>
+    </div>
+
+  </div>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { messages: [] };
 
+// ---- Tab state --------------------------------------------------------------
+const TABS = [
+  { id: 'assistant', label: 'Assistant', desc: 'Chat with the model, tune the sampler.' },
+  { id: 'coder',     label: 'Coder',     desc: 'File tree, editor tabs, terminal — where multi-file model output lands.' },
+  { id: 'brain',     label: 'Brain',     desc: 'Memory browser + skills registry.' },
+  { id: 'inspector', label: 'Inspector', desc: 'Live model dims, KV slot usage, sampler config, last request.' },
+];
+const PANELS_PER_TAB = {
+  assistant: [ { id:'chat', label:'Chat' }, { id:'sampler', label:'Sampler & system' } ],
+  coder:     [ { id:'tree', label:'File tree' }, { id:'editor', label:'Editor tabs' }, { id:'editor-body', label:'Editor body' }, { id:'terminal', label:'Terminal' } ],
+  brain:     [ { id:'brain-list', label:'Memory + skills list' }, { id:'brain-detail', label:'Detail view' } ],
+  inspector: [ { id:'inspector-main', label:'Diagnostics' } ],
+};
+const layoutState = JSON.parse(localStorage.getItem('ultima-layout') || '{}');
+function panelVisible(tab, panel) {
+  const t = layoutState[tab] || {};
+  return t[panel] !== false;
+}
+function setPanelVisible(tab, panel, on) {
+  layoutState[tab] = layoutState[tab] || {};
+  layoutState[tab][panel] = on;
+  localStorage.setItem('ultima-layout', JSON.stringify(layoutState));
+  applyPanelVisibility(tab);
+}
+function applyPanelVisibility(tab) {
+  const view = document.querySelector(`[data-tab-view="${tab}"]`);
+  if (!view) return;
+  view.querySelectorAll('[data-panel]').forEach(el => {
+    const p = el.dataset.panel;
+    el.classList.toggle('pane-hidden', !panelVisible(tab, p));
+  });
+}
+function rebuildLayoutMenu(tab) {
+  const menu = $('layout-menu');
+  const panels = PANELS_PER_TAB[tab] || [];
+  menu.innerHTML = panels.map(p =>
+    `<label><input type="checkbox" data-panel-toggle="${p.id}" ${panelVisible(tab, p.id) ? 'checked' : ''}/> ${p.label}</label>`
+  ).join('') + '<div class="sep"></div><div class="m-btn" data-layout-reset>Reset layout for this tab</div>';
+  menu.querySelectorAll('input[data-panel-toggle]').forEach(cb => {
+    cb.onclick = () => setPanelVisible(tab, cb.dataset.panelToggle, cb.checked);
+  });
+  menu.querySelector('[data-layout-reset]').onclick = () => {
+    delete layoutState[tab];
+    localStorage.setItem('ultima-layout', JSON.stringify(layoutState));
+    applyPanelVisibility(tab);
+    rebuildLayoutMenu(tab);
+  };
+}
+
+// ---- Menu open/close --------------------------------------------------------
+document.querySelectorAll('.m-item').forEach(mi => {
+  mi.onclick = (e) => {
+    e.stopPropagation();
+    const wasOpen = mi.classList.contains('open');
+    document.querySelectorAll('.m-item').forEach(x => x.classList.remove('open'));
+    if (!wasOpen) mi.classList.add('open');
+  };
+});
+document.body.addEventListener('click', () => {
+  document.querySelectorAll('.m-item').forEach(x => x.classList.remove('open'));
+});
+
+// ---- Tab switching ----------------------------------------------------------
+let activeTab = 'assistant';
+function setActiveTab(id) {
+  activeTab = id;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === id));
+  document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.dataset.tabView === id));
+  rebuildLayoutMenu(id);
+  applyPanelVisibility(id);
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => setActiveTab(t.dataset.tab));
+
+// ---- Carousel ---------------------------------------------------------------
+let carouselOpen = false;
+let carouselIdx = 0;
+function openCarousel() {
+  carouselOpen = true;
+  $('carousel-toggle').classList.add('active');
+  const cards = TABS.map((t, i) => `
+    <div class="carousel-card ${i === carouselIdx ? 'focused' : ''}" data-idx="${i}">
+      <h4>${t.label}</h4>
+      <div class="desc">${t.desc}</div>
+    </div>`).join('');
+  $('car-cards').innerHTML = cards;
+  $('car-cards').querySelectorAll('.carousel-card').forEach(c => {
+    c.onclick = () => { carouselIdx = parseInt(c.dataset.idx); selectCarousel(); };
+  });
+  $('carousel').classList.add('active');
+}
+function closeCarousel() {
+  carouselOpen = false;
+  $('carousel-toggle').classList.remove('active');
+  $('carousel').classList.remove('active');
+}
+function refreshFocus() {
+  $('car-cards').querySelectorAll('.carousel-card').forEach((c, i) =>
+    c.classList.toggle('focused', i === carouselIdx));
+}
+function moveCarousel(dir) {
+  carouselIdx = Math.max(0, Math.min(TABS.length - 1, carouselIdx + dir));
+  refreshFocus();
+}
+function selectCarousel() {
+  setActiveTab(TABS[carouselIdx].id);
+  closeCarousel();
+}
+$('carousel-toggle').onclick = () => carouselOpen ? closeCarousel() : openCarousel();
+$('car-prev').onclick = () => moveCarousel(-1);
+$('car-next').onclick = () => moveCarousel(+1);
+document.addEventListener('keydown', (e) => {
+  if (e.altKey && e.key.toLowerCase() === 'c') { e.preventDefault(); carouselOpen ? closeCarousel() : openCarousel(); return; }
+  if (carouselOpen) {
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); moveCarousel(-1); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); moveCarousel(+1); }
+    if (e.key === 'ArrowUp')    { e.preventDefault(); selectCarousel(); }
+    if (e.key === 'Escape')     { e.preventDefault(); closeCarousel(); }
+  } else {
+    if (e.key === 'ArrowDown' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openCarousel(); }
+  }
+});
+
+// ---- Health poll ------------------------------------------------------------
+async function pollHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const j = await r.json();
+    $('hdr-model').innerHTML = `model: <b>${j.model}</b> (${j.arch})`;
+    $('hdr-slots').innerHTML = `slots: <b class="ok">${j.kv_slots.in_use}/${j.kv_slots.total}</b>`;
+    $('insp-slots').textContent = JSON.stringify(j.kv_slots, null, 2);
+    $('insp-dims').textContent  = 'arch: ' + j.arch + '\nmodel: ' + j.model;
+  } catch (e) {
+    $('hdr-model').innerHTML = 'model: <b class="err">unreachable</b>';
+  }
+}
+setInterval(pollHealth, 2000);
+pollHealth();
+
+// ---- Chat -------------------------------------------------------------------
+const state = { messages: [] };
 function addMessage(role, content, stats = null) {
   const box = document.createElement('div');
   box.className = 'msg ' + role;
@@ -106,28 +446,8 @@ function addMessage(role, content, stats = null) {
   $('log').scrollTop = $('log').scrollHeight;
   return box;
 }
-
-async function pollHealth() {
-  try {
-    const r = await fetch('/api/health');
-    const j = await r.json();
-    $('hdr-model').textContent = j.model + ' (' + j.arch + ')';
-    $('health').innerHTML =
-      `model:  <b>${j.model}</b><br>` +
-      `arch:   <b>${j.arch}</b><br>` +
-      `slots:  <b>${j.kv_slots.in_use}/${j.kv_slots.total}</b>`;
-  } catch (e) {
-    $('health').textContent = 'runtime unreachable';
-  }
-}
-setInterval(pollHealth, 2000);
-pollHealth();
-
 function readParams() {
-  const num = (id) => {
-    const v = $(id).value;
-    return v === '' ? undefined : Number(v);
-  };
+  const num = (id) => { const v = $(id).value; return v === '' ? undefined : Number(v); };
   const p = {
     temperature: num('temperature'),
     top_k: num('top_k'),
@@ -140,17 +460,11 @@ function readParams() {
   if (s !== undefined) p.seed = s;
   return p;
 }
-
 $('reset-defaults').onclick = () => {
-  $('temperature').value = 0.2;
-  $('top_k').value = 40;
-  $('top_p').value = 0.95;
-  $('min_p').value = 0.05;
-  $('repetition_penalty').value = 1.1;
-  $('max_tokens').value = 256;
-  $('seed').value = '';
+  $('temperature').value = 0.2; $('top_k').value = 40; $('top_p').value = 0.95;
+  $('min_p').value = 0.05; $('repetition_penalty').value = 1.1;
+  $('max_tokens').value = 256; $('seed').value = '';
 };
-
 $('clear').onclick = () => { state.messages = []; $('log').innerHTML = ''; };
 
 async function send() {
@@ -164,34 +478,26 @@ async function send() {
   addMessage('user', text);
 
   const sysText = $('sys').value.trim();
-  const messages = sysText
-    ? [{ role: 'system', content: sysText }, ...state.messages]
-    : state.messages;
+  const messages = sysText ? [{ role: 'system', content: sysText }, ...state.messages] : state.messages;
 
   const body = { model: 'ultima', messages, stream: true, ...readParams() };
   const started = performance.now();
-
-  // Create the assistant bubble up front and stream content into it.
   const bubble = addMessage('assistant', '');
   const contentEl = bubble.querySelector('.content');
   let content = '';
 
   try {
     const r = await fetch('/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
     if (!r.ok) {
-      // Surface the runtime's actual error message instead of a bare "HTTP 500".
       let detail = '';
-      try {
-        const j = await r.json();
-        detail = j.error || j.message || JSON.stringify(j);
-      } catch { detail = await r.text().catch(() => ''); }
+      try { const j = await r.json(); detail = j.error || JSON.stringify(j); }
+      catch { detail = await r.text().catch(() => ''); }
       throw new Error('HTTP ' + r.status + (detail ? ' — ' + detail : ''));
     }
-    if (!r.body) throw new Error('no response body (SSE unsupported here?)');
+    if (!r.body) throw new Error('no response body');
 
     const reader = r.body.getReader();
     const decoder = new TextDecoder('utf-8');
@@ -202,16 +508,11 @@ async function send() {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-
-      // Extract complete SSE events (delimited by "\n\n").
       let sep;
       while ((sep = buffer.indexOf('\n\n')) !== -1) {
         const raw = buffer.slice(0, sep);
         buffer = buffer.slice(sep + 2);
-        // Each event may span multiple `data:` lines.
-        const dataLines = raw.split('\n')
-          .filter(l => l.startsWith('data: '))
-          .map(l => l.slice(6));
+        const dataLines = raw.split('\n').filter(l => l.startsWith('data: ')).map(l => l.slice(6));
         if (!dataLines.length) continue;
         const payload = dataLines.join('\n');
         if (payload === '[DONE]') continue;
@@ -224,38 +525,36 @@ async function send() {
             $('log').scrollTop = $('log').scrollHeight;
           }
           if (j.usage || j.ultima) finalStats = j;
-        } catch { /* skip malformed frame */ }
+        } catch { /* skip malformed */ }
       }
     }
-
-    // Attach the final stats line.
     let statsText = 'streamed';
     if (finalStats?.ultima) {
       const u = finalStats.ultima;
       const wall = ((performance.now() - started) / 1000).toFixed(2);
-      statsText = `first ${u.first_token_ms?.toFixed?.(0) || '?'} ms · ` +
-                  `${u.decode_toks || 0} tok · ` +
-                  `${u.decode_tps?.toFixed?.(1) || '?'} tok/s · ` +
-                  `seed ${u.seed} · wall ${wall}s`;
+      statsText = `first ${u.first_token_ms?.toFixed?.(0) || '?'} ms · ${u.decode_toks || 0} tok · ${u.decode_tps?.toFixed?.(1) || '?'} tok/s · seed ${u.seed} · wall ${wall}s`;
+      $('insp-last').textContent = JSON.stringify(finalStats.ultima, null, 2);
     }
     const s = document.createElement('div');
     s.className = 'stats';
     s.textContent = statsText;
     bubble.appendChild(s);
-
     state.messages.push({ role: 'assistant', content });
   } catch (e) {
     $('err').textContent = 'error: ' + e.message;
+    contentEl.textContent = '(error — see sampler pane)';
   } finally {
     $('send').disabled = false;
     $('input').focus();
   }
 }
-
 $('send').onclick = send;
 $('input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
 });
+
+// ---- Init -------------------------------------------------------------------
+setActiveTab('assistant');
 </script>
 </body>
 </html>

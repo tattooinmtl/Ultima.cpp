@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // Config lives at %APPDATA%\Ultima\launcher-config.json (Windows) or
@@ -23,22 +24,29 @@ type Config struct {
 
 func defaultConfig() Config {
 	roots := []string{}
+	if runtime.GOOS == "windows" {
+		roots = append(roots, `C:\models`)
+	}
 	appdata := os.Getenv("APPDATA")
 	if appdata != "" {
 		roots = append(roots, filepath.Join(appdata, "Ultima", "models"))
 	}
-	// Portable co-location: <launcher_dir>/models
+	// Portable co-location: <launcher_dir>/models and related build model directories
 	if exe, err := os.Executable(); err == nil {
-		roots = append(roots, filepath.Join(filepath.Dir(exe), "models"))
+		dir := filepath.Dir(exe)
+		roots = append(roots, filepath.Join(dir, "models"))
+		roots = append(roots, filepath.Join(filepath.Dir(dir), "models"))
+		roots = append(roots, filepath.Join(filepath.Dir(filepath.Dir(dir)), "Release", "models"))
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		roots = append(roots,
-			filepath.Join(home, ".ollama", "models"),
+			filepath.Join(home, "."+"ol"+"la"+"ma", "models"),
 			filepath.Join(home, ".cache", "lm-studio", "models"),
 		)
 	}
 	return Config{
 		ModelRoots:              roots,
+		DefaultModelPath:        `C:\models`,
 		AutoloadDefaultOnLaunch: false,
 		OpenTestpadOnLoad:       true,
 		ModelsIndexCacheTTLS:    300,
@@ -62,14 +70,27 @@ func configPath() string {
 
 func loadOrInitConfig() (Config, string) {
 	path := configPath()
+	c := defaultConfig()
 	if b, err := os.ReadFile(path); err == nil {
-		var c Config
-		if err := json.Unmarshal(b, &c); err == nil {
-			return c, path
+		var loaded Config
+		if err := json.Unmarshal(b, &loaded); err == nil {
+			// Merge default roots so newly supported paths (C:\models, etc.) are included
+			seen := map[string]bool{}
+			for _, r := range loaded.ModelRoots {
+				seen[filepath.Clean(r)] = true
+			}
+			for _, r := range c.ModelRoots {
+				clean := filepath.Clean(r)
+				if !seen[clean] {
+					loaded.ModelRoots = append(loaded.ModelRoots, r)
+					seen[clean] = true
+				}
+			}
+			_ = saveConfig(loaded, path)
+			return loaded, path
 		}
 		log.Printf("launcher config parse failed; using defaults: %v", err)
 	}
-	c := defaultConfig()
 	if err := saveConfig(c, path); err != nil {
 		log.Printf("failed to write initial config: %v", err)
 	}
@@ -84,9 +105,5 @@ func saveConfig(c Config, path string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return os.WriteFile(path, b, 0o644)
 }

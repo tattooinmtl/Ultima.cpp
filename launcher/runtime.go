@@ -68,15 +68,77 @@ func (r *RuntimeManager) Load(path, host string, port, nCtx, nThreads int) (Load
 		return LoadedInfo{}, fmt.Errorf("start ultima.exe: %w", err)
 	}
 
-	// Copy runtime logs to the launcher's log so the user can see them.
-	go pipeLogs("runtime.out", stdout)
-	go pipeLogs("runtime.err", stderr)
+	var lastErrMu sync.Mutex
+	lastErr := ""
 
-	// Wait for /api/health to answer.
-	healthy := waitForPort(host, port, 15*time.Second)
+	if stderr != nil {
+		go func() {
+			defer stderr.Close()
+			buf := make([]byte, 4096)
+			for {
+				n, err := stderr.Read(buf)
+				if n > 0 {
+					msg := trimTrailingNL(string(buf[:n]))
+					log.Printf("[runtime.err] %s", msg)
+					lastErrMu.Lock()
+					lastErr = msg
+					lastErrMu.Unlock()
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+	if stdout != nil {
+		go pipeLogs("runtime.out", stdout)
+	}
+
+	// Monitor child process exit while waiting for health
+	exitCh := make(chan error, 1)
+	go func() {
+		exitCh <- cmd.Wait()
+	}()
+
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	deadline := time.Now().Add(15 * time.Second)
+	healthy := false
+
+	for time.Now().Before(deadline) {
+		select {
+		case exitErr := <-exitCh:
+			cancel()
+			lastErrMu.Lock()
+			errMsg := lastErr
+			lastErrMu.Unlock()
+			if errMsg != "" {
+				return LoadedInfo{}, fmt.Errorf("%s", errMsg)
+			}
+			if exitErr != nil {
+				return LoadedInfo{}, fmt.Errorf("runtime exited: %w", exitErr)
+			}
+			return LoadedInfo{}, fmt.Errorf("runtime process exited unexpectedly")
+		default:
+		}
+
+		c, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			healthy = true
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
 	if !healthy {
 		_ = cmd.Process.Kill()
 		cancel()
+		lastErrMu.Lock()
+		errMsg := lastErr
+		lastErrMu.Unlock()
+		if errMsg != "" {
+			return LoadedInfo{}, fmt.Errorf("%s", errMsg)
+		}
 		return LoadedInfo{}, fmt.Errorf("runtime did not become healthy within 15s")
 	}
 
@@ -85,9 +147,9 @@ func (r *RuntimeManager) Load(path, host string, port, nCtx, nThreads int) (Load
 	r.loaded = LoadedInfo{Path: path, Host: host, Port: port, PID: cmd.Process.Pid}
 	log.Printf("runtime loaded: pid=%d model=%s at %s:%d", cmd.Process.Pid, path, host, port)
 
-	// Watchdog: reap the process when it exits so we don't leak zombies.
-	go func(c *exec.Cmd, info LoadedInfo) {
-		err := c.Wait()
+	// Watchdog: reap the process when it exits later
+	go func(c *exec.Cmd, ch chan error, info LoadedInfo) {
+		err := <-ch
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if r.cmd == c {
@@ -96,7 +158,7 @@ func (r *RuntimeManager) Load(path, host string, port, nCtx, nThreads int) (Load
 			r.loaded = LoadedInfo{}
 			log.Printf("runtime exited (pid=%d): %v", info.PID, err)
 		}
-	}(cmd, r.loaded)
+	}(cmd, exitCh, r.loaded)
 
 	return r.loaded, nil
 }

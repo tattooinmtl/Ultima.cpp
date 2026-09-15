@@ -126,11 +126,12 @@ function humanTime(iso) {
 
 async function refresh() {
   try {
+    $('err').textContent = '';
     const j = await api('GET', '/api/models');
     renderRoots(j.roots || []);
     renderModels(j.models || [], j.loaded || {});
   } catch (e) {
-    $('err').textContent = e.message;
+    $('err').textContent = 'Error discovering models: ' + e.message;
   }
 }
 
@@ -163,7 +164,7 @@ function renderModels(models, loaded) {
   const tbody = $('models').querySelector('tbody');
   const loadedPath = loaded?.path || '';
   if (!models.length) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px;">No .gguf files found in the configured roots.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px;">No .gguf files found in the configured roots.<br><small style="color:var(--warn);display:block;margin-top:6px;">Check your model directories under Settings below and click "Save config", then "Rescan".</small></td></tr>';
     return;
   }
   tbody.innerHTML = models.map((m) => {
@@ -200,9 +201,29 @@ async function loadModel(path) {
   }
 }
 
-$('rescan').onclick = refresh;
+$('rescan').onclick = async () => {
+  $('rescan').disabled = true;
+  $('rescan').textContent = 'Scanning...';
+  try {
+    await loadConfig();
+    await refresh();
+    await refreshStatus();
+  } catch (e) {
+    $('err').textContent = e.message;
+  } finally {
+    $('rescan').disabled = false;
+    $('rescan').textContent = 'Rescan';
+  }
+};
 $('open-testpad').onclick = async () => {
-  try { await api('POST', '/api/open'); } catch (e) { $('err').textContent = e.message; }
+  try {
+    const s = await api('GET', '/api/status');
+    const port = s.port || 11434;
+    const host = s.host || '127.0.0.1';
+    window.open(`http://${host}:${port}/`, '_blank');
+  } catch (e) {
+    window.open('http://127.0.0.1:11434/', '_blank');
+  }
 };
 $('unload').onclick = async () => {
   try { await api('POST', '/api/unload'); await refresh(); await refreshStatus(); }

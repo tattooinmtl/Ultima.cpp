@@ -25,10 +25,11 @@ namespace ultima::kernels {
 //   bytes  0..3  high 2 bits: scales[4..7]  (high 2 bits, shifted << 4)
 //   bytes  4..7  high 2 bits: mins[4..7]    (high 2 bits, shifted << 4)
 //
-// Value packing in qs[128]:
-//   For each sub-block s in 0..7:
-//     qs[s*16 + i] low  nibble = q4[s*32 + 2*i    ]  for i in 0..15
-//     qs[s*16 + i] high nibble = q4[s*32 + 2*i + 1]  for i in 0..15
+// Value packing in qs[128] (matches ggml's dequantize_row_q4_K):
+//   Sub-block pair (2j, 2j+1) shares 32 consecutive bytes qs[j*32 .. j*32+32).
+//   For l in 0..31:
+//     q4[2j*32     + l] = low  nibble of qs[j*32 + l]
+//     q4[(2j+1)*32 + l] = high nibble of qs[j*32 + l]
 //
 // Dequant formula for element e in sub-block s of super-block b:
 //   scale_s = unpack6(scales_and_mins, s)

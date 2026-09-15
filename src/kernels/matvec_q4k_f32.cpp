@@ -63,6 +63,24 @@ inline float hsum256(__m256 v) noexcept {
     return _mm_cvtss_f32(s);
 }
 
+// Dot 32 unsigned nibbles (one __m256i, values 0..15) against 32 floats,
+// folding the sub-block dequant scale/min into each value:
+//   acc_g += (nib * dvec - mvec) * x[g*8 .. g*8+8]   for g in 0..3
+inline void dot32_nibbles(__m256i nib, const float* x,
+                          __m256 dvec, __m256 mvec,
+                          __m256& a0, __m256& a1, __m256& a2, __m256& a3) noexcept {
+    const __m128i b0 = _mm256_castsi256_si128(nib);        // bytes  0..15
+    const __m128i b1 = _mm256_extracti128_si256(nib, 1);   // bytes 16..31
+    const __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b0));
+    const __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b0, 8)));
+    const __m256 f2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b1));
+    const __m256 f3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b1, 8)));
+    a0 = _mm256_fmadd_ps(_mm256_fmsub_ps(f0, dvec, mvec), _mm256_loadu_ps(x +  0), a0);
+    a1 = _mm256_fmadd_ps(_mm256_fmsub_ps(f1, dvec, mvec), _mm256_loadu_ps(x +  8), a1);
+    a2 = _mm256_fmadd_ps(_mm256_fmsub_ps(f2, dvec, mvec), _mm256_loadu_ps(x + 16), a2);
+    a3 = _mm256_fmadd_ps(_mm256_fmsub_ps(f3, dvec, mvec), _mm256_loadu_ps(x + 24), a3);
+}
+
 } // namespace
 
 // ----- Scalar oracle --------------------------------------------------------
@@ -89,13 +107,10 @@ void matvec_q4k_f32_scalar(const std::uint8_t* w, const float* x, float* y,
 }
 
 // ----- AVX2 + FMA -----------------------------------------------------------
-// Algebraic reshape avoids materializing the full 256-elt f32 scratch:
-//   value[k] = scale_s * nibble[k] - min_s        (per sub-block s)
-//   sum_k value[k] * x[k] = scale_s * S_wx(s) - min_s * S_x(s)
-// where S_wx(s) = sum over the sub-block of nibble * x_matching,
-//       S_x(s)  = sum over the sub-block of x_matching.
-// Both are computed by 4 AVX2 FMAs of 8 lanes each per sub-block.
-// Nibble unpack stays scalar into a 32-elt on-stack buffer (cache-hot).
+// Per sub-block pair (64 values sharing 32 qs bytes): one SIMD load, mask for
+// the low/high nibbles, then pure SIMD convert + FMA. Scale/min are folded
+// per value (v = nib*d - m) so the whole row accumulates in vector registers
+// with a single horizontal sum at the end.
 void matvec_q4k_f32_avx2(const std::uint8_t* w, const float* x, float* y,
                          std::size_t M, std::size_t K) noexcept {
     if (K == 0 || (K % 256u) != 0) {
@@ -105,11 +120,14 @@ void matvec_q4k_f32_avx2(const std::uint8_t* w, const float* x, float* y,
     const std::size_t blocks_per_row = K / 256u;
     const std::size_t bytes_per_row  = blocks_per_row * 144u;
 
-    alignas(32) float sub_nib[32];
+    const __m256i mask0f = _mm256_set1_epi8(0x0F);
 
     for (std::size_t m = 0; m < M; ++m) {
         const std::uint8_t* row = w + m * bytes_per_row;
-        float acc = 0.0f;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(),
+               a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps(),
+               a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(),
+               a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
 
         for (std::size_t b = 0; b < blocks_per_row; ++b) {
             const std::uint8_t* blk = row + b * 144u;
@@ -119,33 +137,29 @@ void matvec_q4k_f32_avx2(const std::uint8_t* w, const float* x, float* y,
             const std::uint8_t* qs = blk + 16;
             const float* xblk = x + b * 256u;
 
-            for (unsigned s = 0; s < 8; ++s) {
-                unsigned scale_q = 0, min_q = 0;
-                unpack_scale_min_6bit(sm, s, scale_q, min_q);
-                const float scale = d    * static_cast<float>(scale_q);
-                const float min_v = dmin * static_cast<float>(min_q);
+            for (unsigned j = 0; j < 4; ++j) {
+                unsigned scale_q0 = 0, min_q0 = 0, scale_q1 = 0, min_q1 = 0;
+                unpack_scale_min_6bit(sm, 2 * j,     scale_q0, min_q0);
+                unpack_scale_min_6bit(sm, 2 * j + 1, scale_q1, min_q1);
 
-                const std::uint8_t* sub_qs = qs + s * 16u;
-                for (unsigned i = 0; i < 16; ++i) {
-                    sub_nib[2u * i    ] = static_cast<float>(sub_qs[i] & 0x0Fu);
-                    sub_nib[2u * i + 1] = static_cast<float>((sub_qs[i] >> 4) & 0x0Fu);
-                }
+                const __m256 d1 = _mm256_set1_ps(d    * static_cast<float>(scale_q0));
+                const __m256 m1 = _mm256_set1_ps(dmin * static_cast<float>(min_q0));
+                const __m256 d2 = _mm256_set1_ps(d    * static_cast<float>(scale_q1));
+                const __m256 m2 = _mm256_set1_ps(dmin * static_cast<float>(min_q1));
 
-                const float* xsub = xblk + s * 32u;
-                __m256 nib_acc = _mm256_setzero_ps();
-                __m256 x_acc   = _mm256_setzero_ps();
-                for (int c = 0; c < 4; ++c) {
-                    __m256 nv = _mm256_load_ps (sub_nib + c * 8);
-                    __m256 xv = _mm256_loadu_ps(xsub    + c * 8);
-                    nib_acc = _mm256_fmadd_ps(nv, xv, nib_acc);
-                    x_acc   = _mm256_add_ps (x_acc, xv);
-                }
-                const float S_wx = hsum256(nib_acc);
-                const float S_x  = hsum256(x_acc);
-                acc += scale * S_wx - min_v * S_x;
+                const __m256i v  = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(qs + j * 32u));
+                const __m256i lo = _mm256_and_si256(v, mask0f);
+                const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask0f);
+
+                const float* xsub = xblk + j * 64u;
+                dot32_nibbles(lo, xsub,      d1, m1, a0, a1, a2, a3);
+                dot32_nibbles(hi, xsub + 32, d2, m2, a4, a5, a6, a7);
             }
         }
-        y[m] = acc;
+        const __m256 s01 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        const __m256 s23 = _mm256_add_ps(_mm256_add_ps(a4, a5), _mm256_add_ps(a6, a7));
+        y[m] = hsum256(_mm256_add_ps(s01, s23));
     }
 }
 

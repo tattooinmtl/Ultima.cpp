@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -17,6 +18,17 @@ type launcherState struct {
 	cfg      Config
 	cfgPath  string
 	rt       *RuntimeManager
+}
+
+func (s *launcherState) reloadConfigFromDiskLocked() {
+	if s.cfgPath != "" {
+		if b, err := os.ReadFile(s.cfgPath); err == nil {
+			var c Config
+			if err := json.Unmarshal(b, &c); err == nil {
+				s.cfg = c
+			}
+		}
+	}
 }
 
 func serve(addr string, cfg Config, cfgPath string, rt *RuntimeManager) error {
@@ -55,6 +67,7 @@ func (s *launcherState) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		s.mu.Lock()
+		s.reloadConfigFromDiskLocked()
 		cfg := s.cfg
 		s.mu.Unlock()
 		writeJSON(w, 200, cfg)
@@ -80,6 +93,7 @@ func (s *launcherState) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *launcherState) handleModels(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
+	s.reloadConfigFromDiskLocked()
 	roots := append([]string(nil), s.cfg.ModelRoots...)
 	loaded := s.rt.Status()
 	s.mu.Unlock()
@@ -92,8 +106,6 @@ func (s *launcherState) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *launcherState) handleRescan(w http.ResponseWriter, r *http.Request) {
-	// Discovery has no cache in v0.1 — this endpoint exists so the UI can
-	// re-issue the walk without a page reload.
 	s.handleModels(w, r)
 }
 

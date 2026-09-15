@@ -522,7 +522,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                 const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
-                return false;
+                return true;
             });
     });
 
