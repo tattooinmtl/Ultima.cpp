@@ -182,7 +182,15 @@ async function send() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if (!r.ok) {
+      // Surface the runtime's actual error message instead of a bare "HTTP 500".
+      let detail = '';
+      try {
+        const j = await r.json();
+        detail = j.error || j.message || JSON.stringify(j);
+      } catch { detail = await r.text().catch(() => ''); }
+      throw new Error('HTTP ' + r.status + (detail ? ' — ' + detail : ''));
+    }
     if (!r.body) throw new Error('no response body (SSE unsupported here?)');
 
     const reader = r.body.getReader();

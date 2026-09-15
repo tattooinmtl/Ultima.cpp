@@ -49,6 +49,13 @@ void matvec_q6k_f32       (const std::uint8_t* w, const float* x, float* y,
 void matvec_q6k_f32_scalar(const std::uint8_t* w, const float* x, float* y,
                            std::size_t M, std::size_t K) noexcept;
 
+// y[m] = sum_k dequant(W_q5_0)[m, k] * x[k]
+// K must be a multiple of 32 (Q5_0 block size). Needed for older / small
+// architectures whose hidden dim (e.g. 896 in Qwen2.5-Coder-0.5B) is not
+// divisible by 256, so llama.cpp quantized their projections as Q5_0.
+void matvec_q5_0_f32       (const std::uint8_t* w, const float* x, float* y,
+                            std::size_t M, std::size_t K) noexcept;
+
 // ---- Threaded variants ------------------------------------------------------
 // Each splits [0, M) contiguously across the pool's workers and calls the
 // per-row SIMD kernel. Callers own the pool. For M below a small threshold
