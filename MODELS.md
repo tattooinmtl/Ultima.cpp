@@ -14,8 +14,8 @@ GGUFs and reports each file individually.
 | `qwen3moe`   | runnable | Qwen3 MoE, top-k routed experts (Qwen3-Coder-30B-A3B) |
 | `granite`    | runnable | IBM Granite dense, embedding/residual/logit scales, Norm-style RoPE |
 | `phi3`       | runnable | Fused QKV and fused gate/up, LongRoPE frequency factors |
+| `spark2_5`   | runnable | Fused QKV, per-head sigmoid attention gate, GEGLU FFN, 3-of-4 sliding-window layers with their own RoPE dim and base |
 | `gemma4`     | not yet  | per-layer KV head counts, alternating sliding-window attention, dual RoPE bases, post-attention/post-FFN norms, final logit softcapping |
-| `spark2_5`   | not yet  | structurally implemented (fused QKV, per-head gated attention, SWA masking, per-layer RoPE) but decodes to degenerate token echo; gate semantics and SWA/RoPE conventions unconfirmed |
 | `qwen35`     | not yet  | hybrid SSM/Mamba layers (`ssm_*`, 3 of every 4 blocks), MRoPE sections, SSM state cache |
 | `qwen35moe`  | not yet  | the `qwen35` SSM hybrid plus MoE with shared experts |
 | `deepseek2`  | not yet  | multi-head latent attention (compressed KV) and MoE with grouped routing, shared experts, expert bias |
@@ -54,24 +54,40 @@ IQ-series (`IQ1_*`…`IQ4_*`) and the ternary `TQ*` formats are not implemented.
 
 | `tokenizer.ggml.model` | Status | Used by |
 |------------------------|--------|---------|
-| `gpt2` | supported | Qwen, Granite, most modern releases |
+| `gpt2` | supported | Qwen, Granite, Spark-X2.5, most modern releases |
 | `llama` / `spm` | supported | Phi-3, Llama, Mistral — SentencePiece with `<0xNN>` byte fallback |
 | `gemma4` | not implemented | the Gemma models |
 | `none` | n/a | models with no vocabulary |
 
 ## Architectures without a public reference
 
-`spark2_5`, `gemma4`, `qwen35`, `qwen35moe`, `dspark` and `dflash-draft` do not
-correspond to architectures Ultima has a reference implementation for. Their
-GGUF metadata uses llama.cpp-style key names, but the semantics behind those
-keys — gate activation and where it applies, `sliding_window_pattern` polarity,
-whether global layers are meant to be NoPE — cannot be settled by inspection.
-`spark2_5` is the worked example: every tensor shape and metadata key resolves,
-an 8-way ablation found no working combination, and the tokenizer was cleared
-against a known-good control.
+`gemma4`, `qwen35`, `qwen35moe`, `dspark` and `dflash-draft` do not correspond
+to architectures Ultima has a reference implementation for. Their GGUF metadata
+uses llama.cpp-style key names, but the semantics behind those keys cannot be
+settled by inspection alone.
+
+`spark2_5` was in this list and is the cautionary tale. Eight structural
+combinations were ablated and none worked; what was actually wrong was a single
+bit of knowledge — the feed-forward uses GEGLU, not SwiGLU — which is one line
+in llama.cpp PR #27868 and is not inferable from the GGUF. Do not try to
+brute-force an unknown architecture; find its reference first.
 
 `deepseek2` is the exception among the remaining work: it is standard
 DeepSeek-V2 multi-head latent attention, which is well specified.
+
+## Pretokenizers
+
+`tokenizer.ggml.pre` selects how text is cut before BPE runs. Getting it wrong
+silently changes the token ids a prompt produces.
+
+| `pre` | Family | Notes |
+|-------|--------|-------|
+| `qwen2`, `spark2_5` | Qwen2 | one non-letter may prefix a letter run (`(n` is one token); digits one at a time |
+| `llama3`, `llama-v3`, `llama-bpe`, `dbrx`, `smaug` | Llama3 | as above, but digits in runs of up to 3 |
+| anything else | GPT-2 | only a space may prefix a letter run; digit runs unbounded |
+
+Verified token-for-token against llama.cpp `llama-tokenize` for `qwen2`,
+`dbrx` (Granite) and `spark2_5`.
 
 ## Known limitations
 

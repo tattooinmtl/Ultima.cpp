@@ -118,16 +118,23 @@ void top_k_experts(const float* probs, std::size_t n, std::size_t k,
     }
 }
 
+// gelu(gate) * up or silu(gate) * up, per the architecture.
+inline void gated_act(FfnAct act, const float* gate, const float* up,
+                      float* y, std::size_t n) {
+    if (act == FfnAct::GELU) kernels::geglu_f32(gate, up, y, n);
+    else                     kernels::swiglu_f32(gate, up, y, n);
+}
+
 Result<void>
 ffn_dense(BlockScratch& s, const ModelTensors::Block& b,
-          const ModelDims& d, runtime::ThreadPool& pool) {
+          const ModelDims& d, const ArchParams& p, runtime::ThreadPool& pool) {
     if (auto r = matvec_dispatch_threaded(pool, b.ffn_gate.dtype, b.ffn_gate.data,
                                           s.x_norm.data(), s.gate.data(),
                                           d.ffn_hidden, d.hidden); !r) return r;
     if (auto r = matvec_dispatch_threaded(pool, b.ffn_up.dtype, b.ffn_up.data,
                                           s.x_norm.data(), s.up.data(),
                                           d.ffn_hidden, d.hidden); !r) return r;
-    kernels::swiglu_f32(s.gate.data(), s.up.data(), s.gate.data(), d.ffn_hidden);
+    gated_act(p.ffn_act, s.gate.data(), s.up.data(), s.gate.data(), d.ffn_hidden);
     return matvec_dispatch_threaded(pool, b.ffn_down.dtype, b.ffn_down.data,
                                     s.gate.data(), s.x.data(),
                                     d.hidden, d.ffn_hidden);
@@ -137,13 +144,13 @@ ffn_dense(BlockScratch& s, const ModelTensors::Block& b,
 // gate first. One matvec produces both halves.
 Result<void>
 ffn_fused(BlockScratch& s, const ModelTensors::Block& b,
-          const ModelDims& d, runtime::ThreadPool& pool) {
+          const ModelDims& d, const ArchParams& p, runtime::ThreadPool& pool) {
     if (auto r = matvec_dispatch_threaded(pool, b.ffn_up.dtype, b.ffn_up.data,
                                           s.x_norm.data(), s.gate.data(),
                                           2 * d.ffn_hidden, d.hidden); !r) return r;
     float* gate_half = s.gate.data();
     float* up_half   = s.gate.data() + d.ffn_hidden;
-    kernels::swiglu_f32(gate_half, up_half, gate_half, d.ffn_hidden);
+    gated_act(p.ffn_act, gate_half, up_half, gate_half, d.ffn_hidden);
     return matvec_dispatch_threaded(pool, b.ffn_down.dtype, b.ffn_down.data,
                                     gate_half, s.x.data(),
                                     d.hidden, d.ffn_hidden);
@@ -182,7 +189,7 @@ ffn_moe(BlockScratch& s, const ModelTensors::Block& b,
                                               b.ffn_up_exps.expert(e),
                                               s.x_norm.data(), s.up.data(),
                                               p.expert_ffn, d.hidden); !r) return r;
-        kernels::swiglu_f32(s.gate.data(), s.up.data(), s.gate.data(), p.expert_ffn);
+        gated_act(p.ffn_act, s.gate.data(), s.up.data(), s.gate.data(), p.expert_ffn);
 
         if (auto r = matvec_dispatch_threaded(pool, b.ffn_down_exps.dtype,
                                               b.ffn_down_exps.expert(e),
@@ -429,10 +436,10 @@ block_forward(BlockScratch& s,
     // 9. Feed-forward, writing its output into s.x.
     switch (params.ffn) {
     case FfnKind::DenseSwiGLU:
-        if (auto r = ffn_dense(s, block, dims, pool); !r) return r;
+        if (auto r = ffn_dense(s, block, dims, params, pool); !r) return r;
         break;
     case FfnKind::FusedSwiGLU:
-        if (auto r = ffn_fused(s, block, dims, pool); !r) return r;
+        if (auto r = ffn_fused(s, block, dims, params, pool); !r) return r;
         break;
     case FfnKind::SparseMoE:
         if (auto r = ffn_moe(s, block, dims, params, pool); !r) return r;

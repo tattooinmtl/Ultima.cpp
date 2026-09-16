@@ -36,10 +36,15 @@ class BpeTokenizer {
 public:
     enum class Kind { Bpe, Spm };
 
+    // Which pretokenization rules this vocabulary uses, from
+    // tokenizer.ggml.pre. Only meaningful for Kind::Bpe.
+    enum class PreTokenizer : std::uint8_t { Gpt2, Llama3, Qwen2 };
+
     static core::Result<std::unique_ptr<BpeTokenizer>>
     load(const model::LoadedModel& model);
 
     Kind kind() const noexcept { return kind_; }
+    PreTokenizer pretokenizer() const noexcept { return pretokenizer_; }
 
     // Encode UTF-8 text to token ids.
     //   allow_special = true  : special-token strings inside `text` are
@@ -92,6 +97,7 @@ private:
     std::vector<bool>                            is_special_;
 
     Kind                                         kind_ = Kind::Bpe;
+    PreTokenizer                                 pretokenizer_ = PreTokenizer::Gpt2;
 
     // SPM only: per-token merge scores, and the id of the <0x00> byte token
     // (the 256 byte-fallback tokens are contiguous from there). -1 when the

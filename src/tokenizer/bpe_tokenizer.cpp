@@ -34,6 +34,7 @@ constexpr const char* k_eos_id         = "tokenizer.ggml.eos_token_id";
 constexpr const char* k_pad_id         = "tokenizer.ggml.padding_token_id";
 constexpr const char* k_unk_id         = "tokenizer.ggml.unknown_token_id";
 constexpr const char* k_scores         = "tokenizer.ggml.scores";
+constexpr const char* k_pre            = "tokenizer.ggml.pre";
 
 // SentencePiece writes word boundaries as U+2581 LOWER ONE EIGHTH BLOCK.
 constexpr const char* k_spm_space      = "\xE2\x96\x81";
@@ -91,31 +92,88 @@ inline std::uint64_t pack_pair(TokenId a, TokenId b) noexcept {
          |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(b));
 }
 
-// ---- Pretokenizer (GPT-2 rules, ASCII-focused) ----------------------------
+// ---- Pretokenization --------------------------------------------------------
 //
-// Splits the input into pretokens using GPT-2's regex behavior — implemented
-// by hand so we don't drag ICU or a regex engine in. For pure-ASCII input
-// (the coding workload) this matches HF's `Qwen2Tokenizer` output. Non-ASCII
-// UTF-8 bytes are grouped as opaque "other" runs and fed through byte-level
-// encoding; correctness on non-Latin scripts is a v0.2 concern.
-enum class Cat : std::uint8_t { Letter, Digit, Space, Other };
+// Before BPE runs, text is cut into pretokens that merges may never cross.
+// Which cuts are made is per-vocabulary, recorded in tokenizer.ggml.pre, and
+// getting it wrong silently changes the token ids a prompt produces.
+//
+// Two families cover every GPT-2-style vocab Ultima loads. As the regex
+// alternations they implement, tried in order at each position:
+//
+//   Gpt2:
+//     's|'t|'re|'ve|'m|'ll|'d | ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+
+//     | \s+(?!\S) | \s+
+//
+//   Llama3 / Qwen2:
+//     (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,D}
+//     | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+//
+// The second family differs in two ways that matter: a single non-letter may
+// attach to a following letter run, so "(n" is one pretoken rather than two,
+// and digits are capped at D per pretoken - 1 for Qwen2, 3 for Llama3/DBRX.
+using PreTokenizer = BpeTokenizer::PreTokenizer;
 
-Cat classify_ascii(unsigned char c) noexcept {
-    if (c >= 128)                              return Cat::Other;
-    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f')
-        return Cat::Space;
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
-        return Cat::Letter;
-    if (c >= '0' && c <= '9')
-        return Cat::Digit;
-    return Cat::Other;
+PreTokenizer pretokenizer_from_pre(std::string_view pre) noexcept {
+    if (pre == "qwen2" || pre == "spark2_5") return PreTokenizer::Qwen2;
+    if (pre == "llama3" || pre == "llama-v3" || pre == "llama-bpe" ||
+        pre == "dbrx"   || pre == "smaug")   return PreTokenizer::Llama3;
+    // Unknown vocabularies fall back to the GPT-2 split. That is the right
+    // default, but it is a guess: if a model tokenizes oddly, check its
+    // tokenizer.ggml.pre against this table first.
+    return PreTokenizer::Gpt2;
 }
 
-// Contractions GPT-2 splits off: 's, 't, 're, 've, 'm, 'll, 'd.
+// Decode one UTF-8 sequence at `p`. Returns the codepoint and its byte length;
+// invalid bytes decode as themselves with length 1.
+struct Cp { char32_t cp; std::size_t len; };
+
+Cp decode_utf8(const char* p, std::size_t n) noexcept {
+    const unsigned char c0 = static_cast<unsigned char>(p[0]);
+    if (c0 < 0x80) return {c0, 1};
+    auto cont = [&](std::size_t i) {
+        return i < n && (static_cast<unsigned char>(p[i]) & 0xC0) == 0x80;
+    };
+    if ((c0 & 0xE0) == 0xC0 && cont(1)) {
+        return {static_cast<char32_t>(((c0 & 0x1Fu) << 6) |
+                 (static_cast<unsigned char>(p[1]) & 0x3Fu)), 2};
+    }
+    if ((c0 & 0xF0) == 0xE0 && cont(1) && cont(2)) {
+        return {static_cast<char32_t>(((c0 & 0x0Fu) << 12) |
+                 ((static_cast<unsigned char>(p[1]) & 0x3Fu) << 6) |
+                 (static_cast<unsigned char>(p[2]) & 0x3Fu)), 3};
+    }
+    if ((c0 & 0xF8) == 0xF0 && cont(1) && cont(2) && cont(3)) {
+        return {static_cast<char32_t>(((c0 & 0x07u) << 18) |
+                 ((static_cast<unsigned char>(p[1]) & 0x3Fu) << 12) |
+                 ((static_cast<unsigned char>(p[2]) & 0x3Fu) << 6) |
+                 (static_cast<unsigned char>(p[3]) & 0x3Fu)), 4};
+    }
+    return {c0, 1};
+}
+
+inline bool is_space_cp(char32_t c) noexcept {
+    return c == U' ' || c == U'\t' || c == U'\n' || c == U'\r' ||
+           c == 0x0B || c == 0x0C;
+}
+inline bool is_digit_cp(char32_t c) noexcept { return c >= U'0' && c <= U'9'; }
+
+// \p{L} approximated as "ASCII letter, or any non-ASCII codepoint". Real
+// Unicode tables would also classify non-ASCII punctuation and symbols as
+// non-letters; that only shifts where a pretoken boundary falls in text
+// containing them, and never produces an invalid token sequence.
+inline bool is_letter_cp(char32_t c) noexcept {
+    if (c < 0x80) return (c >= U'a' && c <= U'z') || (c >= U'A' && c <= U'Z');
+    return true;
+}
+
+// Contractions the BPE vocabularies split off: 's, 't, 're, 've, 'm, 'll, 'd.
 // Returns the length in bytes of the matched contraction at `p`, or 0.
 std::size_t match_contraction(const char* p, std::size_t n) noexcept {
     if (n < 2 || p[0] != '\'') return 0;
-    auto lower = [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); };
+    auto lower = [](char c) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    };
     const char c1 = lower(p[1]);
     if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return 2;
     if (n >= 3) {
@@ -127,57 +185,133 @@ std::size_t match_contraction(const char* p, std::size_t n) noexcept {
     return 0;
 }
 
-std::vector<std::string_view> pretokenize(std::string_view text) {
+std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer kind) {
     std::vector<std::string_view> out;
-    const char*  p    = text.data();
+    const char* p = text.data();
     const std::size_t n = text.size();
-    std::size_t  i = 0;
+    const bool gpt2 = (kind == PreTokenizer::Gpt2);
+    const std::size_t max_digits =
+        (kind == PreTokenizer::Qwen2) ? std::size_t{1}
+                                      : (gpt2 ? SIZE_MAX : std::size_t{3});
 
+    std::size_t i = 0;
     while (i < n) {
-        // Contractions like 's, 're, ...
+        // 1. Contraction.
         if (auto len = match_contraction(p + i, n - i); len > 0) {
             out.emplace_back(p + i, len);
             i += len;
             continue;
         }
-        // Optional single leading space, then a run of letters, digits, or
-        // "other" (each category grouped independently). Whitespace runs
-        // become their own pretokens (matching `\s+` in the GPT-2 regex).
-        const unsigned char c0 = static_cast<unsigned char>(p[i]);
-        Cat first = classify_ascii(c0);
-        if (first == Cat::Space) {
-            // Determine whether this whitespace run has a trailing non-space
-            // it should merge with. GPT-2's regex: `\s+(?!\S)|\s+`
-            // Simplification: take the whole run as its own pretoken UNLESS
-            // exactly one leading space precedes a Letter/Digit/Other run,
-            // in which case we include it with the following run.
+
+        // 2. An optional single non-letter, then a run of letters. GPT-2 only
+        //    allows a space there; Llama3/Qwen2 allow any character that is
+        //    not a letter, digit or newline - this is what makes "(n" one
+        //    pretoken instead of two.
+        {
             std::size_t j = i;
-            while (j < n && classify_ascii(static_cast<unsigned char>(p[j])) == Cat::Space)
-                ++j;
-            const std::size_t ws_len   = j - i;
-            const bool has_following   = (j < n);
-            if (ws_len == 1 && has_following) {
-                // Fold the single leading space into the next run.
-                Cat next = classify_ascii(static_cast<unsigned char>(p[j]));
-                if (next == Cat::Letter || next == Cat::Digit || next == Cat::Other) {
-                    std::size_t k = j;
-                    while (k < n && classify_ascii(static_cast<unsigned char>(p[k])) == next)
-                        ++k;
-                    out.emplace_back(p + i, k - i);
-                    i = k;
-                    continue;
-                }
+            const Cp c = decode_utf8(p + j, n - j);
+            const bool prefix_ok = gpt2
+                ? (c.cp == U' ')
+                : (!is_letter_cp(c.cp) && !is_digit_cp(c.cp) &&
+                   c.cp != U'\r' && c.cp != U'\n');
+            if (prefix_ok) j += c.len;
+
+            std::size_t k = j;
+            while (k < n) {
+                const Cp l = decode_utf8(p + k, n - k);
+                if (!is_letter_cp(l.cp)) break;
+                k += l.len;
             }
-            out.emplace_back(p + i, ws_len);
-            i = j;
+            if (k > j) {                       // at least one letter followed
+                out.emplace_back(p + i, k - i);
+                i = k;
+                continue;
+            }
+        }
+
+        // 3. Digits, capped per family.
+        {
+            std::size_t j = i;
+            if (gpt2 && p[j] == ' ') ++j;      // GPT-2 allows a leading space
+            std::size_t k = j, count = 0;
+            while (k < n && count < max_digits) {
+                const Cp d = decode_utf8(p + k, n - k);
+                if (!is_digit_cp(d.cp)) break;
+                k += d.len;
+                ++count;
+            }
+            if (count > 0) {
+                out.emplace_back(p + i, k - i);
+                i = k;
+                continue;
+            }
+        }
+
+        // 4. Optional space, a run of non-space non-letter non-digit, then
+        //    any trailing newlines (the newline tail is Llama3/Qwen2 only).
+        {
+            std::size_t j = i;
+            if (p[j] == ' ') ++j;
+            std::size_t k = j;
+            while (k < n) {
+                const Cp c = decode_utf8(p + k, n - k);
+                if (is_space_cp(c.cp) || is_letter_cp(c.cp) || is_digit_cp(c.cp)) break;
+                k += c.len;
+            }
+            if (k > j) {
+                if (!gpt2) {
+                    while (k < n && (p[k] == '\r' || p[k] == '\n')) ++k;
+                }
+                out.emplace_back(p + i, k - i);
+                i = k;
+                continue;
+            }
+        }
+
+        // The remaining alternatives all consume whitespace. Measure the run.
+        std::size_t e = i;
+        while (e < n) {
+            const Cp c = decode_utf8(p + e, n - e);
+            if (!is_space_cp(c.cp)) break;
+            e += c.len;
+        }
+        if (e == i) {
+            // Nothing matched. Emit one codepoint so the loop always advances.
+            const Cp c = decode_utf8(p + i, n - i);
+            out.emplace_back(p + i, c.len);
+            i += c.len;
             continue;
         }
-        // Non-space start: run of the same category.
-        std::size_t k = i;
-        while (k < n && classify_ascii(static_cast<unsigned char>(p[k])) == first)
-            ++k;
-        out.emplace_back(p + i, k - i);
-        i = k;
+
+        // 5. \s*[\r\n]+ - whitespace up to and including the run's last newline.
+        if (!gpt2) {
+            std::size_t last_nl = e;
+            for (std::size_t k = i; k < e; ++k) {
+                if (p[k] == '\r' || p[k] == '\n') last_nl = k;
+            }
+            if (last_nl != e) {
+                out.emplace_back(p + i, last_nl + 1 - i);
+                i = last_nl + 1;
+                continue;
+            }
+        }
+
+        // 6. \s+(?!\S) - the run, minus a trailing space that the next
+        //    pretoken will absorb as its prefix.
+        if (e == n) {
+            out.emplace_back(p + i, e - i);     // run reaches end of text
+            i = e;
+            continue;
+        }
+        if (e - i >= 2) {
+            out.emplace_back(p + i, e - 1 - i);
+            i = e - 1;
+            continue;
+        }
+
+        // 7. \s+ - a single space the following pretoken did not take.
+        out.emplace_back(p + i, e - i);
+        i = e;
     }
     return out;
 }
@@ -235,6 +369,8 @@ public:
         // scores and <0xNN> byte fallback.
         const std::string tok_model =
             model.metadata().get<std::string>(k_model).value_or("gpt2");
+        tok->pretokenizer_ = pretokenizer_from_pre(
+            model.metadata().get<std::string>(k_pre).value_or(""));
         tok->kind_ = (tok_model == "llama" || tok_model == "spm")
                    ? BpeTokenizer::Kind::Spm
                    : BpeTokenizer::Kind::Bpe;
@@ -573,7 +709,7 @@ BpeTokenizer::encode(std::string_view text, bool allow_special) const {
             out.insert(out.end(), ids.begin(), ids.end());
             return;
         }
-        for (auto pt : pretokenize(chunk)) {
+        for (auto pt : pretokenize(chunk, pretokenizer_)) {
             // Pass raw pretoken bytes; encode_pretoken_bytes maps each byte
             // to its byte-token id, then runs BPE.
             auto ids = encode_pretoken_bytes(pt, byte_to_str_,

@@ -12,65 +12,54 @@ namespace {
 // rather than just saying no.
 constexpr std::array<ArchSpec, 14> k_archs{{
     // ---- Supported ---------------------------------------------------------
-    {"qwen2", true, FfnKind::DenseSwiGLU, QkvKind::Separate, RopeStyle::NeoX, false,
+    {"qwen2", true, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::Separate, RopeStyle::NeoX, false,
      "Qwen2 / Qwen2.5 dense, separate QKV with biases"},
 
-    {"qwen3", true, FfnKind::DenseSwiGLU, QkvKind::Separate, RopeStyle::NeoX, false,
+    {"qwen3", true, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::Separate, RopeStyle::NeoX, false,
      "Qwen3 dense, Q/K RMSNorm, no attention biases"},
 
-    {"qwen3moe", true, FfnKind::SparseMoE, QkvKind::Separate, RopeStyle::NeoX, false,
+    {"qwen3moe", true, FfnKind::SparseMoE, FfnAct::SiLU, QkvKind::Separate, RopeStyle::NeoX, false,
      "Qwen3 MoE, Q/K RMSNorm, top-k routed experts"},
 
-    {"granite", true, FfnKind::DenseSwiGLU, QkvKind::Separate, RopeStyle::Norm, false,
+    {"granite", true, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::Separate, RopeStyle::Norm, false,
      "IBM Granite dense, embedding/residual/logit scales, explicit attn scale"},
 
-    {"phi3", true, FfnKind::FusedSwiGLU, QkvKind::Fused, RopeStyle::NeoX, false,
+    {"phi3", true, FfnKind::FusedSwiGLU, FfnAct::SiLU, QkvKind::Fused, RopeStyle::NeoX, false,
      "Phi-3, fused QKV and fused gate/up, LongRoPE frequency factors"},
+
+    {"spark2_5", true, FfnKind::DenseSwiGLU, FfnAct::GELU, QkvKind::Fused, RopeStyle::NeoX, true,
+     "Spark-X2.5, fused QKV, per-head sigmoid attention gate, GEGLU feed-forward, "
+     "3-of-4 sliding-window layers with their own RoPE dim and base"},
 
     // ---- Named but not yet executable --------------------------------------
 
-    // Every structural piece this needs is implemented — fused QKV, per-head
-    // gated attention, sliding-window masking, per-layer RoPE dim and base —
-    // and all tensor shapes and metadata resolve. It still decodes to
-    // degenerate token echo, and an 8-way ablation (SWA on/off/inverted x
-    // gate on/off x NeoX/Norm RoPE x two QKV layouts) did not find a
-    // combination that works. The tokenizer was ruled out against a
-    // known-good control. Ultima has no reference implementation for this
-    // architecture, so the remaining unknowns (gate activation and
-    // application point, sliding_window_pattern polarity, whether the global
-    // layers are meant to be NoPE) are not resolvable by inspection alone.
-    {"spark2_5", false, {}, {}, {}, {},
-     "structurally implemented but produces degenerate output; the gate "
-     "semantics and RoPE/SWA conventions could not be confirmed without a "
-     "reference implementation"},
-
-    {"llama", false, {}, {}, {}, {},
+    {"llama", false, {}, {}, {}, {}, {},
      "needs Norm-style RoPE validation and llama-specific tensor aliases"},
 
-    {"gemma4", false, {}, {}, {}, {},
+    {"gemma4", false, {}, {}, {}, {}, {},
      "needs per-layer KV head counts, alternating sliding-window attention, "
      "dual RoPE bases, post-attention/post-FFN norms, final logit softcapping"},
 
-    {"qwen35", false, {}, {}, {}, {},
+    {"qwen35", false, {}, {}, {}, {}, {},
      "needs hybrid SSM/Mamba layers (ssm_* tensors, 3 of every 4 blocks), "
      "multimodal RoPE sections, and an SSM state cache alongside the KV cache"},
 
-    {"qwen35moe", false, {}, {}, {}, {},
+    {"qwen35moe", false, {}, {}, {}, {}, {},
      "needs the qwen35 SSM hybrid plus MoE routing with shared experts"},
 
-    {"deepseek2", false, {}, {}, {}, {},
+    {"deepseek2", false, {}, {}, {}, {}, {},
      "needs multi-head latent attention (compressed KV, q_a/q_b/kv_a/kv_b "
      "projections) and MoE with grouped routing, shared experts and expert bias"},
 
-    {"dspark", false, {}, {}, {}, {},
+    {"dspark", false, {}, {}, {}, {}, {},
      "diffusion language model, not autoregressive: block denoising does not "
      "fit prefill/decode. Also needs ternary weight kernels"},
 
-    {"dflash-draft", false, {}, {}, {}, {},
+    {"dflash-draft", false, {}, {}, {}, {}, {},
      "speculative-decoding draft head, not a standalone model: the file has no "
      "tokenizer, no token_embd and no output head"},
 
-    {"bert", false, {}, {}, {}, {},
+    {"bert", false, {}, {}, {}, {}, {},
      "encoder-only embedding model; needs a pooling path rather than "
      "causal prefill/decode"},
 }};

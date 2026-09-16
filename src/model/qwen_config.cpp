@@ -164,6 +164,7 @@ parse_arch_config(const LoadedModel& gguf,
     // ---- Structural parameters ---------------------------------------------
     ArchParams p{};
     p.ffn        = spec.ffn;
+    p.ffn_act    = spec.ffn_act;
     p.qkv        = spec.qkv;
     p.rope_style = spec.rope_style;
 
@@ -250,7 +251,8 @@ parse_qwen_config(const LoadedModel& gguf,
     // Callers that only want dims get the qwen-family structural defaults
     // when the arch is not in the registry.
     static constexpr ArchSpec k_default{
-        "", true, FfnKind::DenseSwiGLU, QkvKind::Separate, RopeStyle::NeoX, ""};
+        "", true, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::Separate,
+        RopeStyle::NeoX, /*attn_gate=*/false, ""};
     ArchParams ignored{};
     return parse_arch_config(gguf, spec ? *spec : k_default, arch,
                              out_dims, out_rope, ignored);

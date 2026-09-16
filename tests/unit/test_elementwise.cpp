@@ -97,3 +97,47 @@ TEST_CASE("swiglu_f32: equivalent to silu(gate) * up") {
         CHECK(std::fabs(y[i] - y_ref[i]) < kTol);
     }
 }
+
+// ---- GEGLU ------------------------------------------------------------------
+
+TEST_CASE("geglu_f32: matches the tanh GELU formula times up") {
+    const std::vector<float> gate{-4.0f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 4.0f};
+    const std::vector<float> up  { 2.0f,  1.0f, -1.0f, 3.0f, 0.5f, 2.0f, 1.0f};
+    std::vector<float> y(gate.size(), 0.0f);
+
+    ultima::kernels::geglu_f32(gate.data(), up.data(), y.data(), gate.size());
+
+    for (std::size_t i = 0; i < gate.size(); ++i) {
+        const float g = gate[i];
+        const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+        const float want = 0.5f * g * (1.0f + std::tanh(inner)) * up[i];
+        CHECK(y[i] == doctest::Approx(want).epsilon(1e-6));
+    }
+}
+
+TEST_CASE("geglu_f32: gelu(0) is 0 and large positives pass through") {
+    const std::vector<float> gate{0.0f, 20.0f, -20.0f};
+    const std::vector<float> up  {5.0f,  1.0f,   1.0f};
+    std::vector<float> y(3, 0.0f);
+    ultima::kernels::geglu_f32(gate.data(), up.data(), y.data(), 3);
+    CHECK(y[0] == doctest::Approx(0.0f));
+    CHECK(y[1] == doctest::Approx(20.0f).epsilon(1e-5));
+    CHECK(y[2] == doctest::Approx(0.0f).epsilon(1e-5));
+}
+
+TEST_CASE("geglu_f32: differs from swiglu, and is in-place safe") {
+    std::vector<float> gate{1.0f, -1.0f, 2.5f, -2.5f};
+    const std::vector<float> up{1.0f, 1.0f, 1.0f, 1.0f};
+    std::vector<float> ge(4), sw(4);
+    ultima::kernels::geglu_f32 (gate.data(), up.data(), ge.data(), 4);
+    ultima::kernels::swiglu_f32(gate.data(), up.data(), sw.data(), 4);
+    bool any_diff = false;
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (std::fabs(ge[i] - sw[i]) > 1e-4f) any_diff = true;
+    }
+    CHECK(any_diff);   // picking the wrong one must not go unnoticed
+
+    // Writing over the gate buffer gives the same answer.
+    ultima::kernels::geglu_f32(gate.data(), up.data(), gate.data(), 4);
+    for (std::size_t i = 0; i < 4; ++i) CHECK(gate[i] == doctest::Approx(ge[i]));
+}

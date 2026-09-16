@@ -16,6 +16,26 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-16 spark2_5  spark2_5 WORKING. Root cause was GEGLU vs SwiGLU. Also fixed a pretokenizer bug affecting every model.
+    User supplied the reference: llama.cpp b10988 binaries at C:/Llama/llama-b10988, and upstream PR
+    ggml-org/llama.cpp#27868 (merged 2026-09-06), fetched with `gh pr diff`.
+    Root cause: the feed-forward is LLM_FFN_GELU, not SILU. Everything else the 8-way ablation had
+      questioned was already right - NeoX rope, contiguous [Q|K|V], per-head sigmoid gate on the
+      post-attn-norm input applied before wo, sliding_window_pattern true = sliding.
+      Added kernels::geglu_f32 (tanh approximation) + FfnAct in ArchSpec/ArchParams.
+    Separately found and fixed a real pretokenizer bug affecting EVERY gpt2-vocab model: the
+      hand-rolled splitter grouped by character category, so "(n" always split. The Llama3/Qwen2
+      family allows one non-letter to prefix a letter run, and caps digit runs (1 for qwen2/spark2_5,
+      3 for llama3/dbrx). Rewrote pretokenize() with the three families selected by tokenizer.ggml.pre,
+      plus real UTF-8 decoding. qwen2 and granite now match llama-tokenize token-for-token; they did
+      not before.
+    Verified: 8 of 9 prompts byte-identical to the reference on Spark-1.7B; the one divergence is a
+      near-tied logit, explained by ggml evaluating GELU through an fp16 lookup table (less precise
+      than our direct tanh). Spark-4B also byte-identical, including a prompt where BOTH degenerate
+      to "nnnn" - that is the model, not us. All 7 previously-working models unchanged.
+    Now 9 of 21 files in C:/models runnable. 137 tests pass.
+
+
 2026-09-16 swa-infra  Sliding-window attention + gated attention + per-layer RoPE. spark2_5 attempted, NOT working.
     Infrastructure (all verified inert on the 7 working models, no regression):
       gqa_attention gained pos_begin, so SWA layers mask older keys instead of needing a second

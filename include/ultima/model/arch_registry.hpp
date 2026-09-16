@@ -13,6 +13,12 @@ enum class FfnKind {
     SparseMoE,      // router + per-expert gate/up/down, top-k weighted
 };
 
+// Which nonlinearity the gated FFN applies to its gate branch.
+enum class FfnAct {
+    SiLU,   // SwiGLU - Qwen, Llama, Granite, Phi-3
+    GELU,   // GEGLU  - Spark-X2.5
+};
+
 // How Q/K/V reach the block.
 enum class QkvKind {
     Separate,       // attn_q / attn_k / attn_v
@@ -36,6 +42,7 @@ struct ArchSpec {
 
     // Only meaningful when supported.
     FfnKind   ffn        = FfnKind::DenseSwiGLU;
+    FfnAct    ffn_act    = FfnAct::SiLU;
     QkvKind   qkv        = QkvKind::Separate;
     RopeStyle rope_style = RopeStyle::NeoX;
 

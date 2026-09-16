@@ -26,4 +26,17 @@ void silu_f32_scalar(const float* x, float* y, std::size_t n) noexcept;
 void swiglu_f32       (const float* gate, const float* up, float* y, std::size_t n) noexcept;
 void swiglu_f32_scalar(const float* gate, const float* up, float* y, std::size_t n) noexcept;
 
+// GEGLU: y[i] = gelu(gate[i]) * up[i]. Same shape as SwiGLU with GELU in place
+// of SiLU — Spark-X2.5 uses this.
+//
+// Uses the tanh approximation, evaluated directly:
+//   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Not the exact erf form — that is a visibly different function here. ggml
+// evaluates the same approximation through an fp16-indexed lookup table, so
+// it is slightly *less* precise than this; expect agreement on all but
+// near-tied logits rather than bit-exact equality.
+// In-place safe when y == gate or y == up.
+void geglu_f32       (const float* gate, const float* up, float* y, std::size_t n) noexcept;
+void geglu_f32_scalar(const float* gate, const float* up, float* y, std::size_t n) noexcept;
+
 } // namespace ultima::kernels

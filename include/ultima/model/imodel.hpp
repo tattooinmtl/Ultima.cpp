@@ -39,6 +39,7 @@ struct ModelDims {
 // new architecture in the same family is a table entry, not a new code path.
 struct ArchParams {
     FfnKind   ffn        = FfnKind::DenseSwiGLU;
+    FfnAct    ffn_act    = FfnAct::SiLU;
     QkvKind   qkv        = QkvKind::Separate;
     RopeStyle rope_style = RopeStyle::NeoX;
 
