@@ -55,6 +55,8 @@ void matvec_q6k_f32_scalar(const std::uint8_t* w, const float* x, float* y,
 // divisible by 256, so llama.cpp quantized their projections as Q5_0.
 void matvec_q5_0_f32       (const std::uint8_t* w, const float* x, float* y,
                             std::size_t M, std::size_t K) noexcept;
+void matvec_q5_0_f32_scalar(const std::uint8_t* w, const float* x, float* y,
+                            std::size_t M, std::size_t K) noexcept;
 
 // y[m] = sum_k dequant(W_q5k)[m, k] * x[k]
 // K must be a multiple of 256 (Q5_K super-block size). Q5_K shows up as the
@@ -98,6 +100,10 @@ void matvec_q5k_f32_threaded(ultima::runtime::ThreadPool& pool,
                              std::size_t M, std::size_t K) noexcept;
 
 void matvec_q4_1_f32_threaded(ultima::runtime::ThreadPool& pool,
+                              const std::uint8_t* w, const float* x, float* y,
+                              std::size_t M, std::size_t K) noexcept;
+
+void matvec_q5_0_f32_threaded(ultima::runtime::ThreadPool& pool,
                               const std::uint8_t* w, const float* x, float* y,
                               std::size_t M, std::size_t K) noexcept;
 

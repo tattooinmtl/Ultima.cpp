@@ -118,11 +118,7 @@ matvec_dispatch_threaded(runtime::ThreadPool& pool,
             kernels::matvec_q4_1_f32_threaded(pool, wb, x, y, M, K);
             return {};
         case DataType::Q5_0:
-            // No dedicated threaded Q5_0 kernel yet; scalar loop is
-            // dominated by the model forward pass anyway. Wrap with
-            // manual row splitting so multithread still helps.
-            (void)pool;
-            kernels::matvec_q5_0_f32(wb, x, y, M, K);
+            kernels::matvec_q5_0_f32_threaded(pool, wb, x, y, M, K);
             return {};
         default:
             return fail(ErrorCode::InvalidModel,
