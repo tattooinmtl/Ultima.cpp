@@ -56,4 +56,9 @@ std::vector<float> read_f32_array(const LoadedModel& model,
 std::vector<std::int32_t> read_i32_array(const LoadedModel& model,
                                          const MetadataArrayView& view);
 
+// Single-byte element arrays (GGUF bool / uint8), used for per-layer flag
+// vectors such as attention.sliding_window_pattern.
+std::vector<std::uint8_t> read_u8_array(const LoadedModel& model,
+                                        const MetadataArrayView& view);
+
 } // namespace ultima::model

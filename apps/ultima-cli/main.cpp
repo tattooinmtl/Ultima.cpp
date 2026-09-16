@@ -401,6 +401,7 @@ int run(int argc, char** argv) {
     std::size_t n_threads  = 0;
     float       temperature = 0.0f;   // greedy by default: reproducible checks
     std::uint64_t seed     = 0;
+    bool        show_tokens = false;
 
     for (int i = 3; i < argc; ++i) {
         std::string_view a = argv[i];
@@ -417,6 +418,7 @@ int run(int argc, char** argv) {
         else if (a == "--n-threads")  n_threads  = static_cast<std::size_t>(std::stoi(next("--n-threads")));
         else if (a == "--temp")       temperature = std::stof(next("--temp"));
         else if (a == "--seed")       seed       = static_cast<std::uint64_t>(std::stoull(next("--seed")));
+        else if (a == "--show-tokens") show_tokens = true;
         else {
             std::fprintf(stderr, "ultima run: unknown flag '%.*s'\n",
                          static_cast<int>(a.size()), a.data());
@@ -473,6 +475,15 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "prompt (%zu) + n_predict (%zu) exceeds n_ctx (%zu)\n",
                      tokens.size(), n_predict, kvc.n_ctx);
         return 1;
+    }
+
+    if (show_tokens) {
+        std::printf("tokens (%zu):", tokens.size());
+        for (auto t : tokens) {
+            std::printf(" [%d]%s", t,
+                        tok.decode(std::span<const ultima::tokenizer::TokenId>{&t, 1}).c_str());
+        }
+        std::printf("\n");
     }
 
     std::vector<float> logits(d.vocab, 0.0f);

@@ -177,6 +177,10 @@ resolve_model_tensors(const LoadedModel& gguf,
 
         if (auto r = get("attn_output.weight", d.hidden, d.q_dim, b.attn_out); !r)
             return Failure{r.error()};
+        if (p.attn_gate) {
+            if (auto r = get("attn_gate.weight", d.n_heads, d.hidden, b.attn_gate); !r)
+                return Failure{r.error()};
+        }
         if (auto r = get("ffn_norm.weight", d.hidden, 0, b.ffn_norm); !r)
             return Failure{r.error()};
 

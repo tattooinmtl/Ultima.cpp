@@ -47,6 +47,19 @@ std::vector<float> read_f32_array(const LoadedModel& model,
     }
 }
 
+std::vector<std::uint8_t> read_u8_array(const LoadedModel& model,
+                                        const MetadataArrayView& view) {
+    // 0 = UINT8, 1 = INT8, 7 = BOOL — all one byte per element.
+    if (view.element_type != 0 && view.element_type != 1 && view.element_type != 7) {
+        return {};
+    }
+    if (!view_in_bounds(model, view, 1)) return {};
+
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(view.count));
+    std::memcpy(out.data(), model.file_data() + view.file_offset, out.size());
+    return out;
+}
+
 std::vector<std::int32_t> read_i32_array(const LoadedModel& model,
                                          const MetadataArrayView& view) {
     if (view.element_type != kI32 && view.element_type != kU32) return {};

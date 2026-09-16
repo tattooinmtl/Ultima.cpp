@@ -39,6 +39,11 @@ struct ArchSpec {
     QkvKind   qkv        = QkvKind::Separate;
     RopeStyle rope_style = RopeStyle::NeoX;
 
+    // Per-head sigmoid gate on the attention output. Structural, not
+    // derivable from metadata, so it lives here rather than being probed
+    // from the presence of an attn_gate tensor.
+    bool      attn_gate  = false;
+
     // Human-readable. For supported archs, a short family description; for
     // unsupported ones, the engine work the file still needs.
     std::string_view notes;

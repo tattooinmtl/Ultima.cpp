@@ -53,6 +53,21 @@ struct ArchParams {
     float residual_scale  = 1.0f;   // multiplies each residual branch output
     float logit_scale     = 1.0f;   // divides the final logits
     float attn_scale      = 0.0f;   // 0 => use the usual 1/sqrt(head_dim)
+
+    // Sliding-window attention. `layer_is_swa` is empty when the model
+    // attends globally everywhere; otherwise it has one entry per layer and
+    // the true ones attend only to the last `sliding_window` positions.
+    // Those layers also use the *_swa RoPE settings.
+    std::size_t       sliding_window = 0;
+    std::vector<bool> layer_is_swa;
+
+    // Per-head sigmoid gate on the attention output, applied before the
+    // output projection (Spark-X2.5). The gate tensor is [n_heads, hidden].
+    bool attn_gate = false;
+
+    bool is_swa_layer(std::size_t layer) const noexcept {
+        return layer < layer_is_swa.size() && layer_is_swa[layer];
+    }
 };
 
 // RoPE parameters. Qwen3 optionally sets YaRN; Phi-3 sets LongRoPE frequency
@@ -76,6 +91,14 @@ struct RopeConfig {
 
     // Multiplies cos/sin. 1.0 for everything that does not set it.
     float       attn_factor     = 1.0f;
+
+    // Sliding-window layers can rotate a different number of dimensions at a
+    // different base than the global-attention layers. Spark-X2.5 rotates 256
+    // dims at base 1e4 on its windowed layers and only 64 at base 5e6 on the
+    // global ones. Both default to the non-SWA values when a model does not
+    // distinguish them.
+    float       freq_base_swa   = 0.0f;   // 0 => same as freq_base
+    std::size_t rope_dim_swa    = 0;      // 0 => same as rope_dim
 };
 
 // Per Decision 06 — the seam every future architecture speaks. Neither

@@ -2,6 +2,8 @@
 
 #include "ultima/model/weight_dispatch.hpp"
 
+#include <variant>
+
 #include <fmt/format.h>
 
 namespace ultima::model {
@@ -123,6 +125,15 @@ parse_arch_config(const LoadedModel& gguf,
         rp.attn_factor = *v;
     }
 
+    // Separate rotary settings for the sliding-window layers, when present.
+    rp.freq_base_swa = rp.freq_base;
+    rp.rope_dim_swa  = rp.rope_dim;
+    if (auto v = get_float_any(md, {arch + ".rope.freq_base_swa"})) rp.freq_base_swa = *v;
+    if (auto v = get_uint_any(md, {arch + ".rope.dimension_count_swa"})) {
+        const auto rd = static_cast<std::size_t>(*v);
+        if (rd > 0 && rd <= d.head_dim) rp.rope_dim_swa = rd;
+    }
+
     // YaRN scaling (Qwen3 mainly).
     if (auto s = md.get<std::string>(arch + ".rope.scaling.type")) {
         if (*s == "yarn") rp.scaling = RopeConfig::Scaling::YaRN;
@@ -191,6 +202,32 @@ parse_arch_config(const LoadedModel& gguf,
                         "arch_config");
         }
     }
+
+    // Sliding-window attention. Both the window size and the per-layer
+    // pattern must be present for SWA to engage; a window with no pattern
+    // would silently change which layers see the whole context.
+    if (auto w = get_uint_any(md, {arch + ".attention.sliding_window"});
+        w && *w > 0) {
+        if (const auto* pat_v = md.find(arch + ".attention.sliding_window_pattern")) {
+            if (const auto* view = std::get_if<MetadataArrayView>(pat_v)) {
+                const auto flags = read_u8_array(gguf, *view);
+                if (flags.size() != d.n_layers) {
+                    return fail(ErrorCode::InvalidModel,
+                                fmt::format("'{}.attention.sliding_window_pattern' has "
+                                            "{} entries but the model has {} layers",
+                                            arch, flags.size(), d.n_layers),
+                                "arch_config");
+                }
+                p.sliding_window = static_cast<std::size_t>(*w);
+                p.layer_is_swa.assign(d.n_layers, false);
+                for (std::size_t i = 0; i < d.n_layers; ++i) {
+                    p.layer_is_swa[i] = (flags[i] != 0);
+                }
+            }
+        }
+    }
+
+    p.attn_gate = spec.attn_gate;
 
     // Granite's scalar corrections; identity when absent.
     if (auto v = get_float_any(md, {arch + ".embedding_scale"})) p.embedding_scale = *v;

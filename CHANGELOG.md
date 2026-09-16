@@ -16,6 +16,25 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-16 swa-infra  Sliding-window attention + gated attention + per-layer RoPE. spark2_5 attempted, NOT working.
+    Infrastructure (all verified inert on the 7 working models, no regression):
+      gqa_attention gained pos_begin, so SWA layers mask older keys instead of needing a second
+        ring-buffered cache geometry.
+      ArchParams gained sliding_window + layer_is_swa + attn_gate; RopeConfig gained freq_base_swa
+        and rope_dim_swa, selected per layer in block_forward.
+      loaded_model gained read_u8_array for per-layer bool flag vectors.
+      ArchSpec gained attn_gate; tensor slots resolve attn_gate.weight [n_heads, hidden].
+      CLI: `ultima run --show-tokens`.
+    spark2_5: NOT runnable. Every structural piece is implemented and all shapes/metadata resolve,
+      but it decodes to degenerate token echo. Ablated 8 combinations (SWA on/off/inverted x gate
+      on/off x NeoX/Norm rope x contiguous/interleaved QKV) — none coherent. Tokenizer ruled out
+      by comparing against qwen2 on the same prompt: both split sensibly. Left registered as
+      not-runnable with that reason rather than shipped as working.
+    Finding: spark2_5 / gemma4 / qwen35 / dspark / dflash-draft have no reference implementation
+      available here, so their unconstrained semantics are guesswork. deepseek2 (GLM-4.7-Flash) is
+      the one remaining arch that is well specified — standard DeepSeek-V2 MLA.
+
+
 2026-09-16 fix-q5_0  Q5_0 matvec: AVX2 + threaded. 0.5B model went 2.3 -> 51.5 tok/s (22x)
     src/kernels/matvec_q5_0_f32.cpp  — fused AVX2 unpack; the offset-binary -16 is folded into the
         bit pattern (OR 0xF0 where the fifth bit is clear) so the byte reads as a signed int8 directly,

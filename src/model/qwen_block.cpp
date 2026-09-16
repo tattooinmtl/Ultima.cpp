@@ -49,12 +49,15 @@ void rmsnorm_per_head(float* x, std::size_t n_heads, std::size_t head_dim,
 // - K, V: [n_kv_heads, n_ctx, head_dim] (f32 storage in v0.1); reader is
 //   the KVCache LayerView whose stride_head == n_ctx * head_dim.
 // - out: [n_heads, head_dim] contiguous
-// - scratch: at least pos_end floats
+// - scratch: at least (pos_end - pos_begin) floats
 // - scale: multiplies the raw dot products (1/sqrt(head_dim) for most archs;
 //   Granite ships an explicit value)
+// - pos_begin: first key position to attend to. Non-zero implements sliding
+//   -window attention; the keys below it stay in the cache but are masked out.
 void gqa_attention(const float* q,
                    const float* K, const float* V,
                    std::size_t stride_head,   // element stride between heads
+                   std::size_t pos_begin,
                    std::size_t pos_end,
                    std::size_t n_heads,
                    std::size_t n_kv_heads,
@@ -64,6 +67,7 @@ void gqa_attention(const float* q,
                    float*      scratch)
 {
     const std::size_t group = n_heads / n_kv_heads;
+    const std::size_t span  = pos_end - pos_begin;
 
     for (std::size_t h = 0; h < n_heads; ++h) {
         const std::size_t hkv = h / group;
@@ -71,23 +75,23 @@ void gqa_attention(const float* q,
         const float* K_h = K + hkv * stride_head;
         const float* V_h = V + hkv * stride_head;
 
-        // Scores: dot(q_h, K_h[t]) * scale for t in [0, pos_end)
-        for (std::size_t t = 0; t < pos_end; ++t) {
+        // Scores: dot(q_h, K_h[t]) * scale for t in [pos_begin, pos_end)
+        for (std::size_t t = 0; t < span; ++t) {
             float acc = 0.0f;
-            const float* k_t = K_h + t * head_dim;
+            const float* k_t = K_h + (pos_begin + t) * head_dim;
             for (std::size_t i = 0; i < head_dim; ++i) acc += q_h[i] * k_t[i];
             scratch[t] = acc * scale;
         }
 
-        // Softmax in place over pos_end.
-        kernels::softmax_f32(scratch, scratch, pos_end);
+        // Softmax in place over the visible span.
+        kernels::softmax_f32(scratch, scratch, span);
 
         // Weighted sum of V.
         float* out_h = out + h * head_dim;
         for (std::size_t i = 0; i < head_dim; ++i) out_h[i] = 0.0f;
-        for (std::size_t t = 0; t < pos_end; ++t) {
+        for (std::size_t t = 0; t < span; ++t) {
             const float w = scratch[t];
-            const float* v_t = V_h + t * head_dim;
+            const float* v_t = V_h + (pos_begin + t) * head_dim;
             for (std::size_t i = 0; i < head_dim; ++i) out_h[i] += w * v_t[i];
         }
     }
@@ -207,6 +211,9 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
 
     if (p.qkv == QkvKind::Fused) {
         qkv_full.assign(d.q_dim + 2 * d.kv_dim, 0.0f);
+    }
+    if (p.attn_gate) {
+        head_gate.assign(d.n_heads, 0.0f);
     }
 
     // The FFN scratch has to cover whichever path this architecture takes:
@@ -353,14 +360,18 @@ block_forward(BlockScratch& s,
                          s.attn_k_norm.data() + layer * dims.head_dim, dims.rms_eps);
     }
 
-    // 4. RoPE on Q and K at the absolute position.
-    const bool  neox = (params.rope_style == RopeStyle::NeoX);
-    const float* ff  = rope.freq_factors.empty() ? nullptr : rope.freq_factors.data();
+    // 4. RoPE on Q and K at the absolute position. Sliding-window layers can
+    //    rotate a different number of dims at a different base.
+    const bool  is_swa = params.is_swa_layer(layer);
+    const bool  neox   = (params.rope_style == RopeStyle::NeoX);
+    const float* ff    = rope.freq_factors.empty() ? nullptr : rope.freq_factors.data();
+    const std::size_t rope_dim  = is_swa ? rope.rope_dim_swa  : rope.rope_dim;
+    const float       freq_base = is_swa ? rope.freq_base_swa : rope.freq_base;
     kernels::rope_f32_ext(s.q_full.data(), dims.n_heads, dims.head_dim,
-                          rope.rope_dim, absolute_position, rope.freq_base,
+                          rope_dim, absolute_position, freq_base,
                           neox, ff, rope.attn_factor);
     kernels::rope_f32_ext(s.k_full.data(), dims.n_kv_heads, dims.head_dim,
-                          rope.rope_dim, absolute_position, rope.freq_base,
+                          rope_dim, absolute_position, freq_base,
                           neox, ff, rope.attn_factor);
 
     // 5. Write K, V into cache at absolute position; then read up to pos+1.
@@ -373,11 +384,34 @@ block_forward(BlockScratch& s,
         : 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
     const float* K = static_cast<const float*>(lv.k);
     const float* V = static_cast<const float*>(lv.v);
+
+    // Sliding-window layers see only the most recent `sliding_window` keys.
+    // The older entries stay in the cache — masking here costs nothing and
+    // avoids a second, ring-buffered cache geometry.
+    std::size_t pos_begin = 0;
+    if (is_swa && params.sliding_window > 0 && lv.pos > params.sliding_window) {
+        pos_begin = lv.pos - params.sliding_window;
+    }
     gqa_attention(s.q_full.data(), K, V,
-                  lv.stride_head, lv.pos,
+                  lv.stride_head, pos_begin, lv.pos,
                   dims.n_heads, dims.n_kv_heads, dims.head_dim,
                   attn_scale,
                   s.attn_out.data(), s.attn_scores.data());
+
+    // 6b. Per-head sigmoid gate on the attention output. The gate is one
+    //     scalar per head derived from the normed residual, so it has to be
+    //     applied here, while the output is still laid out per head.
+    if (params.attn_gate) {
+        if (auto r = matvec_dispatch_threaded(pool, block.attn_gate.dtype,
+                                              block.attn_gate.data,
+                                              s.x_norm.data(), s.head_gate.data(),
+                                              dims.n_heads, dims.hidden); !r) return r;
+        for (std::size_t h = 0; h < dims.n_heads; ++h) {
+            const float g = 1.0f / (1.0f + std::exp(-s.head_gate[h]));
+            float* out_h = s.attn_out.data() + h * dims.head_dim;
+            for (std::size_t i = 0; i < dims.head_dim; ++i) out_h[i] *= g;
+        }
+    }
 
     // 7. Output projection + residual add.
     if (auto r = matvec_dispatch_threaded(pool, block.attn_out.dtype, block.attn_out.data,

@@ -15,7 +15,7 @@ GGUFs and reports each file individually.
 | `granite`    | runnable | IBM Granite dense, embedding/residual/logit scales, Norm-style RoPE |
 | `phi3`       | runnable | Fused QKV and fused gate/up, LongRoPE frequency factors |
 | `gemma4`     | not yet  | per-layer KV head counts, alternating sliding-window attention, dual RoPE bases, post-attention/post-FFN norms, final logit softcapping |
-| `spark2_5`   | not yet  | gated attention (`attn_gate`), sliding-window pattern, dual RoPE bases |
+| `spark2_5`   | not yet  | structurally implemented (fused QKV, per-head gated attention, SWA masking, per-layer RoPE) but decodes to degenerate token echo; gate semantics and SWA/RoPE conventions unconfirmed |
 | `qwen35`     | not yet  | hybrid SSM/Mamba layers (`ssm_*`, 3 of every 4 blocks), MRoPE sections, SSM state cache |
 | `qwen35moe`  | not yet  | the `qwen35` SSM hybrid plus MoE with shared experts |
 | `deepseek2`  | not yet  | multi-head latent attention (compressed KV) and MoE with grouped routing, shared experts, expert bias |
@@ -58,6 +58,20 @@ IQ-series (`IQ1_*`…`IQ4_*`) and the ternary `TQ*` formats are not implemented.
 | `llama` / `spm` | supported | Phi-3, Llama, Mistral — SentencePiece with `<0xNN>` byte fallback |
 | `gemma4` | not implemented | the Gemma models |
 | `none` | n/a | models with no vocabulary |
+
+## Architectures without a public reference
+
+`spark2_5`, `gemma4`, `qwen35`, `qwen35moe`, `dspark` and `dflash-draft` do not
+correspond to architectures Ultima has a reference implementation for. Their
+GGUF metadata uses llama.cpp-style key names, but the semantics behind those
+keys — gate activation and where it applies, `sliding_window_pattern` polarity,
+whether global layers are meant to be NoPE — cannot be settled by inspection.
+`spark2_5` is the worked example: every tensor shape and metadata key resolves,
+an 8-way ablation found no working combination, and the tokenizer was cleared
+against a known-good control.
+
+`deepseek2` is the exception among the remaining work: it is standard
+DeepSeek-V2 multi-head latent attention, which is well specified.
 
 ## Known limitations
 

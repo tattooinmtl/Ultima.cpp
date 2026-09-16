@@ -25,6 +25,7 @@ struct BlockScratch {
     std::vector<float> v_full;       // kv_dim
     std::vector<float> attn_out;     // q_dim
     std::vector<float> attn_scores;  // n_ctx (per-head, reused across heads)
+    std::vector<float> head_gate;    // n_heads (gated attention only)
     std::vector<float> gate;         // ffn width (see init)
     std::vector<float> up;           // ffn width (see init)
     std::vector<float> logits_tmp;   // vocab (only allocated for LM head)

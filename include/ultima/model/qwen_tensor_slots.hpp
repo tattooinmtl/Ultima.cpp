@@ -56,6 +56,7 @@ struct ModelTensors {
         WeightRef attn_qkv;    // [q_dim + 2*kv_dim, hidden]
 
         WeightRef attn_out;    // [hidden, q_dim]
+        WeightRef attn_gate;   // [n_heads, hidden] — one scalar per head
         WeightRef ffn_norm;    // [hidden]
 
         // FfnKind::DenseSwiGLU uses gate + up + down.
