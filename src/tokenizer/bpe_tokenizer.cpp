@@ -7,9 +7,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <queue>
 #include <string>
+#include <variant>
 
 namespace ultima::tokenizer {
 
@@ -28,6 +32,11 @@ constexpr const char* k_model          = "tokenizer.ggml.model";
 constexpr const char* k_bos_id         = "tokenizer.ggml.bos_token_id";
 constexpr const char* k_eos_id         = "tokenizer.ggml.eos_token_id";
 constexpr const char* k_pad_id         = "tokenizer.ggml.padding_token_id";
+constexpr const char* k_unk_id         = "tokenizer.ggml.unknown_token_id";
+constexpr const char* k_scores         = "tokenizer.ggml.scores";
+
+// SentencePiece writes word boundaries as U+2581 LOWER ONE EIGHTH BLOCK.
+constexpr const char* k_spm_space      = "\xE2\x96\x81";
 
 // ---- GPT-2 byte-to-unicode map --------------------------------------------
 // Standard mapping used by every GPT-2-family tokenizer (Qwen2, Qwen3
@@ -221,6 +230,21 @@ public:
             }
         }
 
+        // Which vocabulary family is this? "gpt2" => byte-level BPE with a
+        // ranked merge list; "llama"/"spm" => SentencePiece with per-token
+        // scores and <0xNN> byte fallback.
+        const std::string tok_model =
+            model.metadata().get<std::string>(k_model).value_or("gpt2");
+        tok->kind_ = (tok_model == "llama" || tok_model == "spm")
+                   ? BpeTokenizer::Kind::Spm
+                   : BpeTokenizer::Kind::Bpe;
+
+        if (tok->kind_ == BpeTokenizer::Kind::Spm) {
+            if (auto r = build_spm(*tok, model); !r) return Failure{r.error()};
+            finish_specials(*tok, model);
+            return tok;
+        }
+
         // Load merges — vector of "a b" strings, in priority order.
         auto merges_opt = model.metadata().get<std::vector<std::string>>(k_merges);
         if (!merges_opt) {
@@ -244,26 +268,74 @@ public:
             tok->merge_rank_.emplace(key, static_cast<std::uint32_t>(i));
         }
 
-        // Resolve special-token ids.
-        tok->bos_id_ = static_cast<TokenId>(model.metadata().get_uint(k_bos_id).value_or(-1));
-        tok->eos_id_ = static_cast<TokenId>(model.metadata().get_uint(k_eos_id).value_or(-1));
-        tok->pad_id_ = static_cast<TokenId>(model.metadata().get_uint(k_pad_id).value_or(-1));
-        tok->im_start_id_ = tok->id_of("<|im_start|>");
-        tok->im_end_id_   = tok->id_of("<|im_end|>");
+        finish_specials(*tok, model);
+        return tok;
+    }
 
-        // Sort specials by length desc for greedy longest-match encode.
-        for (std::size_t i = 0; i < tok->vocab_.size(); ++i) {
-            if (tok->is_special_[i]) {
-                tok->specials_by_len_desc_.emplace_back(
-                    tok->vocab_[i], static_cast<TokenId>(i));
+private:
+    // SentencePiece vocab: scores drive the merge order, token_type marks
+    // which ids are control/user-defined (never merged, hidden on decode)
+    // and which are the 256 <0xNN> byte-fallback tokens.
+    static Result<void> build_spm(BpeTokenizer& tok,
+                                  const model::LoadedModel& model) {
+        const auto* scores_v = model.metadata().find(k_scores);
+        if (!scores_v) {
+            return fail(ErrorCode::MissingRequiredMetadata,
+                        fmt::format("missing '{}' (required for a "
+                                    "SentencePiece vocabulary)", k_scores),
+                        "bpe_tokenizer");
+        }
+        if (const auto* view = std::get_if<model::MetadataArrayView>(scores_v)) {
+            tok.scores_ = model::read_f32_array(model, *view);
+        }
+        if (tok.scores_.size() != tok.vocab_.size()) {
+            return fail(ErrorCode::InvalidModel,
+                        fmt::format("'{}' has {} entries but the vocab has {}",
+                                    k_scores, tok.scores_.size(), tok.vocab_.size()),
+                        "bpe_tokenizer");
+        }
+
+        // token_type: 2 = UNKNOWN, 3 = CONTROL, 4 = USER_DEFINED, 6 = BYTE.
+        // Byte-fallback tokens stay non-special: decode has to emit them.
+        if (const auto* tt_v = model.metadata().find(k_token_type)) {
+            if (const auto* view = std::get_if<model::MetadataArrayView>(tt_v)) {
+                const auto types = model::read_i32_array(model, *view);
+                if (types.size() == tok.vocab_.size()) {
+                    for (std::size_t i = 0; i < types.size(); ++i) {
+                        const auto t = types[i];
+                        tok.is_special_[i] = (t == 2 || t == 3 || t == 4);
+                    }
+                }
             }
         }
-        std::sort(tok->specials_by_len_desc_.begin(),
-                  tok->specials_by_len_desc_.end(),
+
+        tok.byte_fallback_base_ = tok.id_of("<0x00>");
+        tok.unk_id_ = static_cast<TokenId>(
+            model.metadata().get_uint(k_unk_id).value_or(
+                static_cast<std::uint64_t>(-1)));
+        return {};
+    }
+
+    static void finish_specials(BpeTokenizer& tok,
+                                const model::LoadedModel& model) {
+        tok.bos_id_ = static_cast<TokenId>(model.metadata().get_uint(k_bos_id).value_or(-1));
+        tok.eos_id_ = static_cast<TokenId>(model.metadata().get_uint(k_eos_id).value_or(-1));
+        tok.pad_id_ = static_cast<TokenId>(model.metadata().get_uint(k_pad_id).value_or(-1));
+        tok.im_start_id_ = tok.id_of("<|im_start|>");
+        tok.im_end_id_   = tok.id_of("<|im_end|>");
+
+        // Sort specials by length desc for greedy longest-match encode.
+        for (std::size_t i = 0; i < tok.vocab_.size(); ++i) {
+            if (tok.is_special_[i]) {
+                tok.specials_by_len_desc_.emplace_back(
+                    tok.vocab_[i], static_cast<TokenId>(i));
+            }
+        }
+        std::sort(tok.specials_by_len_desc_.begin(),
+                  tok.specials_by_len_desc_.end(),
                   [](const auto& a, const auto& b) {
                       return a.first.size() > b.first.size();
                   });
-        return tok;
     }
 };
 
@@ -345,6 +417,142 @@ std::vector<TokenId> encode_pretoken_bytes(
     return seq;
 }
 
+// ---- SentencePiece ---------------------------------------------------------
+
+// Length in bytes of the UTF-8 sequence starting at s[i].
+std::size_t utf8_len(std::string_view s, std::size_t i) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    std::size_t n = 1;
+    if      (c >= 0xF0) n = 4;
+    else if (c >= 0xE0) n = 3;
+    else if (c >= 0xC0) n = 2;
+    return std::min(n, s.size() - i);
+}
+
+// One symbol in the merge list: a slice of the normalized text plus its
+// neighbours. `len == 0` marks a symbol absorbed by a merge.
+struct SpmSymbol {
+    std::string text;
+    std::ptrdiff_t prev = -1;
+    std::ptrdiff_t next = -1;
+    bool alive = true;
+};
+
+struct SpmBigram {
+    std::ptrdiff_t left  = -1;
+    std::ptrdiff_t right = -1;
+    float          score = 0.0f;
+    std::size_t    size  = 0;   // byte length of the merged text
+
+    // Max-heap on score; ties go to the leftmost pair, matching
+    // llama.cpp's llm_bigram_spm ordering.
+    bool operator<(const SpmBigram& o) const {
+        return (score < o.score) || (score == o.score && left > o.left);
+    }
+};
+
+// SentencePiece merge loop: start from single UTF-8 characters and repeatedly
+// glue the adjacent pair whose concatenation has the highest vocab score.
+std::vector<TokenId> encode_spm(
+    std::string_view text,
+    const std::unordered_map<std::string, TokenId>& token_to_id,
+    const std::vector<float>& scores,
+    TokenId byte_fallback_base,
+    TokenId unk_id)
+{
+    // Normalize: SentencePiece prepends a word boundary and writes every
+    // space as U+2581.
+    std::string norm = k_spm_space;
+    for (char c : text) {
+        if (c == ' ') norm += k_spm_space;
+        else          norm.push_back(c);
+    }
+
+    std::vector<SpmSymbol> syms;
+    for (std::size_t i = 0; i < norm.size();) {
+        const std::size_t n = utf8_len(norm, i);
+        SpmSymbol s;
+        s.text = norm.substr(i, n);
+        s.prev = static_cast<std::ptrdiff_t>(syms.size()) - 1;
+        s.next = static_cast<std::ptrdiff_t>(syms.size()) + 1;
+        syms.push_back(std::move(s));
+        i += n;
+    }
+    if (syms.empty()) return {};
+    syms.back().next = -1;
+
+    std::priority_queue<SpmBigram> work;
+    auto try_add = [&](std::ptrdiff_t l, std::ptrdiff_t r) {
+        if (l < 0 || r < 0) return;
+        if (!syms[static_cast<std::size_t>(l)].alive) return;
+        if (!syms[static_cast<std::size_t>(r)].alive) return;
+        const std::string merged = syms[static_cast<std::size_t>(l)].text
+                                 + syms[static_cast<std::size_t>(r)].text;
+        auto it = token_to_id.find(merged);
+        if (it == token_to_id.end()) return;
+        SpmBigram b;
+        b.left  = l;
+        b.right = r;
+        b.score = scores[static_cast<std::size_t>(it->second)];
+        b.size  = merged.size();
+        work.push(b);
+    };
+
+    for (std::ptrdiff_t i = 1; i < static_cast<std::ptrdiff_t>(syms.size()); ++i) {
+        try_add(i - 1, i);
+    }
+
+    while (!work.empty()) {
+        const SpmBigram b = work.top();
+        work.pop();
+
+        auto& left  = syms[static_cast<std::size_t>(b.left)];
+        auto& right = syms[static_cast<std::size_t>(b.right)];
+        // Stale entry: one side was already merged into something else, so
+        // the recorded byte length no longer matches.
+        if (!left.alive || !right.alive ||
+            left.text.size() + right.text.size() != b.size) {
+            continue;
+        }
+
+        left.text += right.text;
+        right.alive = false;
+        left.next = right.next;
+        if (right.next >= 0) syms[static_cast<std::size_t>(right.next)].prev = b.left;
+
+        try_add(left.prev, b.left);
+        try_add(b.left, left.next);
+    }
+
+    // Emit. Anything still not in the vocab falls back to its raw bytes.
+    std::vector<TokenId> out;
+    for (std::ptrdiff_t i = 0; i >= 0 && i < static_cast<std::ptrdiff_t>(syms.size());
+         i = syms[static_cast<std::size_t>(i)].next) {
+        const auto& s = syms[static_cast<std::size_t>(i)];
+        if (!s.alive) continue;
+        auto it = token_to_id.find(s.text);
+        if (it != token_to_id.end()) {
+            out.push_back(it->second);
+            continue;
+        }
+        for (unsigned char byte : s.text) {
+            // Look the byte token up by name rather than indexing off a base:
+            // the <0xNN> block is contiguous in practice but nothing in the
+            // format guarantees it.
+            TokenId id = -1;
+            if (byte_fallback_base >= 0) {
+                char name[8];
+                std::snprintf(name, sizeof(name), "<0x%02X>", byte);
+                auto bit = token_to_id.find(name);
+                if (bit != token_to_id.end()) id = bit->second;
+            }
+            if (id < 0) id = unk_id;
+            if (id >= 0) out.push_back(id);
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 std::vector<TokenId>
@@ -356,6 +564,15 @@ BpeTokenizer::encode(std::string_view text, bool allow_special) const {
     // allow_special is true. Everything else flows through the normal
     // pretokenize + BPE path.
     auto encode_normal_chunk = [&](std::string_view chunk) {
+        if (chunk.empty()) return;
+        if (kind_ == Kind::Spm) {
+            // SentencePiece does its own normalization and has no
+            // regex pretokenizer step.
+            auto ids = encode_spm(chunk, token_to_id_, scores_,
+                                  byte_fallback_base_, unk_id_);
+            out.insert(out.end(), ids.begin(), ids.end());
+            return;
+        }
         for (auto pt : pretokenize(chunk)) {
             // Pass raw pretoken bytes; encode_pretoken_bytes maps each byte
             // to its byte-token id, then runs BPE.
@@ -419,6 +636,30 @@ BpeTokenizer::decode(std::span<const TokenId> tokens, bool skip_special) const {
         // Special tokens (kept when !skip_special) go through verbatim.
         if (is_special_[sidx]) {
             out += s;
+            continue;
+        }
+
+        if (kind_ == Kind::Spm) {
+            // "<0xNN>" byte-fallback tokens decode to that raw byte; every
+            // other piece is literal text with U+2581 standing for a space.
+            if (s.size() == 6 && s.compare(0, 3, "<0x") == 0 && s[5] == '>') {
+                const auto hex = s.substr(3, 2);
+                char* end = nullptr;
+                const long v = std::strtol(hex.c_str(), &end, 16);
+                if (end && *end == '\0' && v >= 0 && v <= 0xFF) {
+                    out.push_back(static_cast<char>(v));
+                    continue;
+                }
+            }
+            for (std::size_t k = 0; k < s.size();) {
+                if (s.compare(k, 3, k_spm_space) == 0) {
+                    out.push_back(' ');
+                    k += 3;
+                } else {
+                    out.push_back(s[k]);
+                    ++k;
+                }
+            }
             continue;
         }
         // Walk the token's UTF-8 string, decoding each GPT-2 byte-token

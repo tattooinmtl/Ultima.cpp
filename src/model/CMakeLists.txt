@@ -2,9 +2,11 @@ add_library(ultima_model STATIC
     dtype.cpp
     tensor_info.cpp
     metadata_store.cpp
+    loaded_model.cpp
     gguf_reader.cpp
     gguf_loader.cpp
     mmap_file_windows.cpp
+    arch_registry.cpp
     qwen_config.cpp
     qwen_tensor_slots.cpp
     weight_dispatch.cpp

@@ -24,13 +24,22 @@ struct PairHash {
     std::size_t operator()(std::uint64_t k) const noexcept { return k ^ (k >> 32); }
 };
 
-// Byte-level BPE tokenizer loaded from a GGUF file's tokenizer.ggml.* keys.
-// See Decision 07. The model is loaded once at construction; encode/decode
-// are thread-safe (immutable state; per-call scratch is stack-local).
+// Tokenizer loaded from a GGUF file's tokenizer.ggml.* keys. See Decision 07.
+// The model is loaded once at construction; encode/decode are thread-safe
+// (immutable state; per-call scratch is stack-local).
+//
+// Two vocabulary families are supported, selected by tokenizer.ggml.model:
+//   Bpe ("gpt2") — byte-level BPE with a ranked merge list. Qwen, Granite.
+//   Spm ("llama") — SentencePiece: score-ranked merges over ▁-marked text,
+//                   with <0xNN> byte fallback. Llama, Mistral, Phi-3.
 class BpeTokenizer {
 public:
+    enum class Kind { Bpe, Spm };
+
     static core::Result<std::unique_ptr<BpeTokenizer>>
     load(const model::LoadedModel& model);
+
+    Kind kind() const noexcept { return kind_; }
 
     // Encode UTF-8 text to token ids.
     //   allow_special = true  : special-token strings inside `text` are
@@ -81,6 +90,15 @@ private:
     std::vector<std::string>                     vocab_;
     std::unordered_map<std::string, TokenId>     token_to_id_;
     std::vector<bool>                            is_special_;
+
+    Kind                                         kind_ = Kind::Bpe;
+
+    // SPM only: per-token merge scores, and the id of the <0x00> byte token
+    // (the 256 byte-fallback tokens are contiguous from there). -1 when the
+    // vocab has no byte fallback.
+    std::vector<float>                           scores_;
+    TokenId                                      byte_fallback_base_ = -1;
+    TokenId                                      unk_id_             = -1;
 
     // Special-token literal strings (for allow_special encode).
     std::vector<std::pair<std::string, TokenId>> specials_by_len_desc_;

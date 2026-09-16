@@ -32,7 +32,13 @@ enum class DataType : std::uint32_t {
 
 const char* to_string(DataType t) noexcept;
 
-// True if v0.1 knows how to load and dequantize this type.
+// True if Ultima can dequantize this type (dequant_1d / read_row), which is
+// what norms, biases and the embedding row lookup need.
+//
+// NOT the same as "usable as a projection weight": matvec_dispatch covers a
+// subset (F32, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K). F16 and BF16 dequantize
+// but have no matvec kernel yet, which is fine because no supported
+// architecture stores a projection matrix in them.
 bool is_active(DataType t) noexcept;
 
 // K-quants are stored in super-blocks of 256 elements. Non-K quants are

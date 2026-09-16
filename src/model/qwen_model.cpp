@@ -1,5 +1,6 @@
 #include "ultima/kernels/norms.hpp"
 #include "ultima/kv_cache/kv_cache.hpp"
+#include "ultima/model/arch_registry.hpp"
 #include "ultima/model/imodel.hpp"
 #include "ultima/model/qwen_block.hpp"
 #include "ultima/model/qwen_config.hpp"
@@ -21,33 +22,35 @@ using core::Failure;
 using core::Result;
 using core::fail;
 
-// Concrete Qwen model. Covers both Qwen2 and Qwen3 — the Qwen3 differences
-// (Q/K RMSNorm, YaRN scaling) live inside qwen_block_forward as per-flag
-// branches driven by the tensor slot table + RopeConfig.
-class QwenModel final : public IModel {
+// One concrete model covering every llama-family architecture in the registry.
+// The per-architecture differences — fused vs separate QKV, dense vs fused vs
+// MoE feed-forward, RoPE convention, Granite's scalar corrections — are data
+// in ArchParams, resolved once at load time and branched on inside
+// block_forward rather than duplicated into subclasses.
+class TransformerModel final : public IModel {
 public:
-    QwenModel(std::string arch,
-              const LoadedModel& gguf,
-              runtime::ThreadPool& pool)
-        : arch_{std::move(arch)}, gguf_{gguf}, pool_{pool} {}
+    TransformerModel(std::string arch,
+                     const ArchSpec& spec,
+                     const LoadedModel& gguf,
+                     runtime::ThreadPool& pool)
+        : arch_{std::move(arch)}, spec_{spec}, gguf_{gguf}, pool_{pool} {}
 
     Result<void> init() {
-        if (auto r = parse_qwen_config(gguf_, arch_, dims_, rope_); !r) return r;
-        auto tensors = resolve_qwen_tensors(gguf_, arch_,
-                                            dims_.n_layers, dims_.hidden,
-                                            dims_.n_kv_heads, dims_.head_dim,
-                                            dims_.ffn_hidden, dims_.vocab);
+        if (auto r = parse_arch_config(gguf_, spec_, arch_, dims_, rope_, params_); !r)
+            return r;
+        auto tensors = resolve_model_tensors(gguf_, arch_, dims_, params_);
         if (!tensors) return Failure{tensors.error()};
         tensors_ = std::move(*tensors);
 
-        scratch_.init(dims_);
+        scratch_.init(dims_, params_);
         if (auto r = preload_scratch_from_tensors(scratch_, tensors_, dims_); !r) return r;
         return {};
     }
 
-    const ModelDims&  dims() const noexcept override { return dims_; }
-    const RopeConfig& rope() const noexcept override { return rope_; }
-    const char*       arch() const noexcept override { return arch_.c_str(); }
+    const ModelDims&  dims()   const noexcept override { return dims_; }
+    const RopeConfig& rope()   const noexcept override { return rope_; }
+    const ArchParams& params() const noexcept override { return params_; }
+    const char*       arch()   const noexcept override { return arch_.c_str(); }
 
     Result<void> prefill(kv_cache::KVCache& kv,
                          kv_cache::SlotHandle slot,
@@ -87,17 +90,23 @@ private:
             return fail(ErrorCode::InvalidModel,
                         fmt::format("token id {} out of vocab [0, {})",
                                     token, dims_.vocab),
-                        "qwen_model");
+                        "transformer_model");
         }
         if (auto r = read_row(tensors_.token_embd.dtype, tensors_.token_embd.data,
                               static_cast<std::size_t>(token), dims_.hidden,
                               scratch_.x.data()); !r) return r;
 
+        // Granite scales the embedding before the first block.
+        if (params_.embedding_scale != 1.0f) {
+            for (std::size_t i = 0; i < dims_.hidden; ++i)
+                scratch_.x[i] *= params_.embedding_scale;
+        }
+
         // 2. Transformer stack.
         for (std::size_t L = 0; L < dims_.n_layers; ++L) {
-            if (auto r = qwen_block_forward(scratch_, tensors_.blocks[L],
-                                            dims_, rope_, kv, slot, L,
-                                            abs_pos, pool_); !r) return r;
+            if (auto r = block_forward(scratch_, tensors_.blocks[L],
+                                       dims_, params_, rope_, kv, slot, L,
+                                       abs_pos, pool_); !r) return r;
         }
 
         // 3. If logits requested, finalize.
@@ -112,16 +121,23 @@ private:
                                                   scratch_.x_norm.data(),
                                                   out_logits,
                                                   dims_.vocab, dims_.hidden); !r) return r;
+            // Granite divides the logits by a fixed scale.
+            if (params_.logit_scale != 1.0f && params_.logit_scale != 0.0f) {
+                const float inv = 1.0f / params_.logit_scale;
+                for (std::size_t i = 0; i < dims_.vocab; ++i) out_logits[i] *= inv;
+            }
         }
         return {};
     }
 
     std::string             arch_;
+    const ArchSpec&         spec_;
     const LoadedModel&      gguf_;
     runtime::ThreadPool&    pool_;
     ModelDims               dims_{};
     RopeConfig              rope_{};
-    QwenTensors             tensors_;
+    ArchParams              params_{};
+    ModelTensors            tensors_;
     BlockScratch            scratch_;
 };
 
@@ -130,13 +146,22 @@ private:
 Result<std::unique_ptr<IModel>>
 load_model(const LoadedModel& gguf, runtime::ThreadPool& pool) {
     const std::string& arch = gguf.architecture();
-    if (arch != "qwen2" && arch != "qwen3") {
+    const ArchSpec* spec = find_arch(arch);
+
+    if (!spec) {
         return fail(ErrorCode::InvalidModel,
-                    fmt::format("architecture '{}' not supported in v0.1 "
-                                "(expected 'qwen2' or 'qwen3')", arch),
+                    fmt::format("unknown architecture '{}'. Run 'ultima archs' "
+                                "for the architectures Ultima knows about.", arch),
                     "load_model");
     }
-    auto m = std::make_unique<QwenModel>(arch, gguf, pool);
+    if (!spec->supported) {
+        return fail(ErrorCode::InvalidModel,
+                    fmt::format("architecture '{}' is recognized but not yet "
+                                "runnable: {}", arch, spec->notes),
+                    "load_model");
+    }
+
+    auto m = std::make_unique<TransformerModel>(arch, *spec, gguf, pool);
     if (auto r = m->init(); !r) return Failure{r.error()};
     return std::unique_ptr<IModel>{m.release()};
 }

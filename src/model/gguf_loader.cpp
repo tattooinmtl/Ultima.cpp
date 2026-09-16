@@ -151,6 +151,7 @@ public:
     }
 
     std::uint64_t file_size_bytes() const override { return file_.size(); }
+    const std::uint8_t* file_data() const override { return file_.data(); }
     std::uint64_t alignment()       const override { return alignment_; }
     std::uint32_t gguf_version()    const override { return gguf_version_; }
 

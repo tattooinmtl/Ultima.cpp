@@ -76,4 +76,30 @@ void matvec_q8_0_f32_threaded(ultima::runtime::ThreadPool& pool,
     });
 }
 
+void matvec_q5k_f32_threaded(ultima::runtime::ThreadPool& pool,
+                             const std::uint8_t* w, const float* x, float* y,
+                             std::size_t M, std::size_t K) noexcept {
+    if (K == 0 || (K % 256u) != 0) {
+        for (std::size_t m = 0; m < M; ++m) y[m] = 0.0f;
+        return;
+    }
+    const std::size_t bytes_per_row = (K / 256u) * 176u;
+    dispatch_rows(pool, M, [&](std::size_t begin, std::size_t end) {
+        matvec_q5k_f32(w + begin * bytes_per_row, x, y + begin, end - begin, K);
+    });
+}
+
+void matvec_q4_1_f32_threaded(ultima::runtime::ThreadPool& pool,
+                              const std::uint8_t* w, const float* x, float* y,
+                              std::size_t M, std::size_t K) noexcept {
+    if (K == 0 || (K % 32u) != 0) {
+        for (std::size_t m = 0; m < M; ++m) y[m] = 0.0f;
+        return;
+    }
+    const std::size_t bytes_per_row = (K / 32u) * 20u;
+    dispatch_rows(pool, M, [&](std::size_t begin, std::size_t end) {
+        matvec_q4_1_f32(w + begin * bytes_per_row, x, y + begin, end - begin, K);
+    });
+}
+
 } // namespace ultima::kernels

@@ -5,11 +5,15 @@ add_library(ultima_kernels STATIC
     matvec_q8_0_f32.cpp
     matvec_q6k_f32.cpp
     matvec_q5_0_f32.cpp
+    matvec_q5k_f32.cpp
+    matvec_q4_1_f32.cpp
     matvec_threaded.cpp
     dequant_q4k.cpp
     dequant_q8_0.cpp
     dequant_q6k.cpp
     dequant_q5_0.cpp
+    dequant_q5k.cpp
+    dequant_q4_1.cpp
     elementwise.cpp
     rmsnorm.cpp
     softmax.cpp

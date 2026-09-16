@@ -30,6 +30,7 @@ public:
     std::uint64_t file_size_bytes() const override { return 0; }
     std::uint64_t alignment()       const override { return 32; }
     std::uint32_t gguf_version()    const override { return 3; }
+    const std::uint8_t* file_data() const override { return nullptr; }
 
 private:
     std::string                                   arch_;

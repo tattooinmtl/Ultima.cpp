@@ -1,7 +1,9 @@
 #include "ultima/model/weight_dispatch.hpp"
 
+#include "ultima/kernels/dequant_q4_1.hpp"
 #include "ultima/kernels/dequant_q4k.hpp"
 #include "ultima/kernels/dequant_q5_0.hpp"
+#include "ultima/kernels/dequant_q5k.hpp"
 #include "ultima/kernels/dequant_q6k.hpp"
 #include "ultima/kernels/dequant_q8_0.hpp"
 #include "ultima/kernels/matvec.hpp"
@@ -49,6 +51,14 @@ float fp16_to_float(std::uint16_t h) noexcept {
     return f;
 }
 
+float bf16_to_float(std::uint16_t h) noexcept {
+    // bfloat16 is simply the top 16 bits of an IEEE 754 float32.
+    const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 Result<void>
 matvec_dispatch(DataType dtype, const void* w, const float* x, float* y,
                 std::size_t M, std::size_t K) {
@@ -69,9 +79,15 @@ matvec_dispatch(DataType dtype, const void* w, const float* x, float* y,
         case DataType::Q5_0:
             kernels::matvec_q5_0_f32(wb, x, y, M, K);
             return {};
+        case DataType::Q5_K:
+            kernels::matvec_q5k_f32(wb, x, y, M, K);
+            return {};
+        case DataType::Q4_1:
+            kernels::matvec_q4_1_f32(wb, x, y, M, K);
+            return {};
         default:
             return fail(ErrorCode::InvalidModel,
-                        fmt::format("matvec dtype {} not supported in v0.1",
+                        fmt::format("matvec dtype {} not supported",
                                     to_string(dtype)),
                         "weight_dispatch");
     }
@@ -95,6 +111,12 @@ matvec_dispatch_threaded(runtime::ThreadPool& pool,
         case DataType::Q8_0:
             kernels::matvec_q8_0_f32_threaded(pool, wb, x, y, M, K);
             return {};
+        case DataType::Q5_K:
+            kernels::matvec_q5k_f32_threaded(pool, wb, x, y, M, K);
+            return {};
+        case DataType::Q4_1:
+            kernels::matvec_q4_1_f32_threaded(pool, wb, x, y, M, K);
+            return {};
         case DataType::Q5_0:
             // No dedicated threaded Q5_0 kernel yet; scalar loop is
             // dominated by the model forward pass anyway. Wrap with
@@ -104,7 +126,7 @@ matvec_dispatch_threaded(runtime::ThreadPool& pool,
             return {};
         default:
             return fail(ErrorCode::InvalidModel,
-                        fmt::format("matvec_threaded dtype {} not supported in v0.1",
+                        fmt::format("matvec_threaded dtype {} not supported",
                                     to_string(dtype)),
                         "weight_dispatch");
     }
@@ -121,6 +143,11 @@ dequant_1d(DataType dtype, const void* src, float* dst, std::size_t n) {
         case DataType::F16: {
             const auto* h = static_cast<const std::uint16_t*>(src);
             for (std::size_t i = 0; i < n; ++i) dst[i] = fp16_to_float(h[i]);
+            return {};
+        }
+        case DataType::BF16: {
+            const auto* h = static_cast<const std::uint16_t*>(src);
+            for (std::size_t i = 0; i < n; ++i) dst[i] = bf16_to_float(h[i]);
             return {};
         }
         case DataType::Q8_0: {
@@ -159,6 +186,24 @@ dequant_1d(DataType dtype, const void* src, float* dst, std::size_t n) {
             kernels::dequant_q6k(sb, n / 256u, dst);
             return {};
         }
+        case DataType::Q5_K: {
+            if ((n % 256u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("Q5_K dequant_1d requires n%256==0, got {}", n),
+                            "weight_dispatch");
+            }
+            kernels::dequant_q5k(sb, n / 256u, dst);
+            return {};
+        }
+        case DataType::Q4_1: {
+            if ((n % 32u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("Q4_1 dequant_1d requires n%32==0, got {}", n),
+                            "weight_dispatch");
+            }
+            kernels::dequant_q4_1(sb, n / 32u, dst);
+            return {};
+        }
         default:
             return fail(ErrorCode::InvalidModel,
                         fmt::format("dequant_1d dtype {} not supported", to_string(dtype)),
@@ -181,6 +226,12 @@ read_row(DataType dtype, const void* base, std::size_t row, std::size_t K,
             const auto* rows = static_cast<const std::uint16_t*>(base);
             const std::uint16_t* r = rows + row * K;
             for (std::size_t i = 0; i < K; ++i) dst[i] = fp16_to_float(r[i]);
+            return {};
+        }
+        case DataType::BF16: {
+            const auto* rows = static_cast<const std::uint16_t*>(base);
+            const std::uint16_t* r = rows + row * K;
+            for (std::size_t i = 0; i < K; ++i) dst[i] = bf16_to_float(r[i]);
             return {};
         }
         case DataType::Q8_0: {
@@ -221,6 +272,26 @@ read_row(DataType dtype, const void* base, std::size_t row, std::size_t K,
             }
             const std::size_t bytes_per_row = (K / 256u) * 210u;
             kernels::dequant_q6k(bb + row * bytes_per_row, K / 256u, dst);
+            return {};
+        }
+        case DataType::Q5_K: {
+            if ((K % 256u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("Q5_K read_row requires K%256==0, got {}", K),
+                            "weight_dispatch");
+            }
+            const std::size_t bytes_per_row = (K / 256u) * 176u;
+            kernels::dequant_q5k(bb + row * bytes_per_row, K / 256u, dst);
+            return {};
+        }
+        case DataType::Q4_1: {
+            if ((K % 32u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("Q4_1 read_row requires K%32==0, got {}", K),
+                            "weight_dispatch");
+            }
+            const std::size_t bytes_per_row = (K / 32u) * 20u;
+            kernels::dequant_q4_1(bb + row * bytes_per_row, K / 32u, dst);
             return {};
         }
         default:

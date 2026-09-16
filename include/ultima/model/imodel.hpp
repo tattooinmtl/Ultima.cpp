@@ -2,12 +2,14 @@
 
 #include "ultima/core/error.hpp"
 #include "ultima/kv_cache/kv_cache.hpp"
+#include "ultima/model/arch_registry.hpp"
 #include "ultima/model/loaded_model.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ultima::runtime { class ThreadPool; }
 
@@ -19,37 +21,74 @@ struct ModelDims {
     std::size_t n_heads     = 0;
     std::size_t n_kv_heads  = 0;   // grouped-query
     std::size_t head_dim    = 0;
-    std::size_t hidden      = 0;   // n_heads * head_dim
+    std::size_t hidden      = 0;   // residual stream width
     std::size_t ffn_hidden  = 0;
     std::size_t vocab       = 0;
     std::size_t n_ctx_train = 0;
     float       rms_eps     = 1e-6f;
+
+    // Attention projection widths. These are NOT always derivable from
+    // hidden: Qwen3-MoE runs 32 heads of 128 off a 2048-wide residual, so
+    // q_dim (4096) is twice hidden. Always size Q/K/V buffers from these.
+    std::size_t q_dim       = 0;   // n_heads    * head_dim
+    std::size_t kv_dim      = 0;   // n_kv_heads * head_dim
 };
 
-// RoPE parameters shared by Qwen2 and Qwen3. Qwen3 optionally sets YaRN.
+// Per-architecture behaviour that the shared block forward branches on.
+// Everything here is read from GGUF metadata plus the arch registry, so a
+// new architecture in the same family is a table entry, not a new code path.
+struct ArchParams {
+    FfnKind   ffn        = FfnKind::DenseSwiGLU;
+    QkvKind   qkv        = QkvKind::Separate;
+    RopeStyle rope_style = RopeStyle::NeoX;
+
+    // Sparse MoE (qwen3moe and relatives).
+    std::size_t n_expert      = 0;   // total experts per layer
+    std::size_t n_expert_used = 0;   // top-k actually evaluated
+    std::size_t expert_ffn    = 0;   // per-expert FFN width
+
+    // Granite's explicit scalar corrections. Defaults are the identity, so
+    // architectures that do not set them behave exactly as before.
+    float embedding_scale = 1.0f;   // multiplies the token embedding
+    float residual_scale  = 1.0f;   // multiplies each residual branch output
+    float logit_scale     = 1.0f;   // divides the final logits
+    float attn_scale      = 0.0f;   // 0 => use the usual 1/sqrt(head_dim)
+};
+
+// RoPE parameters. Qwen3 optionally sets YaRN; Phi-3 sets LongRoPE frequency
+// factors plus a magnitude scale.
 struct RopeConfig {
     enum class Scaling { None, YaRN };
 
     float       freq_base       = 10000.0f;
-    std::size_t rope_dim        = 0;      // == head_dim in Qwen2/3
+    std::size_t rope_dim        = 0;      // == head_dim for most architectures
     Scaling     scaling         = Scaling::None;
     float       yarn_factor     = 1.0f;   // set from GGUF when scaling==YaRN
     float       yarn_ctx_train  = 0.0f;
     float       yarn_attn_factor= 1.0f;
     float       yarn_beta_fast  = 32.0f;
     float       yarn_beta_slow  = 1.0f;
+
+    // LongRoPE / NTK-by-parts: per-dimension divisors for theta, length
+    // rope_dim/2. Empty means "no correction". Phi-3 carries two sets and
+    // selects by context length; we resolve that choice at load time.
+    std::vector<float> freq_factors;
+
+    // Multiplies cos/sin. 1.0 for everything that does not set it.
+    float       attn_factor     = 1.0f;
 };
 
-// Per Decision 06 — the seam every future architecture speaks. v0.1 ships
-// Qwen2Model + Qwen3Model. Neither prefill nor decode allocates KV; the
-// caller owns the KVCache and hands in a slot handle.
+// Per Decision 06 — the seam every future architecture speaks. Neither
+// prefill nor decode allocates KV; the caller owns the KVCache and hands in
+// a slot handle.
 class IModel {
 public:
     virtual ~IModel() = default;
 
-    virtual const ModelDims&  dims() const noexcept = 0;
-    virtual const RopeConfig& rope() const noexcept = 0;
-    virtual const char*       arch() const noexcept = 0;   // "qwen2" | "qwen3"
+    virtual const ModelDims&  dims()   const noexcept = 0;
+    virtual const RopeConfig& rope()   const noexcept = 0;
+    virtual const ArchParams& params() const noexcept = 0;
+    virtual const char*       arch()   const noexcept = 0;   // general.architecture
 
     // Prefill a run of tokens starting at kv.pos(slot). Writes ONLY the
     // last token's logits into out_logits[0..vocab). Advances slot.pos.
@@ -66,8 +105,9 @@ public:
                                       float* out_logits) = 0;
 };
 
-// Factory: dispatches by GGUF general.architecture. Errors on unknown arch;
-// v0.1 supports "qwen2" and "qwen3".
+// Factory: dispatches by GGUF general.architecture through the arch registry.
+// An architecture the registry knows but cannot execute yet fails with the
+// specific engine work it still needs; see arch_registry.hpp.
 core::Result<std::unique_ptr<IModel>>
 load_model(const LoadedModel& gguf, runtime::ThreadPool& pool);
 

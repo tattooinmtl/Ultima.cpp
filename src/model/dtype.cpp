@@ -27,8 +27,12 @@ bool is_active(DataType t) noexcept {
     switch (t) {
     case DataType::F32:
     case DataType::F16:
+    case DataType::BF16:
+    case DataType::Q4_1:
+    case DataType::Q5_0:
     case DataType::Q8_0:
     case DataType::Q4_K:
+    case DataType::Q5_K:
     case DataType::Q6_K:
         return true;
     default:
