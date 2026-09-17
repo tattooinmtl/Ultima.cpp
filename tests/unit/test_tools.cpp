@@ -439,3 +439,39 @@ TEST_CASE("dispatch: a name with no recognizable verb is still refused") {
     CHECK_FALSE(r.ok);
     CHECK(r.content.find("Available tools") != std::string::npos);
 }
+
+
+// U+201C / U+201D built from separate literals: written inline next to a
+// letter, MSVC reads "\x9Ca" as one over-long hex escape.
+static const std::string LQ = "\xE2\x80\x9C";
+static const std::string RQ = "\xE2\x80\x9D";
+
+TEST_CASE("parse_tool_calls: curly quotes are repaired rather than losing the call") {
+    // Observed live from Qwen2.5-Coder-7B in planning mode: it opened the call
+    // with a correct "name" then drifted into typographic quotes for every key
+    // and value after it, which made the whole call unparseable.
+    const std::string text =
+        "<tool_call>\n{\n \"name\": \"write_project_file\",\n "
+        + LQ + "arguments" + RQ + ": {\n   "
+        + LQ + "path" + RQ + ": " + LQ + ".ultima/plan.md" + RQ + ",\n   "
+        + LQ + "content" + RQ + ": " + LQ + "## Plan" + RQ + "\n }\n}\n</tool_call>";
+
+    auto calls = parse_tool_calls(text);
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].name == "write_project_file");
+    CHECK(calls[0].args["path"] == ".ultima/plan.md");
+    CHECK(calls[0].args["content"] == "## Plan");
+}
+
+TEST_CASE("parse_tool_calls: a well-formed call keeps curly quotes in its content") {
+    // The repair only runs after a strict parse has already failed. Otherwise
+    // it would quietly rewrite the text of files the model is writing.
+    const std::string body = "He said " + LQ + "hello" + RQ + " to her";
+    const std::string text =
+        "<tool_call>{\"name\":\"write_project_file\",\"arguments\":"
+        "{\"path\":\"a.md\",\"content\":\"" + body + "\"}}</tool_call>";
+
+    auto calls = parse_tool_calls(text);
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].args["content"] == body);
+}

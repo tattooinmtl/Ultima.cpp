@@ -16,6 +16,36 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-17 coder-ide-p4  Phase 4 done - phased planning. Also found the cause of the silent empty turns from Phase 2.
+    NEW src/server/session.{hpp,cpp} - the workflow state lives in the workspace, not in memory:
+      .ultima/plan.md (phase list, hand-editable), .ultima/todos.json (subtasks), .ultima/CHANGELOG.md
+      (append-only). The plan is a file rather than a new tool because six tools is already as many
+      as a small model reliably picks from.
+      * parse_plan is deliberately tolerant - the user is invited to edit the file. Accepts "- [ ]",
+        "* [X]", "1. [ ]" and, from a live run, "-[x]Phase4 :" with no spaces. Phases renumber by
+        position so reordering by hand needs no renumbering.
+      * render_plan_for_prompt names ONLY the active phase. Listing the whole plan invites a small
+        model to skip ahead and do three phases badly in one turn.
+    /api/agent/chat gained mode: "plan" | "work" | "auto". Planning mode injects the plan-first
+      instructions, refuses any tool call that is not writing the plan, and stops the moment the
+      plan lands (stop:"plan_written") rather than burning a second round on prose.
+    NEW GET /api/plan and POST /api/plan/phase. Checking a phase off appends to the project changelog.
+    ui/testpad - Plan panel in the Coder tab: phases with nested subtasks, active phase highlighted,
+      click a box to toggle it, progress count. A "Plan" button beside "Run".
+    FOUND THE PHASE-2 MYSTERY: rounds that produced neither prose nor a tool call were silently
+      doing nothing. They now emit a `warning` event with the raw head of the generation, which
+      immediately showed Qwen2.5-Coder-7B opening a call with a correct "name" and then drifting
+      into typographic quotes for every key after it. Unparseable JSON, whole call dropped.
+      parse_tool_calls now retries with the quotes normalized - only after a strict parse has
+      already failed, so a file whose content legitimately contains curly quotes is not rewritten.
+    A plan written this turn is forced all-unchecked: the model checked off Phase 4 as it wrote the
+      list, which would have made the runtime skip that phase entirely.
+    Verified live: "Build a landing page for a coffee shop" in plan mode produced four phases and
+      NO project code - the workspace held only .ultima/plan.md and the pre-existing README. The
+      panel renders it, toggling phase 1 advanced the active phase to 2 and logged the completion.
+      210 unit tests pass.
+
+
 2026-09-17 coder-ide-p3  Phase 3 done - the Coder tab is a real editor. Verified in a browser.
     ui/testpad/index.html - the Coder tab was placeholder markup; it is now an IDE over the
       /api/fs/* endpoints. Still one self-contained file with no external references.

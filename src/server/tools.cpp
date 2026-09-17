@@ -68,13 +68,47 @@ std::size_t match_brace(std::string_view s, std::size_t start) {
     return std::string_view::npos;
 }
 
+// Replace typographic quotes with their ASCII equivalents.
+//
+// Observed live from Qwen2.5-Coder-7B: it opened a tool call with a correct
+// "name" then drifted into curly quotes for every later key and value, which
+// makes the JSON unparseable and loses the whole call. Only ever applied after
+// a strict parse has already failed, so a call whose content legitimately
+// contains curly quotes is unaffected.
+std::string repair_smart_quotes(std::string_view in) {
+    static const struct { const char* from; char to; } subs[] = {
+        {"\xE2\x80\x9C", '"'},    // U+201C left double
+        {"\xE2\x80\x9D", '"'},    // U+201D right double
+        {"\xE2\x80\x98", '\''},   // U+2018 left single
+        {"\xE2\x80\x99", '\''},   // U+2019 right single
+    };
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size();) {
+        bool hit = false;
+        if (i + 3 <= in.size()) {
+            for (const auto& sub : subs) {
+                if (in.compare(i, 3, sub.from) == 0) { out.push_back(sub.to); i += 3; hit = true; break; }
+            }
+        }
+        if (!hit) out.push_back(in[i++]);
+    }
+    return out;
+}
+
 // Turn one JSON blob into a ToolCall, if it looks like one.
 bool call_from_json(std::string_view blob, ToolCall& out) {
     json j;
     try {
         j = json::parse(blob);
     } catch (const std::exception&) {
-        return false;
+        // Second chance: the usual reason a call fails to parse is curly
+        // quotes, not a genuinely malformed object.
+        try {
+            j = json::parse(repair_smart_quotes(blob));
+        } catch (const std::exception&) {
+            return false;
+        }
     }
     if (!j.is_object() || !j.contains("name") || !j["name"].is_string()) return false;
 

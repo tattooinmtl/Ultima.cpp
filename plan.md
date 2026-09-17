@@ -32,10 +32,15 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
       clicking a file opens a tab, editing marks it dirty, Ctrl+S writes to
       disk, and an agent run creates a file that appears as a focused tab.
       Highlighter has its own regression test (scripts/test_testpad_highlight.mjs).
-- [ ] Phase 4: Phased planning — `.ultima/plan.md` + `todos.json`, the agent
+- [x] Phase 4: Phased planning — `.ultima/plan.md` + `todos.json`, the agent
       contract, and the Plan panel that renders phases with nested subtasks.
       Provable by giving the agent a project-sized ask and getting a plan back
       with no code.
+      **Done 2026-09-17.** Asked the 7B for a coffee-shop landing page in plan
+      mode: it wrote .ultima/plan.md with four phases and nothing else - the
+      workspace still held only that file and the pre-existing README. The Plan
+      panel renders it, checking a phase off advances the active one and appends
+      to .ultima/CHANGELOG.md. 210 unit tests.
 - [ ] Phase 5: Full-stack session — project scaffolding templates, the sandbox
       run tools from Decision 16 §16.3, and a live preview pane. Provable by
       "build me a todo app" producing a running page.
@@ -62,6 +67,13 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
   drifts from the glyphs; both rules carry a comment saying so. The
   highlighter is one combined regex per language, and `\x60` is how a
   backtick gets into a String.raw pattern.
+- Phase 4 found the cause of the empty turns seen in Phase 2. A round that
+  produced neither prose nor a tool call now emits a `warning` event carrying
+  the raw head of the generation, and that showed the 7B writing typographic
+  quotes - the JSON was unparseable, so the whole call was silently dropped.
+  Parsing now retries with the quotes normalized, but only after a strict parse
+  has already failed, so content that legitimately contains curly quotes is
+  untouched.
 - Open, and the honest state of Phase 2: the loop, parsing, dispatch and
   events are solid, but a 7B given a two-step task ("read it, then edit it")
   frequently stops after one failed call rather than recovering. That is a

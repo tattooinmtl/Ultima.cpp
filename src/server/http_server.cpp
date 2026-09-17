@@ -12,6 +12,7 @@
 #include "ultima/model/imodel.hpp"
 #include "ultima/sampler/sampler.hpp"
 #include "ultima/tokenizer/chat_template.hpp"
+#include "ultima/server/session.hpp"
 #include "ultima/server/tools.hpp"
 #include "ultima/server/workspace.hpp"
 #include "ultima/tokenizer/tokenizer.hpp"
@@ -332,6 +333,27 @@ bool check_auth_token(const std::string& token,
     return true;
 }
 
+json plan_to_json(const Plan& plan) {
+    json phases = json::array();
+    for (const auto& p : plan.phases) {
+        json todos = json::array();
+        for (const auto& t : p.todos) {
+            todos.push_back({{"id", t.id}, {"text", t.text}, {"done", t.done}});
+        }
+        phases.push_back({{"number", p.number}, {"text", p.text},
+                          {"done", p.done}, {"todos", todos}});
+    }
+    const Phase* act = plan.active();
+    return {
+        {"title",     plan.title},
+        {"requested", plan.requested},
+        {"started",   plan.started},
+        {"phases",    phases},
+        {"active",    act ? json(act->number) : json(nullptr)},
+        {"done",      plan.done_count()},
+    };
+}
+
 // Map a workspace failure onto an HTTP status: a refused or malformed path is
 // the caller's fault, a missing file is 404, anything else is ours.
 int fs_status_for(const core::Error& e) {
@@ -557,6 +579,51 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
         }
     });
 
+    // ---- /api/plan — the phased-planning state (Decision 18 §18.5) -------
+
+    svr.Get("/api/plan", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+
+        auto plan = load_plan(*ws);
+        if (!plan) { fs_send_error(res, plan.error()); return; }
+        res.set_content(plan_to_json(*plan).dump(), "application/json");
+    });
+
+    // Check a phase off (or back on) from the UI. The agent does the same thing
+    // by rewriting plan.md; this is the hand-editing path.
+    svr.Post("/api/plan/phase", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+        try {
+            const auto body = json::parse(req.body);
+            const auto number = body.at("phase").get<std::size_t>();
+            const bool done   = body.value("done", true);
+
+            auto plan = load_plan(*ws);
+            if (!plan) { fs_send_error(res, plan.error()); return; }
+            if (number < 1 || number > plan->phases.size()) {
+                res.status = 400;
+                res.set_content(json{{"error", "no such phase"}}.dump(), "application/json");
+                return;
+            }
+            plan->phases[number - 1].done = done;
+            if (auto w = save_plan(*ws, *plan); !w) { fs_send_error(res, w.error()); return; }
+            if (done) {
+                append_changelog(*ws, "phase " + std::to_string(number) + " done - " +
+                                      plan->phases[number - 1].text);
+            }
+            res.set_content(plan_to_json(*plan).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
     // ---- /api/slots ----
     svr.Get("/api/slots", [&](const httplib::Request& req, httplib::Response& res) {
         if (!check_auth_token(state.cfg.auth_token, req, res)) return;
@@ -728,19 +795,40 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
             return;
         }
 
+        // "plan"  — produce a plan and nothing else.
+        // "work"  — execute, with the active phase injected.
+        // "auto"  — work, planning first only if asked to.
+        const std::string mode = body.value("mode", std::string{"auto"});
+
+        // Read the plan up front: it shapes the system prompt, and re-reading
+        // it every turn is what lets the user hand-edit plan.md between turns.
+        Plan plan;
+        {
+            std::lock_guard<std::mutex> lk{state.ws_mutex};
+            if (state.ws) {
+                if (auto p = load_plan(*state.ws); p) plan = std::move(*p);
+            }
+        }
+        const bool planning = (mode == "plan");
+
         // Append the tool protocol to the system message, creating one if the
         // caller did not send it. The tools have to be described inside the
         // system turn or the model will not use them.
         {
-            const std::string tools_block = render_tools_system_prompt();
+            std::string block = render_tools_system_prompt();
+            if (planning) {
+                block += render_planning_instructions(*state.ws);
+            } else {
+                block += render_plan_for_prompt(plan);
+            }
             if (!msgs.empty() && msgs.front().role == "system") {
-                msgs.front().content += tools_block;
+                msgs.front().content += block;
             } else {
                 tokenizer::ChatMessage sys;
                 sys.role = "system";
                 sys.content =
                     "You are Ultima's coding assistant. You work inside the user's "
-                    "project and change it by calling tools." + tools_block;
+                    "project and change it by calling tools." + block;
                 msgs.insert(msgs.begin(), std::move(sys));
             }
         }
@@ -762,7 +850,11 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
 
         auto req_state = std::make_shared<std::tuple<
             std::vector<tokenizer::ChatMessage>, sampler::SamplerParams,
-            std::size_t, std::size_t>>(std::move(msgs), params, max_tokens, max_rounds);
+            std::size_t, std::size_t, bool>>(std::move(msgs), params, max_tokens,
+                                             // Planning is a single round by
+                                             // construction: write the plan, stop.
+                                             planning ? std::size_t{2} : max_rounds,
+                                             planning);
 
         res.set_chunked_content_provider("text/event-stream",
             [this_state_ptr = &state, req_state]
@@ -772,6 +864,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                 const auto& parm = std::get<1>(*req_state);
                 const auto maxtk = std::get<2>(*req_state);
                 const auto rounds_budget = std::get<3>(*req_state);
+                const bool planning      = std::get<4>(*req_state);
 
                 auto emit = [&](const char* event, const json& payload) {
                     const std::string f =
@@ -789,6 +882,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
 
                 std::size_t round = 0;
                 std::size_t total_calls = 0;
+                bool plan_written = false;
                 for (; round < rounds_budget; ++round) {
                     // Only what is outside a <tool_call> block reaches the user.
                     std::string acc;
@@ -812,6 +906,20 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                     }
 
                     const auto calls = parse_tool_calls(r->text);
+
+                    // A round that yields neither prose nor a tool call is a
+                    // dead end the user would otherwise see as nothing at all
+                    // happening. Surface the raw text so the failure is
+                    // diagnosable instead of silent.
+                    if (calls.empty() && shown == 0) {
+                        std::string head = r->text.substr(0, 400);
+                        emit("warning", json{
+                            {"reason", "the model produced no visible text and no tool call"},
+                            {"raw_head", head},
+                            {"raw_len", r->text.size()},
+                            {"round", round}});
+                    }
+
                     if (calls.empty()) {
                         // No tool calls: this reply is the answer, so the turn
                         // is over.
@@ -835,7 +943,24 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                                                {"arguments", c.args},
                                                {"round", round}});
 
-                        const ToolResult tr = dispatch_tool(*ws, c);
+                        // In planning mode the only legal act is writing the
+                        // plan. Refusing anything else here is what stops a
+                        // model from "helpfully" starting the work as well.
+                        ToolResult tr;
+                        const std::string target = c.args.value("path", std::string{});
+                        const bool writes_plan =
+                            target.find("plan.md") != std::string::npos;
+                        if (planning && !writes_plan) {
+                            tr.name = c.name;
+                            tr.ok = false;
+                            tr.content =
+                                "Not now. This turn is for writing the plan only. "
+                                "Call write_project_file with path \"" +
+                                std::string{k_plan_path} + "\" and the phase list, "
+                                "then stop.";
+                        } else {
+                            tr = dispatch_tool(*ws, c);
+                        }
                         emit("tool_result", json{{"name", tr.name},
                                                  {"ok", tr.ok},
                                                  {"content", tr.content},
@@ -844,6 +969,26 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                         if (!tr.changed_path.empty() && tr.ok) {
                             emit("file", json{{"path", tr.changed_path},
                                               {"tab", tr.tab_label}});
+                            // The plan drives the UI panel and the next turn's
+                            // system prompt, so push it the moment it changes.
+                            if (tr.changed_path.find("plan.md") != std::string::npos ||
+                                tr.changed_path.find("todos.json") != std::string::npos) {
+                                if (auto p2 = load_plan(*ws); p2) {
+                                    // A plan written this turn cannot have
+                                    // finished phases. Observed live: the model
+                                    // checked off Phase 4 as it wrote the list,
+                                    // which would have made the runtime skip it.
+                                    if (planning) {
+                                        bool fixed = false;
+                                        for (auto& ph : p2->phases) {
+                                            if (ph.done) { ph.done = false; fixed = true; }
+                                        }
+                                        if (fixed) save_plan(*ws, *p2);
+                                    }
+                                    emit("plan", plan_to_json(*p2));
+                                    plan_written = true;
+                                }
+                            }
                         }
 
                         tokenizer::ChatMessage tool_msg;
@@ -853,6 +998,13 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                             ? tr.content
                             : ("ERROR: " + tr.content);
                         conv.push_back(std::move(tool_msg));
+                    }
+                    if (planning && plan_written) {
+                        emit("done", json{{"rounds", round + 1},
+                                          {"tool_calls", total_calls},
+                                          {"stop", "plan_written"}});
+                        sink.done();
+                        return true;
                     }
                 }
 
