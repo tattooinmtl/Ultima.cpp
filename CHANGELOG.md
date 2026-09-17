@@ -16,6 +16,38 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-17 coder-ide-p3  Phase 3 done - the Coder tab is a real editor. Verified in a browser.
+    ui/testpad/index.html - the Coder tab was placeholder markup; it is now an IDE over the
+      /api/fs/* endpoints. Still one self-contained file with no external references.
+      * File tree from /api/fs/tree?recursive=1, with new / rename / delete.
+      * Editor tabs: one per open file, dirty dot, close button, middle-click close, and a
+        confirm before discarding unsaved changes.
+      * Editor: a textarea with transparent text laid over a syntax-highlighted <pre>, plus a
+        line-number gutter that slides with the scroll. Tab inserts two spaces; Ctrl+S saves.
+        The two layers must share font metrics and padding exactly or the caret drifts off the
+        glyphs - both CSS rules say so.
+      * Highlighter: one combined regex per language (js/ts, python, css, html, json, markdown),
+        precedence ordered so a keyword inside a string is not recolored. A backtick cannot appear
+        inside a String.raw template, so those patterns use \x60.
+      * Status bar: path, language, line and char counts, saved/unsaved.
+      * Terminal panel + an agent box that drives POST /api/agent/chat from Phase 2 and lands its
+        `file` events as tabs. A file the model rewrites reloads in place, unless that tab has
+        unsaved edits - clobbering the user's typing would be worse than a stale tab. New tabs do
+        not steal focus within 5s of the user touching the editor.
+    NEW scripts/test_testpad_highlight.mjs - extracts the Coder module from the HTML and checks
+      every language round-trips losslessly, including an unterminated string, a trailing
+      backslash, and a 4000-line file (11ms). Not in CTest: the C++ build must not depend on node.
+    Verified in a browser end to end: opened src/app.js and index.html from the tree, typed into
+      index.html, watched the dirty dot and char count update, Ctrl+S, confirmed the bytes on disk;
+      then asked the agent box for a file and watched notes.md appear in the tree and open as a
+      focused tab showing highlighted markdown.
+    Two layout bugs found by measuring rather than squinting: the empty state rendered inside the
+      52px gutter column (needs grid-column:1/-1), and .coder-main never stretched because it is a
+      flex child without flex:1, so the grid sized to content and left 244px of dead space.
+    The 1.5B emitted write_projectFile with "./notes.md" - the Phase 2 verb fallback and path
+      normalization both caught it, in a live run, again.
+
+
 2026-09-16 coder-ide-p2  Phase 2 done - file tool layer + agent loop. Three robustness fixes came from live runs.
     NEW src/server/tools.{hpp,cpp} - six tools (list_files, read_file, write_project_file, edit_file,
       rename_file, delete_file), their JSON schemas, the Qwen <tool_call> system prompt, a lenient

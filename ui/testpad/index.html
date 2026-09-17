@@ -106,16 +106,85 @@
   .err { color:var(--err); font-family:var(--mono); font-size:12px; margin-top:6px; min-height:16px; }
 
   /* ---- Coder tab ---- */
-  .coder-tree { background:var(--panel); padding:8px 0; overflow-y:auto; font-family:var(--mono); font-size:12px; }
-  .coder-tree .item { padding:4px 12px; cursor:pointer; color:var(--muted); }
+  /* ---- Coder tab: file tree ---- */
+  .coder-tree { background:var(--panel); overflow-y:auto; font-family:var(--mono); font-size:12px; }
+  .tree-bar { display:flex; align-items:center; gap:4px; padding:6px 8px; border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--panel); }
+  .tree-bar button { background:var(--panel-2); color:var(--muted); border:1px solid var(--border); border-radius:4px; cursor:pointer; font-size:12px; line-height:1; padding:3px 7px; }
+  .tree-bar button:hover { color:var(--fg); border-color:var(--accent); }
+  .tree-root { margin-left:auto; color:var(--muted); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:110px; direction:rtl; }
+  .coder-tree .item { padding:3px 10px; cursor:pointer; color:var(--muted); display:flex; align-items:center; gap:6px; }
   .coder-tree .item:hover { background:var(--border); color:var(--fg); }
   .coder-tree .item.active { background:var(--border); color:var(--accent); }
-  .coder-main { display:grid; grid-template-rows: auto 1fr 160px; min-height:0; }
-  .coder-file-tabs { display:flex; overflow-x:auto; background:var(--panel-2); border-bottom:1px solid var(--border); }
-  .coder-file-tabs .ft { padding:6px 12px; font-size:12px; cursor:pointer; color:var(--muted); border-right:1px solid var(--border); white-space:nowrap; }
+  .coder-tree .item .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+  .coder-tree .item .act { opacity:0; font-size:10px; padding:0 3px; }
+  .coder-tree .item:hover .act { opacity:.65; }
+  .coder-tree .item .act:hover { opacity:1; color:var(--accent); }
+  .tree-empty { padding:10px 12px; color:var(--muted); font-size:11px; line-height:1.5; }
+
+  /* ---- Coder tab: editor tabs ---- */
+  .coder-file-tabs { display:flex; overflow-x:auto; background:var(--panel-2); border-bottom:1px solid var(--border); min-height:29px; }
+  .coder-file-tabs .ft { padding:6px 8px 6px 12px; font-size:12px; cursor:pointer; color:var(--muted); border-right:1px solid var(--border); white-space:nowrap; display:flex; align-items:center; gap:6px; }
   .coder-file-tabs .ft.active { color:var(--fg); background:var(--panel); }
-  .coder-editor { overflow:auto; padding:12px 16px; font-family:var(--mono); font-size:13px; white-space:pre; }
-  .coder-terminal { background:#08090c; color:#c8e3ff; padding:8px 12px; overflow-y:auto; font-family:var(--mono); font-size:12px; border-top:1px solid var(--border); white-space:pre-wrap; }
+  .coder-file-tabs .ft .x { opacity:.4; font-size:11px; }
+  .coder-file-tabs .ft .x:hover { opacity:1; color:var(--accent); }
+  .coder-file-tabs .ft.dirty .nm::after { content:' •'; color:var(--accent); }
+  .ft-none { padding:6px 12px; font-size:12px; color:var(--muted); }
+
+  /* ---- Coder tab: the editor -------------------------------------------
+     A textarea with transparent text laid exactly over a highlighted <pre>.
+     The <pre> holds the same text, so it sizes the scroll area and the two
+     stay aligned as long as their font metrics and padding match exactly.
+     Any change to one of these rules must be mirrored in the other. */
+  .ed-wrap { display:grid; grid-template-columns:52px 1fr; min-height:0; background:var(--panel); }
+  .ed-gutter-clip { overflow:hidden; background:var(--panel-2); border-right:1px solid var(--border); }
+  .ed-gutter { padding:10px 8px 10px 0; text-align:right; color:var(--muted); opacity:.6;
+               font-family:var(--mono); font-size:13px; line-height:1.55; white-space:pre; user-select:none; }
+  .ed-scroll { position:relative; overflow:auto; min-height:0; }
+  .ed-inner { position:relative; min-height:100%; width:max-content; min-width:100%; }
+  .ed-hl, .ed-ta { margin:0; padding:10px 14px; border:0;
+                   font-family:var(--mono); font-size:13px; line-height:1.55;
+                   white-space:pre; tab-size:2; }
+  .ed-hl { position:relative; z-index:0; color:var(--fg); }
+  .ed-ta { position:absolute; inset:0; z-index:1; width:100%; height:100%;
+           background:transparent; color:transparent; caret-color:var(--accent);
+           resize:none; outline:none; overflow:hidden; }
+  .ed-ta::selection { background:rgba(120,170,255,.28); }
+  /* Spans both grid columns — otherwise the empty state renders inside the
+     52px gutter column and wraps one word per line. */
+  .ed-empty { grid-column:1 / -1; padding:16px; color:var(--muted); font-size:12px; line-height:1.6; }
+
+  /* Rows: file tabs, editor, status bar, terminal. `flex:1` matters — the
+     parent .pane is a flex column, so without it the grid sizes to its
+     content and leaves dead space below the terminal. */
+  .coder-main { display:grid; grid-template-rows:auto 1fr auto 190px; flex:1; min-height:0; }
+
+  /* Token colors. Deliberately few: a local model writing a landing page
+     needs the file to be readable, not a twelve-color theme. */
+  .t-cmt { color:#6b7a8d; font-style:italic; }
+  .t-str { color:#9ecf7a; }
+  .t-num { color:#e2b86b; }
+  .t-kw  { color:#7aa2f7; }
+  .t-tag { color:#f07178; }
+  .t-atr { color:#e2b86b; }
+  .t-hd  { color:#7aa2f7; font-weight:600; }
+
+  /* ---- Coder tab: terminal + agent box ---- */
+  .coder-terminal { background:#08090c; color:#c8e3ff; overflow:hidden; font-family:var(--mono); font-size:12px;
+                    border-top:1px solid var(--border); display:grid; grid-template-rows:1fr auto; min-height:0; }
+  #term-log { overflow-y:auto; padding:8px 12px; white-space:pre-wrap; }
+  #term-log .t-run  { color:#7aa2f7; }
+  #term-log .t-ok   { color:#9ecf7a; }
+  #term-log .t-bad  { color:#f07178; }
+  #term-log .t-dim  { color:#6b7a8d; }
+  .term-compose { display:flex; gap:6px; padding:6px 8px; border-top:1px solid var(--border); background:#0b0d11; }
+  .term-compose input { flex:1; background:var(--panel); color:var(--fg); border:1px solid var(--border);
+                        border-radius:4px; padding:5px 8px; font-family:var(--mono); font-size:12px; outline:none; }
+  .term-compose input:focus { border-color:var(--accent); }
+  .term-compose button { background:var(--accent); color:#06080c; border:0; border-radius:4px;
+                         padding:5px 14px; cursor:pointer; font-size:12px; font-weight:600; }
+  .term-compose button:disabled { opacity:.5; cursor:default; }
+  .ed-status { display:flex; gap:14px; padding:3px 12px; font-size:11px; color:var(--muted);
+               background:var(--panel-2); border-top:1px solid var(--border); }
 
   /* ---- Brain tab ---- */
   .brain-list { background:var(--panel); padding:8px 0; overflow-y:auto; font-family:var(--mono); font-size:12px; }
@@ -226,21 +295,29 @@
     <!-- Coder tab -->
     <div class="tab-view tab-coder" data-tab-view="coder">
       <aside class="pane coder-tree" data-panel="tree">
-        <div style="padding:6px 12px; color:var(--muted); font-size:11px;">FILES</div>
-        <div class="item" onclick="alert('File tree wires to workspace when Decision 15 lands.')">(empty)</div>
+        <div class="tree-bar">
+          <button id="tree-new" title="New file">+</button>
+          <button id="tree-refresh" title="Refresh tree">&#8635;</button>
+          <span class="tree-root" id="tree-root"></span>
+        </div>
+        <div id="tree-list"></div>
       </aside>
       <section class="pane" data-panel="editor">
         <div class="coder-main">
-          <div class="coder-file-tabs" id="coder-file-tabs">
-            <div class="ft active">no files</div>
+          <div class="coder-file-tabs" id="coder-file-tabs"></div>
+          <div class="ed-wrap" id="ed-body" data-panel="editor-body"></div>
+          <div class="ed-status" id="ed-status"></div>
+          <div class="coder-terminal" data-panel="terminal">
+            <div id="term-log"></div>
+            <div class="term-compose">
+              <input id="agent-input" placeholder="Ask the model to change this project…" />
+              <button id="agent-send">Run</button>
+            </div>
           </div>
-          <div class="coder-editor" id="coder-editor" data-panel="editor-body">// Files written by the model via write_project_file will open here as tabs.</div>
-          <div class="coder-terminal" data-panel="terminal">$ (terminal panel — bash_tool output streams here)</div>
         </div>
       </section>
     </div>
 
-    <!-- Brain tab -->
     <div class="tab-view tab-brain" data-tab-view="brain">
       <aside class="pane brain-list" data-panel="brain-list">
         <div class="b-hdr">Memories (scope: session)</div>
@@ -553,8 +630,425 @@ $('input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
 });
 
+
+// ---- Coder tab ---------------------------------------------------------------
+// A small IDE over the /api/fs/* endpoints from Decision 18. No dependencies:
+// the testpad is bundled into the binary and may not reference anything
+// external, so the editor and the highlighter are written here.
+const Coder = (() => {
+  const open = new Map();      // path -> { text, saved, lang }
+  let active = null;           // path of the focused tab
+  let tree = [];
+  let lastUserFocus = 0;       // so agent-created tabs do not steal focus
+
+  // ---- syntax highlighting --------------------------------------------------
+  // One combined regex per language, applied in a single pass. Ordering inside
+  // `rules` is the precedence: comments and strings come first so a keyword
+  // inside a string is not recolored.
+  const KW_JS = 'const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|'
+              + 'class|extends|super|new|this|null|undefined|true|false|async|await|try|catch|'
+              + 'finally|throw|typeof|instanceof|import|export|from|default|of|in|delete|void|'
+              + 'yield|static|get|set';
+  const KW_PY = 'def|class|return|if|elif|else|for|while|break|continue|import|from|as|pass|'
+              + 'raise|try|except|finally|with|lambda|None|True|False|and|or|not|is|in|global|'
+              + 'nonlocal|assert|yield|async|await|del';
+
+  const LANGS = {
+    js: [ ['cmt', String.raw`//[^\n]*|/\*[\s\S]*?\*/`],
+          // \x60 is a backtick: a literal one cannot appear inside String.raw.
+          ['str', String.raw`\x60(?:\\[\s\S]|[^\x60\\])*\x60|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'`],
+          ['num', String.raw`\b\d[\w.]*\b`],
+          ['kw',  String.raw`\b(?:` + KW_JS + String.raw`)\b`] ],
+    py: [ ['cmt', String.raw`#[^\n]*`],
+          ['str', String.raw`"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'`],
+          ['num', String.raw`\b\d[\w.]*\b`],
+          ['kw',  String.raw`\b(?:` + KW_PY + String.raw`)\b`] ],
+    css:[ ['cmt', String.raw`/\*[\s\S]*?\*/`],
+          ['str', String.raw`"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'`],
+          ['num', String.raw`[-+]?\b\d[\w.%]*\b`],
+          ['kw',  String.raw`@[a-zA-Z-]+|[.#][\w-]+`] ],
+    html:[ ['cmt', String.raw`<!--[\s\S]*?-->`],
+           ['str', String.raw`"(?:[^"]*)"|'(?:[^']*)'`],
+           ['tag', String.raw`</?[a-zA-Z][\w:-]*|/?>`],
+           ['atr', String.raw`\b[a-zA-Z-]+(?==)`] ],
+    json:[ ['str', String.raw`"(?:\\.|[^"\\\n])*"`],
+           ['num', String.raw`-?\b\d[\w.+-]*\b`],
+           ['kw',  String.raw`\b(?:true|false|null)\b`] ],
+    md: [ ['cmt', String.raw`\x60\x60\x60[\s\S]*?\x60\x60\x60|\x60[^\x60\n]*\x60`],
+          ['hd',  String.raw`^#{1,6} [^\n]*`],
+          ['kw',  String.raw`\*\*[^*\n]+\*\*|\[[^\]\n]*\]\([^)\n]*\)`] ],
+  };
+  const COMPILED = {};
+  for (const [lang, rules] of Object.entries(LANGS)) {
+    COMPILED[lang] = {
+      re: new RegExp(rules.map(r => '(' + r[1] + ')').join('|'), 'gm'),
+      cls: rules.map(r => r[0]),
+    };
+  }
+
+  function langFor(path) {
+    const m = /\.([a-z0-9]+)$/i.exec(path || '');
+    const ext = m ? m[1].toLowerCase() : '';
+    if (['js','mjs','cjs','ts','tsx','jsx'].includes(ext)) return 'js';
+    if (['py'].includes(ext)) return 'py';
+    if (['css','scss','less'].includes(ext)) return 'css';
+    if (['html','htm','xml','svg','vue'].includes(ext)) return 'html';
+    if (['json'].includes(ext)) return 'json';
+    if (['md','markdown'].includes(ext)) return 'md';
+    return null;
+  }
+  const esc = (s) => s.replace(/[&<>]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
+
+  function highlight(code, lang) {
+    const spec = COMPILED[lang];
+    if (!spec) return esc(code);
+    let out = '', last = 0;
+    spec.re.lastIndex = 0;
+    let m;
+    while ((m = spec.re.exec(code)) !== null) {
+      // A zero-length match would spin forever; step past it.
+      if (m[0] === '') { spec.re.lastIndex++; continue; }
+      out += esc(code.slice(last, m.index));
+      let cls = null;
+      for (let g = 1; g < m.length; g++) { if (m[g] !== undefined) { cls = spec.cls[g-1]; break; } }
+      out += '<span class="t-' + cls + '">' + esc(m[0]) + '</span>';
+      last = m.index + m[0].length;
+    }
+    return out + esc(code.slice(last));
+  }
+
+  // ---- editor ---------------------------------------------------------------
+  const ta = () => $('ed-ta'), hl = () => $('ed-hl'), gutter = () => $('ed-gutter');
+
+  function render() {
+    const doc = active ? open.get(active) : null;
+    const wrap = $('ed-body');
+    if (!doc) {
+      wrap.innerHTML = '<div class="ed-empty">No file open.<br>Pick one from the tree, or ask the model below to create one.</div>';
+      renderStatus();
+      return;
+    }
+    if (!$('ed-ta')) {
+      wrap.innerHTML =
+        '<div class="ed-gutter-clip"><div class="ed-gutter" id="ed-gutter"></div></div>' +
+        '<div class="ed-scroll" id="ed-scroll"><div class="ed-inner">' +
+        '<pre class="ed-hl" id="ed-hl"></pre>' +
+        '<textarea class="ed-ta" id="ed-ta" spellcheck="false" wrap="off"></textarea>' +
+        '</div></div>';
+      wireEditor();
+    }
+    ta().value = doc.text;
+    paint();
+  }
+
+  // Repaint the highlight layer and gutter from the textarea's current value.
+  function paint() {
+    const doc = active ? open.get(active) : null;
+    if (!doc || !$('ed-ta')) return;
+    const text = ta().value;
+    // The trailing newline keeps the <pre> one line taller than the text, so
+    // the caret on the last line still has a painted row under it.
+    hl().innerHTML = highlight(text, doc.lang) + '\n';
+    const lines = text.split('\n').length;
+    let g = '';
+    for (let i = 1; i <= lines; i++) g += i + '\n';
+    gutter().textContent = g;
+    renderStatus();
+  }
+
+  function wireEditor() {
+    const t = ta();
+    t.addEventListener('input', () => {
+      const doc = open.get(active);
+      if (!doc) return;
+      doc.text = t.value;
+      paint();
+      renderTabs();
+    });
+    t.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const s = t.selectionStart, en = t.selectionEnd;
+        t.value = t.value.slice(0, s) + '  ' + t.value.slice(en);
+        t.selectionStart = t.selectionEnd = s + 2;
+        t.dispatchEvent(new Event('input'));
+      } else if (e.key === 's' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        save();
+      }
+    });
+    t.addEventListener('focus', () => { lastUserFocus = Date.now(); });
+    // The gutter has no scrollbar of its own; slide it to match.
+    $('ed-scroll').addEventListener('scroll', () => {
+      gutter().style.transform = 'translateY(' + (-$('ed-scroll').scrollTop) + 'px)';
+    });
+  }
+
+  function renderStatus() {
+    const doc = active ? open.get(active) : null;
+    const el = $('ed-status');
+    if (!doc) { el.textContent = ''; return; }
+    const lines = doc.text.split('\n').length;
+    el.innerHTML = '<span>' + esc(active) + '</span>' +
+                   '<span>' + (doc.lang || 'text') + '</span>' +
+                   '<span>' + lines + ' lines</span>' +
+                   '<span>' + doc.text.length + ' chars</span>' +
+                   '<span>' + (doc.text === doc.saved ? 'saved' : 'unsaved — Ctrl+S') + '</span>';
+  }
+
+  // ---- tabs -----------------------------------------------------------------
+  function renderTabs() {
+    const bar = $('coder-file-tabs');
+    if (open.size === 0) { bar.innerHTML = '<div class="ft-none">no files open</div>'; return; }
+    bar.innerHTML = '';
+    for (const [path, doc] of open) {
+      const el = document.createElement('div');
+      el.className = 'ft' + (path === active ? ' active' : '') +
+                     (doc.text !== doc.saved ? ' dirty' : '');
+      el.innerHTML = '<span class="nm"></span><span class="x">✕</span>';
+      el.querySelector('.nm').textContent = path.split('/').pop();
+      el.title = path;
+      el.onclick = (e) => {
+        lastUserFocus = Date.now();
+        if (e.target.classList.contains('x')) { close(path); return; }
+        active = path; render(); renderTabs(); renderTree();
+      };
+      el.onauxclick = (e) => { if (e.button === 1) { e.preventDefault(); close(path); } };
+      bar.appendChild(el);
+    }
+  }
+
+  function close(path) {
+    const doc = open.get(path);
+    if (doc && doc.text !== doc.saved &&
+        !confirm(path + ' has unsaved changes. Close anyway?')) return;
+    open.delete(path);
+    if (active === path) active = open.size ? [...open.keys()][open.size - 1] : null;
+    // The textarea belongs to the closed document; drop it so render() rebuilds.
+    $('ed-body').innerHTML = '';
+    render(); renderTabs(); renderTree();
+  }
+
+  // ---- file operations ------------------------------------------------------
+  async function api(path, opts) {
+    const r = await fetch(path, opts);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+    return body;
+  }
+
+  async function openFile(path, focus = true) {
+    if (open.has(path)) {
+      if (focus) { active = path; render(); renderTabs(); renderTree(); }
+      return;
+    }
+    try {
+      const b = await api('/api/fs/file?path=' + encodeURIComponent(path));
+      open.set(path, { text: b.content, saved: b.content, lang: langFor(path) });
+      if (focus) active = path;
+      $('ed-body').innerHTML = '';
+      render(); renderTabs(); renderTree();
+      if (b.truncated) term('! ' + path + ' was truncated at 2 MB; saving would lose the rest', 'bad');
+    } catch (e) {
+      term('! cannot open ' + path + ': ' + e.message, 'bad');
+    }
+  }
+
+  async function save() {
+    if (!active) return;
+    const doc = open.get(active);
+    if (!doc || doc.text === doc.saved) return;
+    try {
+      await api('/api/fs/file', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: active, content: doc.text }),
+      });
+      doc.saved = doc.text;
+      renderTabs(); renderStatus();
+      term('saved ' + active, 'ok');
+      refreshTree();
+    } catch (e) {
+      term('! save failed: ' + e.message, 'bad');
+    }
+  }
+
+  async function refreshTree() {
+    try {
+      const b = await api('/api/fs/tree?recursive=1');
+      tree = b.entries || [];
+      $('tree-root').textContent = b.root || '';
+      $('tree-root').title = b.root || '';
+      renderTree();
+    } catch (e) {
+      $('tree-list').innerHTML = '<div class="tree-empty">' + esc(e.message) + '</div>';
+    }
+  }
+
+  function renderTree() {
+    const list = $('tree-list');
+    if (!tree.length) {
+      list.innerHTML = '<div class="tree-empty">Empty workspace.<br>Use + to add a file.</div>';
+      return;
+    }
+    list.innerHTML = '';
+    for (const e of tree) {
+      const row = document.createElement('div');
+      row.className = 'item' + (e.path === active ? ' active' : '');
+      const depth = (e.path.match(/\//g) || []).length;
+      row.style.paddingLeft = (10 + depth * 10) + 'px';
+      row.innerHTML = '<span class="nm"></span>' +
+                      '<span class="act" data-act="ren" title="Rename">✎</span>' +
+                      '<span class="act" data-act="del" title="Delete">🗑</span>';
+      row.querySelector('.nm').textContent = e.path.split('/').pop();
+      row.title = e.path + '  (' + e.size + ' bytes)';
+      row.onclick = (ev) => {
+        const act = ev.target.dataset && ev.target.dataset.act;
+        if (act === 'ren') { ev.stopPropagation(); rename(e.path); return; }
+        if (act === 'del') { ev.stopPropagation(); remove(e.path); return; }
+        lastUserFocus = Date.now();
+        openFile(e.path);
+      };
+      list.appendChild(row);
+    }
+  }
+
+  async function rename(path) {
+    const to = prompt('Rename to:', path);
+    if (!to || to === path) return;
+    try {
+      await api('/api/fs/rename', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: path, to }),
+      });
+      if (open.has(path)) {
+        const doc = open.get(path);
+        open.delete(path);
+        open.set(to, { ...doc, lang: langFor(to) });
+        if (active === path) active = to;
+      }
+      term('renamed ' + path + ' -> ' + to, 'ok');
+      await refreshTree(); renderTabs(); render();
+    } catch (e) { term('! rename failed: ' + e.message, 'bad'); }
+  }
+
+  async function remove(path) {
+    if (!confirm('Delete ' + path + '?')) return;
+    try {
+      await api('/api/fs/file?path=' + encodeURIComponent(path), { method: 'DELETE' });
+      open.delete(path);
+      if (active === path) { active = open.size ? [...open.keys()][0] : null; $('ed-body').innerHTML = ''; }
+      term('deleted ' + path, 'ok');
+      await refreshTree(); renderTabs(); render();
+    } catch (e) { term('! delete failed: ' + e.message, 'bad'); }
+  }
+
+  async function newFile() {
+    const path = prompt('New file path (relative to the workspace):', 'index.html');
+    if (!path) return;
+    try {
+      await api('/api/fs/file', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, content: '' }),
+      });
+      await refreshTree();
+      openFile(path);
+    } catch (e) { term('! create failed: ' + e.message, 'bad'); }
+  }
+
+  // ---- terminal panel -------------------------------------------------------
+  function term(line, cls) {
+    const log = $('term-log');
+    const d = document.createElement('div');
+    if (cls) d.className = 't-' + cls;
+    d.textContent = line;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // ---- agent run ------------------------------------------------------------
+  // Drives POST /api/agent/chat from Phase 2 and lands its `file` events as
+  // tabs, which is the whole point of the tool layer having a UI.
+  async function runAgent() {
+    const input = $('agent-input');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    $('agent-send').disabled = true;
+    term('> ' + text, 'run');
+
+    try {
+      const res = await fetch('/api/agent/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: text }],
+                               max_tokens: 700, max_rounds: 6, temperature: 0.2 }),
+      });
+      if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder('utf-8');
+      let buf = '', event = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trimEnd();
+          buf = buf.slice(nl + 1);
+          if (line.startsWith('event: ')) { event = line.slice(7); continue; }
+          if (!line.startsWith('data: ')) continue;
+          let d; try { d = JSON.parse(line.slice(6)); } catch { continue; }
+
+          if (event === 'tool_call') {
+            const a = d.arguments || {};
+            term('  ' + d.name + '(' + (a.path || a.from || a.glob || '') + ')', 'dim');
+          } else if (event === 'tool_result') {
+            term('  ' + (d.ok ? '✓ ' : '✗ ') + d.content.split('\n')[0].slice(0, 120),
+                 d.ok ? 'ok' : 'bad');
+          } else if (event === 'file') {
+            await refreshTree();
+            // Reload an open file the model just changed, unless the user is
+            // mid-edit in it — clobbering their typing would be worse than a
+            // stale tab.
+            const doc = open.get(d.path);
+            const busy = doc && doc.text !== doc.saved;
+            if (busy) { term('  (' + d.path + ' changed on disk; your tab has unsaved edits)', 'bad'); }
+            else {
+              open.delete(d.path);
+              const stealFocus = Date.now() - lastUserFocus > 5000;
+              await openFile(d.path, stealFocus || !active);
+            }
+          } else if (event === 'done') {
+            term('  [' + d.rounds + ' round(s), ' + d.tool_calls + ' tool call(s), ' + d.stop + ']', 'dim');
+          } else if (event === 'error') {
+            term('  ! ' + d.error, 'bad');
+          }
+        }
+      }
+    } catch (e) {
+      term('! ' + e.message, 'bad');
+    } finally {
+      $('agent-send').disabled = false;
+    }
+  }
+
+  function init() {
+    $('tree-refresh').onclick = refreshTree;
+    $('tree-new').onclick = newFile;
+    $('agent-send').onclick = runAgent;
+    $('agent-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runAgent(); }
+    });
+    renderTabs(); render(); refreshTree();
+  }
+
+  return { init, openFile, save, refreshTree, highlight, langFor };
+})();
+
 // ---- Init -------------------------------------------------------------------
 setActiveTab('assistant');
+Coder.init();
 </script>
 </body>
 </html>

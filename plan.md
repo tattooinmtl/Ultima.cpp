@@ -26,8 +26,12 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
       /api/agent/chat, reproducibly. 37 unit tests. Live runs drove three
       robustness fixes (see Notes). Known limitation: the 7B stops after a
       failed tool call instead of retrying — Phase 4 is the structural answer.
-- [ ] Phase 3: Coder tab — file tree, editor tabs, syntax highlighting, save.
+- [x] Phase 3: Coder tab — file tree, editor tabs, syntax highlighting, save.
       Provable by opening the testpad and editing a file end to end.
+      **Done 2026-09-17.** Verified in a browser: tree lists the workspace,
+      clicking a file opens a tab, editing marks it dirty, Ctrl+S writes to
+      disk, and an agent run creates a file that appears as a focused tab.
+      Highlighter has its own regression test (scripts/test_testpad_highlight.mjs).
 - [ ] Phase 4: Phased planning — `.ultima/plan.md` + `todos.json`, the agent
       contract, and the Plan panel that renders phases with nested subtasks.
       Provable by giving the agent a project-sized ask and getting a plan back
@@ -53,6 +57,11 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
   names (separator/case drift, aliases, and a leading-verb fallback), strips a
   leading slash from paths, and makes every error actionable by naming the
   retry. None of this loosens `resolve()` — the normalization happens above it.
+- Phase 3 editor is a textarea with transparent text over a highlighted
+  <pre>. The two must keep identical font metrics and padding or the caret
+  drifts from the glyphs; both rules carry a comment saying so. The
+  highlighter is one combined regex per language, and `\x60` is how a
+  backtick gets into a String.raw pattern.
 - Open, and the honest state of Phase 2: the loop, parsing, dispatch and
   events are solid, but a 7B given a two-step task ("read it, then edit it")
   frequently stops after one failed call rather than recovering. That is a
