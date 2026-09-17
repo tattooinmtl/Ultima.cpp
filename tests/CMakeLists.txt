@@ -29,6 +29,7 @@ add_executable(ultima_test
     unit/test_sampler.cpp
     unit/test_qwen_config.cpp
     unit/test_kv_cache_forward.cpp
+    unit/test_workspace.cpp
 )
 
 target_link_libraries(ultima_test
@@ -41,6 +42,7 @@ target_link_libraries(ultima_test
         ultima_tokenizer
         ultima_kv_cache
         ultima_sampler
+        ultima_server
         ultima_warnings
         doctest::doctest
 )

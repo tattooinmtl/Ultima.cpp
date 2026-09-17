@@ -2076,6 +2076,173 @@ Four tabs (Assistant, Coder, Brain, Inspector), top layout menu with per-panel t
 
 ---
 
+# Decision 18 — Coder IDE (workspace file API, file tools, editor shell, phased planning)
+
+## Scope
+
+Decisions 16 and 17 designed the coding agent and the shell that hosts it, but
+nothing underneath them was built: there is no file API, no tool layer, and the
+testpad is still a single chat pane. This decision specifies the whole Coder
+track as one buildable unit — a real IDE inside the testpad that a local model
+can drive to produce whole applications.
+
+Four things have to exist, in this order, because each depends on the one
+before it:
+
+1. A **workspace file API** — real file operations over HTTP, rooted at one
+   directory, with path-escape guards.
+2. A **file tool layer** — those same operations exposed as model-callable
+   tools, plus the tool-call loop that lets a turn invoke them.
+3. A **tabbed editor** in the Coder tab — file tree, tabs, editing, save.
+4. A **phased planning workflow** — how a session decomposes "build me an app"
+   into phases the user can watch and steer.
+
+## 18.1 — Why not the GameForgerAI approach
+
+The reference implementation (`C:\GameForgerAI`, `gameSimController.js` +
+`GameSimCreator.jsx`) streams whole files to the browser as
+`<!-- FILE: name -->` sections, parses them into a `{name: content}` map, and
+renders one Monaco tab per entry. That is a good fit for single-page games: one
+turn regenerates the whole artifact, and there is no filesystem to keep
+consistent.
+
+Ultima needs both more than that and less:
+
+- **More**: the user asked for rename, delete and partial edits — the
+  operations a model needs to evolve a codebase rather than re-emit it. A
+  whole-file marker format cannot express "rename this file" or "change these
+  three lines", and re-emitting every file every turn is exactly what a small
+  local model is worst at.
+- **Less**: no CDN. `ui/testpad/index.html` is bundled into the binary at
+  configure time and references nothing external, which rules out Monaco. The
+  editor is written in-tree.
+
+What carries over from the reference: files as a flat `path -> content` map in
+the client, one tab per file, tabs appearing as the model creates them, and a
+visible tool-call trace so the user can see what the agent did.
+
+## 18.2 — Workspace file API
+
+One workspace root per server process, set by `--workspace <dir>` (default: the
+current directory). Every path in every request is relative to it.
+
+```
+GET    /api/fs/tree?path=            -> { entries: [{path, kind, size, mtime}] }
+GET    /api/fs/file?path=a/b.js      -> { path, content, truncated }
+PUT    /api/fs/file                  -> { path, content }          (create/overwrite)
+PATCH  /api/fs/file                  -> { path, edits: [{find, replace, all?}] }
+POST   /api/fs/rename                -> { from, to }
+DELETE /api/fs/file?path=            -> {}
+POST   /api/fs/mkdir                 -> { path }
+```
+
+**Path safety is the whole security surface of this feature.** Every path goes
+through one `resolve_in_workspace()` that lexically normalizes, rejects
+absolute paths, rejects any `..` segment, resolves symlinks, and re-checks that
+the result is still under the root. A path that fails is a 400 naming the
+reason, never a silent clamp. This is the only place that turns a request
+string into a `std::filesystem::path`.
+
+Refusals that are deliberate, not oversights:
+
+- Binary files are not served through `/api/fs/file`; the response says so. A
+  2 MB text cap applies, reported as `truncated: true` rather than a partial
+  lie.
+- No writes outside the workspace, no matter how the path is spelled.
+- `.git/` is listed but not writable through the API.
+
+## 18.3 — File tools
+
+The same operations, declared to the model. Names match Decision 16 where it
+already named one (`write_project_file`).
+
+| Tool | Purpose |
+|------|---------|
+| `list_files(glob?)`                        | project tree, optionally filtered |
+| `read_file(path, start?, end?)`            | read, optionally a line range |
+| `write_project_file(path, content, tab?)`  | create or overwrite, opens a tab |
+| `edit_file(path, find, replace, all?)`     | exact-string replacement |
+| `rename_file(from, to)`                    | move or rename |
+| `delete_file(path)`                        | remove |
+
+`edit_file` is exact-string — not a diff format, not line numbers. Small models
+produce malformed unified diffs constantly, and line numbers go stale the
+moment anything above them changes. An exact-string replace either matches or
+fails loudly, which is the failure mode we want.
+
+Every mutation broadcasts an SSE `project-file-updated` event on the existing
+stream so the editor reflects it live.
+
+## 18.4 — Editor shell
+
+The Coder tab, built in-tree with no dependencies:
+
+- **File tree** — the workspace, lazy-expanded, with new / rename / delete.
+- **Tab bar** — one tab per open file, dirty marker, middle-click to close,
+  overflow scroll. Tabs the model creates open automatically and focus the
+  newest, unless the user has focused something else in the last few seconds.
+- **Editor** — a textarea with a syntax-highlighted underlay, line numbers,
+  bracket and indent handling, and find. Highlighting is a compact per-language
+  tokenizer (js / ts / html / css / json / python / markdown), not a
+  general-purpose engine.
+- **Save** — `Ctrl+S` per tab; dirty tabs survive tab switches.
+
+The editor is deliberately modest. A local 1.5B model writing a landing page
+does not need IntelliSense; it needs the user to be able to read, correct and
+save what it produced.
+
+## 18.5 — Phased planning
+
+The workflow the agent follows for anything bigger than a one-file change, and
+the reason this is a decision rather than a prompt tweak: small models drift
+when handed an open-ended goal. Phases are the leash.
+
+On a project-sized request the agent's **first turn produces a plan and nothing
+else** — no code. The plan is written to `<workspace>/.ultima/plan.md`:
+
+```markdown
+## <project title>
+**Requested:** <the user's ask, one line>
+**Started:** YYYY-MM-DD HH:MM
+
+- [ ] Phase 1: <outcome>
+- [ ] Phase 2: <outcome>
+```
+
+Rules the runtime enforces, not merely suggests:
+
+- **One phase is one task.** A phase is done when it produces something the
+  user can look at. "Set up the project" is a phase; "write the CSS variables"
+  is not.
+- **One phase in flight at a time.** The agent works the first unchecked phase
+  and stops at its boundary for the user to look.
+- **A phase too big for one turn spawns subtasks**, written to
+  `<workspace>/.ultima/todos.json` as `{phase, id, text, done}` records — not
+  into `plan.md`, which stays a readable phase list. The Plan panel renders
+  phases with their subtasks nested.
+- **Phases are checked off in `plan.md`** and logged to `CHANGELOG.md` as they
+  land, so a session resumed tomorrow reads its own history.
+
+The user can edit `plan.md` by hand to reorder, cut or add phases; the agent
+re-reads it at the top of every turn and follows the edited version.
+
+## 18.6 — Files
+
+- `src/server/workspace.{hpp,cpp}` — path resolution + file operations.
+- `src/server/fs_routes.cpp` — the `/api/fs/*` handlers.
+- `src/server/tools.{hpp,cpp}` — tool declarations + dispatch loop.
+- `ui/testpad/index.html` — Coder tab, file tree, editor (still one file).
+- `<workspace>/.ultima/{plan.md,todos.json,CHANGELOG.md}` — session state.
+
+## 18.7 — Locked
+
+Seven HTTP endpoints behind one path-resolution guard, six model tools, an
+in-tree editor with no external dependencies, and a phase workflow whose unit
+is "something the user can look at". Deferred to v0.2: multi-workspace, git
+integration, an LSP, and drag-to-dock panels (Decision 17 §17.4).
+
+---
+
 ## Future decisions (not written yet)
 
 - Decision 06 — Model architecture layer (`IModel`, Qwen2Model, Qwen3Model dispatch) — required before M4

@@ -34,6 +34,7 @@ const std::string_view kTestpadHtml = \"<!doctype html><body>testpad HTML missin
 endif()
 
 add_library(ultima_server STATIC
+    workspace.cpp
     http_server.cpp
     "${TESTPAD_GEN}"
 )
@@ -54,6 +55,7 @@ target_link_libraries(ultima_server
         nlohmann_json::nlohmann_json
     PRIVATE
         ultima_warnings
+        fmt::fmt
 )
 
 # Consume cpp-httplib's include path directly rather than linking to its

@@ -29,6 +29,10 @@ struct ServerConfig {
     std::uint16_t   bind_port      = 11434;         // Ollama-mnemonic per Decision 14
     std::string     auth_token;                     // empty => auth disabled for local traffic
     std::size_t     max_gen_tokens = 512;           // safety cap for a single request
+
+    // Root the Coder IDE's file operations are confined to (Decision 18).
+    // Every /api/fs/* path resolves against this and may not escape it.
+    std::string     workspace_root = ".";
 };
 
 class HttpServer {

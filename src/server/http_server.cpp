@@ -12,9 +12,11 @@
 #include "ultima/model/imodel.hpp"
 #include "ultima/sampler/sampler.hpp"
 #include "ultima/tokenizer/chat_template.hpp"
+#include "ultima/server/workspace.hpp"
 #include "ultima/tokenizer/tokenizer.hpp"
 
 #include <atomic>
+#include <optional>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -308,6 +310,55 @@ json openai_chat_response(const std::string& model_name,
 // fallback placeholder in testpad_bundle.cpp).
 extern const std::string_view kTestpadHtml;
 
+// Request helpers.
+//
+// These are free functions on purpose. They were previously lambdas local to
+// the HttpServer constructor, captured by reference into each route handler —
+// but handlers run long after the constructor returns, so those references
+// dangled. It worked by luck until the stack layout changed.
+
+// Bearer check. An empty configured token disables auth (local-only default).
+bool check_auth_token(const std::string& token,
+                      const httplib::Request& req, httplib::Response& res) {
+    if (token.empty()) return true;
+    auto it = req.headers.find("Authorization");
+    const std::string expected = "Bearer " + token;
+    if (it == req.headers.end() || it->second != expected) {
+        res.status = 401;
+        res.set_content(json{{"error", "unauthorized"}}.dump(), "application/json");
+        return false;
+    }
+    return true;
+}
+
+// Map a workspace failure onto an HTTP status: a refused or malformed path is
+// the caller's fault, a missing file is 404, anything else is ours.
+int fs_status_for(const core::Error& e) {
+    switch (e.code) {
+    case ErrorCode::InvalidArgument: return 400;
+    case ErrorCode::NotFound:
+    case ErrorCode::FileNotFound:    return 404;
+    default:                         return 500;
+    }
+}
+
+void fs_send_error(httplib::Response& res, const core::Error& e) {
+    res.status = fs_status_for(e);
+    res.set_content(json{{"error", e.message}}.dump(), "application/json");
+}
+
+// The workspace is opened at listen time; a request that arrives before that,
+// or after a failed open, gets a clear 503 instead of dereferencing nothing.
+Workspace* fs_ready_or_503(std::optional<Workspace>& ws, httplib::Response& res) {
+    if (!ws) {
+        res.status = 503;
+        res.set_content(json{{"error", "no workspace is open"}}.dump(),
+                        "application/json");
+        return nullptr;
+    }
+    return &*ws;
+}
+
 struct HttpServer::Impl {
     Impl(RuntimeContext c, ServerConfig g) : ctx{std::move(c)}, cfg{std::move(g)} {}
 
@@ -316,6 +367,11 @@ struct HttpServer::Impl {
     httplib::Server svr;
     std::mutex     model_mutex;   // serializes chat requests (one slot pool in v0.1)
     std::atomic<bool> stopping{false};
+
+    // Opened lazily in listen_blocking() so a bad --workspace is reported as a
+    // startup error rather than thrown from a constructor.
+    std::optional<Workspace> ws;
+    std::mutex     ws_mutex;      // file ops are not otherwise serialized
 };
 
 HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
@@ -323,23 +379,12 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
     auto& svr = impl_->svr;
     auto& state = *impl_;
 
-    // ---- Auth middleware (local bypass, LAN requires bearer) ----
-    auto check_auth = [&](const httplib::Request& req, httplib::Response& res) -> bool {
-        if (state.cfg.auth_token.empty()) return true;      // auth disabled
-        auto it = req.headers.find("Authorization");
-        const std::string expected = "Bearer " + state.cfg.auth_token;
-        if (it == req.headers.end() || it->second != expected) {
-            res.status = 401;
-            res.set_content(json{{"error", "unauthorized"}}.dump(), "application/json");
-            return false;
-        }
-        return true;
-    };
 
     // ---- CORS (localhost dev) ----
     svr.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin",  "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Methods",
+                       "GET, POST, PUT, PATCH, DELETE, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
         if (req.method == "OPTIONS") {
             res.status = 204;
@@ -350,7 +395,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
 
     // ---- /api/health ----
     svr.Get("/api/health", [&](const httplib::Request& req, httplib::Response& res) {
-        if (!check_auth(req, res)) return;
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
         json j = {
             {"status",   "ok"},
             {"model",    state.ctx.model_name},
@@ -365,7 +410,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
 
     // ---- /v1/models ----
     svr.Get("/v1/models", [&](const httplib::Request& req, httplib::Response& res) {
-        if (!check_auth(req, res)) return;
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
         const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         json j = {
@@ -382,9 +427,138 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
         res.set_content(j.dump(), "application/json");
     });
 
+    // ---- /api/fs/* — Coder IDE file operations (Decision 18 §18.2) --------
+    //
+    // Every path in every handler below goes through Workspace::resolve(),
+    // which is the one place a client string becomes a filesystem path. A
+    // refusal is a 400 naming the reason; nothing is ever clamped into range.
+
+    svr.Get("/api/fs/tree", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+
+        const bool recursive = req.get_param_value("recursive") == "1";
+        const std::string path = req.get_param_value("path");
+
+        auto entries = recursive ? ws->list_recursive() : ws->list(path);
+        if (!entries) { fs_send_error(res, entries.error()); return; }
+
+        json arr = json::array();
+        for (const auto& e : *entries) {
+            arr.push_back({{"path", e.path}, {"is_dir", e.is_dir},
+                           {"size", e.size}, {"mtime", e.mtime}});
+        }
+        res.set_content(json{{"root", ws->root().generic_string()},
+                             {"entries", arr}}.dump(), "application/json");
+    });
+
+    svr.Get("/api/fs/file", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+
+        const std::string path = req.get_param_value("path");
+        auto got = ws->read(path);
+        if (!got) { fs_send_error(res, got.error()); return; }
+        res.set_content(json{{"path", path},
+                             {"content", got->content},
+                             {"truncated", got->truncated}}.dump(),
+                        "application/json");
+    });
+
+    svr.Put("/api/fs/file", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+        try {
+            const auto body = json::parse(req.body);
+            const std::string path    = body.at("path").get<std::string>();
+            const std::string content = body.value("content", std::string{});
+            if (auto w = ws->write(path, content); !w) { fs_send_error(res, w.error()); return; }
+            res.set_content(json{{"path", path}, {"bytes", content.size()}}.dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    svr.Patch("/api/fs/file", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+        try {
+            const auto body = json::parse(req.body);
+            const std::string path = body.at("path").get<std::string>();
+            std::vector<Workspace::Edit> edits;
+            for (const auto& e : body.at("edits")) {
+                edits.push_back({e.at("find").get<std::string>(),
+                                 e.value("replace", std::string{}),
+                                 e.value("all", false)});
+            }
+            auto n = ws->edit(path, edits);
+            if (!n) { fs_send_error(res, n.error()); return; }
+            res.set_content(json{{"path", path}, {"replacements", *n}}.dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    svr.Post("/api/fs/rename", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+        try {
+            const auto body = json::parse(req.body);
+            const std::string from = body.at("from").get<std::string>();
+            const std::string to   = body.at("to").get<std::string>();
+            if (auto r = ws->rename(from, to); !r) { fs_send_error(res, r.error()); return; }
+            res.set_content(json{{"from", from}, {"to", to}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    svr.Delete("/api/fs/file", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+
+        const std::string path = req.get_param_value("path");
+        if (auto r = ws->remove(path); !r) { fs_send_error(res, r.error()); return; }
+        res.set_content(json{{"path", path}, {"deleted", true}}.dump(),
+                        "application/json");
+    });
+
+    svr.Post("/api/fs/mkdir", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.ws_mutex};
+        auto* ws = fs_ready_or_503(state.ws, res);
+        if (!ws) return;
+        try {
+            const auto body = json::parse(req.body);
+            const std::string path = body.at("path").get<std::string>();
+            if (auto r = ws->mkdir(path); !r) { fs_send_error(res, r.error()); return; }
+            res.set_content(json{{"path", path}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
     // ---- /api/slots ----
     svr.Get("/api/slots", [&](const httplib::Request& req, httplib::Response& res) {
-        if (!check_auth(req, res)) return;
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
         json j = {
             {"total",  state.ctx.kv.config().n_slots},
             {"in_use", state.ctx.kv.n_active_slots()},
@@ -396,7 +570,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
 
     // ---- /api/tokenize + /api/detokenize ----
     svr.Post("/api/tokenize", [&](const httplib::Request& req, httplib::Response& res) {
-        if (!check_auth(req, res)) return;
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
         try {
             auto body = json::parse(req.body);
             const std::string text = body.value("text", "");
@@ -410,7 +584,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
         }
     });
     svr.Post("/api/detokenize", [&](const httplib::Request& req, httplib::Response& res) {
-        if (!check_auth(req, res)) return;
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
         try {
             auto body = json::parse(req.body);
             std::vector<std::int32_t> ids;
@@ -429,7 +603,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
     // ---- /v1/chat/completions (streaming + non-streaming) ----
     svr.Post("/v1/chat/completions",
         [&](const httplib::Request& req, httplib::Response& res) {
-        if (!check_auth(req, res)) return;
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
 
         json body;
         try { body = json::parse(req.body); }
@@ -535,6 +709,14 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
 HttpServer::~HttpServer() { stop(); }
 
 Result<void> HttpServer::listen_blocking() {
+    // Open the workspace before binding: a bad --workspace should fail loudly
+    // at startup, not on the first file request.
+    {
+        auto ws = Workspace::open(impl_->cfg.workspace_root);
+        if (!ws) return Failure{ws.error()};
+        impl_->ws.emplace(std::move(*ws));
+    }
+
     if (!impl_->svr.listen(impl_->cfg.bind_host.c_str(),
                            static_cast<int>(impl_->cfg.bind_port))) {
         return fail(ErrorCode::InvalidModel,

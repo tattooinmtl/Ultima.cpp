@@ -16,6 +16,46 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-16 coder-ide-p1  Decision 18 written; Phase 1 done - workspace file API. Also fixed pre-existing UB in the server.
+    roadmap01.md Decision 18 - Coder IDE: workspace file API, six model tools, in-tree tabbed
+      editor, phased planning. Studied C:/GameForgerAI (gameSimController.js + GameSimCreator.jsx)
+      as the reference; its one-tab-per-file UI carries over, its whole-file regeneration does not,
+      because it cannot express rename or partial edit. No Monaco: the testpad is bundled into the
+      binary with zero external references.
+    plan.md - five phases, one phase = one task, subtasks go to .ultima/todos.json.
+    NEW src/server/workspace.{hpp,cpp} - the whole feature funnels through one resolve(), which
+      refuses .., absolute paths, drive letters, UNC, control characters and Windows device names,
+      then re-checks containment after symlink resolution. Never clamps a bad path into a good one.
+      edit() is exact-string and all-or-nothing: a failing edit list leaves the file untouched.
+    NEW /api/fs/{tree,file,rename,mkdir} over GET/PUT/PATCH/DELETE, plus a --workspace flag on serve.
+    FIX pre-existing UB: check_auth was a constructor-local lambda captured by reference into every
+      route handler, so every request read a destroyed object. Latent until the new fs helpers
+      changed the stack layout, then it segfaulted on the first request. All request helpers are
+      free functions now.
+    tests/unit/test_workspace.cpp - 22 cases with the escape vectors pinned. 160 tests pass.
+    Verified live: all seven endpoints work; ../, %2F-encoded, backslash, drive-letter, UNC,
+      /etc/passwd and NUL variants all refused 400 with a named reason; nothing written outside root.
+
+
+2026-09-16 coder-ide-p1  Decision 18 written; Phase 1 done — workspace file API. Also fixed pre-existing UB in the server.
+    roadmap01.md Decision 18 — Coder IDE: workspace file API, six model tools, in-tree tabbed editor,
+      phased planning. Studied C:/GameForgerAI (gameSimController.js + GameSimCreator.jsx) as the
+      reference; its one-tab-per-file UI carries over, its whole-file regeneration does not, because
+      it cannot express rename or partial edit. No Monaco: testpad is bundled into the binary with
+      zero external refs.
+    plan.md — five phases, one phase = one task.
+    NEW src/server/workspace.{hpp,cpp} — the whole feature funnels through one resolve(), which
+      refuses .., absolute paths, drive letters, UNC, control chars and Windows device names, then
+      re-checks containment after symlink resolution. Never clamps a bad path into a good one.
+      edit() is exact-string and all-or-nothing: a failing edit list leaves the file untouched.
+    NEW /api/fs/{tree,file,rename,mkdir} — GET/PUT/PATCH/DELETE. --workspace flag on .
+    FIX pre-existing UB: check_auth was a constructor-local lambda captured by reference into every
+      route handler, so every request read a destroyed object. Latent until the new fs helpers
+      changed the stack layout, then it segfaulted on the first request. All request helpers are
+      free functions now.
+    tests/unit/test_workspace.cpp — 22 cases, escape vectors pinned. 160 tests pass.
+
+
 2026-09-16 spark2_5  spark2_5 WORKING. Root cause was GEGLU vs SwiGLU. Also fixed a pretokenizer bug affecting every model.
     User supplied the reference: llama.cpp b10988 binaries at C:/Llama/llama-b10988, and upstream PR
     ggml-org/llama.cpp#27868 (merged 2026-09-06), fetched with `gh pr diff`.
