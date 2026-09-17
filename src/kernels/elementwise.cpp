@@ -73,12 +73,10 @@ void swiglu_f32(const float* gate, const float* up, float* y, std::size_t n) noe
 
 // ----- geglu -----------------------------------------------------------------
 void geglu_f32_scalar(const float* gate, const float* up, float* y, std::size_t n) noexcept {
-    constexpr float k_sqrt_2_over_pi = 0.7978845608028654f;   // sqrt(2/pi)
-    constexpr float k_coeff          = 0.044715f;
+    constexpr float k_inv_sqrt2 = 0.70710678118654752f;   // 1/sqrt(2)
     for (std::size_t i = 0; i < n; ++i) {
         const float g = gate[i];
-        const float inner = k_sqrt_2_over_pi * (g + k_coeff * g * g * g);
-        const float a = 0.5f * g * (1.0f + std::tanh(inner));
+        const float a = 0.5f * g * (1.0f + std::erf(g * k_inv_sqrt2));
         y[i] = a * up[i];
     }
 }
