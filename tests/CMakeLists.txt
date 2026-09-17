@@ -30,6 +30,7 @@ add_executable(ultima_test
     unit/test_qwen_config.cpp
     unit/test_kv_cache_forward.cpp
     unit/test_workspace.cpp
+    unit/test_tools.cpp
 )
 
 target_link_libraries(ultima_test

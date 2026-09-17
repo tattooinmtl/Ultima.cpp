@@ -19,9 +19,13 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
       endpoints work; ../, encoded ../, backslash ../, drive letters, UNC,
       /etc/passwd and NUL all refused 400 with a named reason; nothing written
       outside the root.
-- [ ] Phase 2: File tool layer — the same six operations declared to the model,
+- [x] Phase 2: File tool layer — the same six operations declared to the model,
       plus the tool-call loop. Provable by asking a loaded model to create a
       file and seeing it appear on disk.
+      **Done 2026-09-16.** Qwen2.5-Coder-7B creates a file on disk through
+      /api/agent/chat, reproducibly. 37 unit tests. Live runs drove three
+      robustness fixes (see Notes). Known limitation: the 7B stops after a
+      failed tool call instead of retrying — Phase 4 is the structural answer.
 - [ ] Phase 3: Coder tab — file tree, editor tabs, syntax highlighting, save.
       Provable by opening the testpad and editing a file end to end.
 - [ ] Phase 4: Phased planning — `.ultima/plan.md` + `todos.json`, the agent
@@ -43,3 +47,14 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
   does not, because it cannot express rename or partial edit.
 - Phase 1 is the security-sensitive one. Every path in the whole feature funnels
   through a single `resolve_in_workspace()`; that function is where the tests go.
+- Phase 2, learned from live runs rather than guessed. Qwen2.5-Coder-7B called
+  `write_project-file` with a hyphen and passed `/hello.js` with a leading
+  slash; later it invented `read_project`. So the tool layer now canonicalizes
+  names (separator/case drift, aliases, and a leading-verb fallback), strips a
+  leading slash from paths, and makes every error actionable by naming the
+  retry. None of this loosens `resolve()` — the normalization happens above it.
+- Open, and the honest state of Phase 2: the loop, parsing, dispatch and
+  events are solid, but a 7B given a two-step task ("read it, then edit it")
+  frequently stops after one failed call rather than recovering. That is a
+  model-capability limit, and the reason Phase 4 exists: one phase at a time,
+  each small enough to be a single confident step.

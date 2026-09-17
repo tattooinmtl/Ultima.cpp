@@ -35,6 +35,7 @@ endif()
 
 add_library(ultima_server STATIC
     workspace.cpp
+    tools.cpp
     http_server.cpp
     "${TESTPAD_GEN}"
 )

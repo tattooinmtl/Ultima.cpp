@@ -16,6 +16,32 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-16 coder-ide-p2  Phase 2 done - file tool layer + agent loop. Three robustness fixes came from live runs.
+    NEW src/server/tools.{hpp,cpp} - six tools (list_files, read_file, write_project_file, edit_file,
+      rename_file, delete_file), their JSON schemas, the Qwen <tool_call> system prompt, a lenient
+      parser and the dispatcher.
+    NEW POST /api/agent/chat - the turn is a loop: generate, execute any tool calls, feed the results
+      back as `tool` messages, generate again. Ends on a reply with no calls, or the round budget.
+      SSE events: delta | tool_call | tool_result | file | done | error.
+    Parser accepts the three shapes small models drift between: the trained <tool_call> wrapper, a
+      fenced json block, and a bare object (only as the whole reply, so prose quoting JSON is not
+      misread). Brace matching is string-aware so JS braces inside `content` do not end the object.
+      A call truncated by the token cap still parses.
+    visible_prose_prefix() keeps <tool_call> markup out of the streamed deltas, including holding
+      back a partial opening tag.
+    Driven by live runs against Qwen2.5-Coder-7B, not guessed:
+      - it called "write_project-file" (hyphen)     -> name canonicalization + aliases
+      - it passed "/hello.js" (leading slash)       -> path normalization above resolve()
+      - it invented "read_project"                  -> leading-verb fallback
+      - bare "missing argument X" made it give up   -> errors now name the retry
+    Verified: the 7B creates a file on disk through the endpoint, reproducibly; the file event fires
+      with a tab label. 190 tests pass.
+    Known limitation, not papered over: on a two-step ask the 7B often stops after one failed call
+      instead of recovering. Machinery is fine; that is model capability, and Phase 4 is the answer.
+    Process note: tested a stale binary for one cycle - a running server held ultima.exe open so the
+      relink was skipped silently while the .lib updated. Stop the server before rebuilding.
+
+
 2026-09-16 coder-ide-p1  Decision 18 written; Phase 1 done - workspace file API. Also fixed pre-existing UB in the server.
     roadmap01.md Decision 18 - Coder IDE: workspace file API, six model tools, in-tree tabbed
       editor, phased planning. Studied C:/GameForgerAI (gameSimController.js + GameSimCreator.jsx)

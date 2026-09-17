@@ -12,6 +12,7 @@
 #include "ultima/model/imodel.hpp"
 #include "ultima/sampler/sampler.hpp"
 #include "ultima/tokenizer/chat_template.hpp"
+#include "ultima/server/tools.hpp"
 #include "ultima/server/workspace.hpp"
 #include "ultima/tokenizer/tokenizer.hpp"
 
@@ -695,6 +696,171 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                 }
                 const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
+                sink.done();
+                return true;
+            });
+    });
+
+    // ---- /api/agent/chat — the coding session (Decision 18 §18.3) --------
+    //
+    // A turn is a loop, not a single generation: the model replies, any tool
+    // calls in that reply are executed, the results are appended as `tool`
+    // messages, and it generates again. The loop ends when a reply contains no
+    // tool calls, or when the round budget runs out.
+    //
+    // SSE events: delta | tool_call | tool_result | file | done | error.
+    svr.Post("/api/agent/chat", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+
+        auto msgs = parse_messages(body.value("messages", json::array()));
+        if (msgs.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error", "messages is empty"}}.dump(),
+                            "application/json");
+            return;
+        }
+
+        // Append the tool protocol to the system message, creating one if the
+        // caller did not send it. The tools have to be described inside the
+        // system turn or the model will not use them.
+        {
+            const std::string tools_block = render_tools_system_prompt();
+            if (!msgs.empty() && msgs.front().role == "system") {
+                msgs.front().content += tools_block;
+            } else {
+                tokenizer::ChatMessage sys;
+                sys.role = "system";
+                sys.content =
+                    "You are Ultima's coding assistant. You work inside the user's "
+                    "project and change it by calling tools." + tools_block;
+                msgs.insert(msgs.begin(), std::move(sys));
+            }
+        }
+
+        const auto params = parse_sampler(body);
+        const std::size_t max_tokens = body.contains("max_tokens")
+                                       && body["max_tokens"].is_number_integer()
+            ? std::min<std::size_t>(body["max_tokens"].get<std::size_t>(),
+                                    state.cfg.max_gen_tokens)
+            : state.cfg.max_gen_tokens;
+        // Enough rounds to read a couple of files and then write them back;
+        // low enough that a model stuck in a loop stops costing time.
+        const std::size_t max_rounds = std::min<std::size_t>(
+            body.value("max_rounds", std::size_t{6}), 16);
+
+        res.set_header("Cache-Control",     "no-cache");
+        res.set_header("Connection",        "keep-alive");
+        res.set_header("X-Accel-Buffering", "no");
+
+        auto req_state = std::make_shared<std::tuple<
+            std::vector<tokenizer::ChatMessage>, sampler::SamplerParams,
+            std::size_t, std::size_t>>(std::move(msgs), params, max_tokens, max_rounds);
+
+        res.set_chunked_content_provider("text/event-stream",
+            [this_state_ptr = &state, req_state]
+            (std::size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                auto& s = *this_state_ptr;
+                auto& conv       = std::get<0>(*req_state);
+                const auto& parm = std::get<1>(*req_state);
+                const auto maxtk = std::get<2>(*req_state);
+                const auto rounds_budget = std::get<3>(*req_state);
+
+                auto emit = [&](const char* event, const json& payload) {
+                    const std::string f =
+                        std::string("event: ") + event + "\ndata: " + payload.dump() + "\n\n";
+                    return sink.write(f.data(), f.size());
+                };
+
+                std::lock_guard<std::mutex> lk(s.model_mutex);
+                Workspace* ws = s.ws ? &*s.ws : nullptr;
+                if (!ws) {
+                    emit("error", json{{"error", "no workspace is open"}});
+                    sink.done();
+                    return true;
+                }
+
+                std::size_t round = 0;
+                std::size_t total_calls = 0;
+                for (; round < rounds_budget; ++round) {
+                    // Only what is outside a <tool_call> block reaches the user.
+                    std::string acc;
+                    std::size_t shown = 0;
+
+                    auto r = run_chat_stream(s.ctx, conv, parm, maxtk,
+                        [&](std::string_view piece) {
+                            acc.append(piece);
+                            const std::string vis = visible_prose_prefix(acc);
+                            if (vis.size() > shown) {
+                                emit("delta", json{{"text", vis.substr(shown)}});
+                                shown = vis.size();
+                            }
+                        });
+
+                    if (!r) {
+                        emit("error", json{{"error", r.error().message},
+                                           {"component", r.error().component}});
+                        sink.done();
+                        return true;
+                    }
+
+                    const auto calls = parse_tool_calls(r->text);
+                    if (calls.empty()) {
+                        // No tool calls: this reply is the answer, so the turn
+                        // is over.
+                        emit("done", json{{"rounds", round + 1},
+                                          {"tool_calls", total_calls},
+                                          {"stop", "complete"}});
+                        sink.done();
+                        return true;
+                    }
+
+                    // Record what the model said, verbatim, so the next round
+                    // sees its own calls alongside their results.
+                    tokenizer::ChatMessage assistant;
+                    assistant.role = "assistant";
+                    assistant.content = r->text;
+                    conv.push_back(std::move(assistant));
+
+                    for (const auto& c : calls) {
+                        ++total_calls;
+                        emit("tool_call", json{{"name", c.name},
+                                               {"arguments", c.args},
+                                               {"round", round}});
+
+                        const ToolResult tr = dispatch_tool(*ws, c);
+                        emit("tool_result", json{{"name", tr.name},
+                                                 {"ok", tr.ok},
+                                                 {"content", tr.content},
+                                                 {"round", round}});
+                        // Decision 16 §16.4: a written file opens its own tab.
+                        if (!tr.changed_path.empty() && tr.ok) {
+                            emit("file", json{{"path", tr.changed_path},
+                                              {"tab", tr.tab_label}});
+                        }
+
+                        tokenizer::ChatMessage tool_msg;
+                        tool_msg.role = "tool";
+                        tool_msg.name = tr.name;
+                        tool_msg.content = tr.ok
+                            ? tr.content
+                            : ("ERROR: " + tr.content);
+                        conv.push_back(std::move(tool_msg));
+                    }
+                }
+
+                // Budget exhausted. Say so rather than letting the UI think the
+                // model simply finished.
+                emit("done", json{{"rounds", round},
+                                  {"tool_calls", total_calls},
+                                  {"stop", "max_rounds"}});
                 sink.done();
                 return true;
             });
