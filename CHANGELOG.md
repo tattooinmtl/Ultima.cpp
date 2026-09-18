@@ -16,6 +16,31 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-18 coder-ide-p6  Phase 6 done - skills access. The knowledge base existed all along and was never wired.
+    FOUND: examples/knowledge holds 88 files (33 pattern skills, 14 languages, 11 frameworks,
+      6 databases, 9 tools) and C:/.skills holds 283 more - none of it reachable. AGENTS.md has
+      been instructing the model to call use_skill(name) for weeks; that tool did not exist.
+    NEW src/server/skills.{hpp,cpp} - SKILL.md discovery across three roots in priority order
+      (workspace .skills, the shipped tree, the cross-agent library), first match wins so a
+      project can shadow a shipped skill. Frontmatter parsing, fold-matching on names so
+      "html5 canvas" finds "html5-canvas", and ranked search over name/description/tags.
+    NEW tool use_skill(name) - seventh tool, and the count is deliberate. With 315 skills an
+      index in the prompt is impossible, so discovery happens through the error path: a wrong
+      name returns the closest matches with their descriptions. That pattern has now earned its
+      place three times this session.
+      Classified Risk::Read, so it is never gated by permissions.
+    Skill body cap is 6 KB, cut at a section boundary. Measured sizes: median 8.7 KB, p90
+      16.8 KB, largest 88 KB. On CPU every kilobyte is prefill time; 6 KB is about 1500 tokens.
+    NEW ServerConfig::max_turn_seconds (default 600) - a hard ceiling on one agent turn.
+    Verified live: the 7B called use_skill with "html5 canvas" (spaces, not hyphens) and got the
+      skill; "threejs" returned threejs-3d, threejs-3d-model-editor and threejs-3d-modeler with
+      descriptions, pulled from the cross-agent library. 244 unit tests pass.
+    OPEN, not fixed: a client that hangs up mid-turn does not reliably stop the generation,
+      because a small write into a socket whose peer has gone succeeds locally until TCP notices.
+      is_writable() did not catch it either. The wall-clock cap is the backstop; a real fix wants
+      generation on its own thread with a cancellation token.
+
+
 2026-09-18 coder-ide-p5  Phase 5 done - agent permissions. The live test caught a gate bypass.
     NEW PERMISSIONS.md - the user-facing contract.
     NEW src/server/permissions.{hpp,cpp} - three modes and seven risk classes.

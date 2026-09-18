@@ -48,7 +48,11 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
       denial reaches the model as a tool result, and yolo skips both.
       **Done 2026-09-18.** All four verified live against the 7B. 230 unit
       tests. The live run caught a gate bypass - see Notes.
-- [ ] Phase 6: Full-stack session — project scaffolding templates, the sandbox
+- [x] Phase 6: Skills access — use_skill(name), discovery across three roots,
+      and a compact index in the system prompt. See Decision 11 notes below.
+      **Done 2026-09-18.** 315 skills discovered; the 7B loaded html5-canvas by
+      an approximate name and a wrong name returned real suggestions.
+- [ ] Phase 7: Full-stack session — project scaffolding templates, the sandbox
       run tools from Decision 16 §16.3, and a live preview pane. Provable by
       "build me a todo app" producing a running page.
 
@@ -90,6 +94,20 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
   leading slash before the dispatcher did, and accepted `file_path` when the
   dispatcher did not. Rule of thumb: the gate and the dispatcher must agree
   about every argument, or the gate is decoration.
+- Phase 6 found the knowledge base was never wired: 88 files under
+  examples/knowledge plus 283 in C:/.skills, and AGENTS.md told the model to
+  call `use_skill`, which did not exist. It does now.
+- Skill bodies are big (median 8.7 KB, p90 16.8 KB, largest 88 KB) and on CPU
+  every kilobyte is prefill the user waits through, so the body cap is 6 KB and
+  truncates at a section boundary. Loading a skill visibly slows the next round;
+  that is the cost of the context, not a bug.
+- OPEN: a client that hangs up mid-turn does not reliably stop the generation.
+  The turn holds the model mutex, so the next request waits behind it. Write
+  failure is the only dependable signal and TCP hides it for a long time — a
+  small write into a socket whose peer vanished succeeds locally. There is now
+  a wall-clock cap (ServerConfig::max_turn_seconds, default 600) as the
+  backstop, which always fires but is blunt. A proper fix wants the generation
+  on its own thread with a cancellation token.
 - Open, and the honest state of Phase 2: the loop, parsing, dispatch and
   events are solid, but a 7B given a two-step task ("read it, then edit it")
   frequently stops after one failed call rather than recovering. That is a

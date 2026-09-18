@@ -278,9 +278,11 @@ TEST_CASE("dispatch: tools cannot escape the workspace") {
     CHECK_FALSE(fs::exists(tmp.root().parent_path() / "escaped.js"));
 }
 
-TEST_CASE("tool schemas: the six tools are declared with their required args") {
+TEST_CASE("tool schemas: every tool is declared with its required args") {
     const auto& s = ultima::server::tool_schemas();
-    CHECK(s.size() == 6);
+    // Six file tools plus use_skill. Kept small on purpose: a small model
+    // handed twenty tools picks the wrong one. Raise this only with a reason.
+    CHECK(s.size() == 7);
 
     bool saw_write = false;
     for (const auto& t : s) {

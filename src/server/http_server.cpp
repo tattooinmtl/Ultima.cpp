@@ -14,6 +14,7 @@
 #include "ultima/tokenizer/chat_template.hpp"
 #include "ultima/server/permissions.hpp"
 #include "ultima/server/session.hpp"
+#include "ultima/server/skills.hpp"
 #include "ultima/server/tools.hpp"
 #include "ultima/server/workspace.hpp"
 #include "ultima/tokenizer/tokenizer.hpp"
@@ -100,7 +101,8 @@ run_chat_stream(RuntimeContext& ctx,
                 const std::vector<tokenizer::ChatMessage>& msgs,
                 const sampler::SamplerParams& user_params,
                 std::size_t max_tokens,
-                const std::function<void(std::string_view)>& on_delta) {
+                const std::function<void(std::string_view)>& on_delta,
+                const std::function<bool()>& should_abort = {}) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
 
@@ -157,6 +159,10 @@ run_chat_stream(RuntimeContext& ctx,
     const auto im_end = ctx.tokenizer.im_end_id();
 
     for (std::size_t i = 0; i < max_tokens; ++i) {
+        // Checked every token so a hung-up client stops the work immediately
+        // rather than after the whole budget. The model mutex is held for the
+        // duration of a turn, so a wasted generation blocks every later request.
+        if (should_abort && should_abort()) break;
         const std::int32_t next = sampler::sample(std::span<float>(logits), params, sctx);
         if (next < 0) break;
         if (next == eos || next == im_end) break;
@@ -397,6 +403,7 @@ struct HttpServer::Impl {
     // Opened lazily in listen_blocking() so a bad --workspace is reported as a
     // startup error rather than thrown from a constructor.
     std::optional<Workspace> ws;
+    SkillIndex     skills;        // discovered once at listen time
     std::mutex     ws_mutex;      // file ops are not otherwise serialized
 
     // ---- Permissions (PERMISSIONS.md) ----
@@ -880,6 +887,10 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
         // system turn or the model will not use them.
         {
             std::string block = render_tools_system_prompt();
+            {
+                std::lock_guard<std::mutex> lk{state.ws_mutex};
+                block += render_skills_prompt(state.skills);
+            }
             if (planning) {
                 block += render_planning_instructions(*state.ws);
             } else {
@@ -930,10 +941,16 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                 const auto rounds_budget = std::get<3>(*req_state);
                 const bool planning      = std::get<4>(*req_state);
 
+                // On Windows a closed socket is not reliably visible to
+                // is_writable() until a write actually fails, so disconnect is
+                // detected from the writes themselves.
+                bool sink_dead = false;
                 auto emit = [&](const char* event, const json& payload) {
+                    if (sink_dead) return false;
                     const std::string f =
                         std::string("event: ") + event + "\ndata: " + payload.dump() + "\n\n";
-                    return sink.write(f.data(), f.size());
+                    if (!sink.write(f.data(), f.size())) { sink_dead = true; return false; }
+                    return true;
                 };
 
                 std::lock_guard<std::mutex> lk(s.model_mutex);
@@ -947,10 +964,30 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                 std::size_t round = 0;
                 std::size_t total_calls = 0;
                 bool plan_written = false;
+
+                // A client that hangs up should stop the work. Otherwise the
+                // turn generates into a dead sink while holding model_mutex,
+                // and every later request waits behind it.
+                // Detecting a hung-up client is unreliable on its own: a small
+                // write into a socket whose peer has vanished succeeds locally
+                // until the TCP stack notices, which can take minutes. So the
+                // write-failure check is backed by a wall-clock cap, which is
+                // crude but always fires. Either way the point is the same —
+                // the model mutex is held for a whole turn, so a turn nobody is
+                // listening to blocks every later request.
+                const auto turn_start = std::chrono::steady_clock::now();
+                const auto turn_budget = std::chrono::seconds(s.cfg.max_turn_seconds);
+                auto client_gone = [&] {
+                    if (sink_dead || !sink.is_writable()) return true;
+                    return s.cfg.max_turn_seconds > 0 &&
+                           (std::chrono::steady_clock::now() - turn_start) > turn_budget;
+                };
                 for (; round < rounds_budget; ++round) {
+                    if (client_gone()) return true;
                     // Only what is outside a <tool_call> block reaches the user.
                     std::string acc;
                     std::size_t shown = 0;
+                    std::size_t since_probe = 0;
 
                     auto r = run_chat_stream(s.ctx, conv, parm, maxtk,
                         [&](std::string_view piece) {
@@ -959,8 +996,20 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                             if (vis.size() > shown) {
                                 emit("delta", json{{"text", vis.substr(shown)}});
                                 shown = vis.size();
+                                since_probe = 0;
+                            } else if (++since_probe >= 24) {
+                                // An SSE comment: clients ignore it, but the
+                                // write fails once the client has gone. Inside
+                                // a tool call there is no prose to emit, so
+                                // without this nothing would notice.
+                                since_probe = 0;
+                                static constexpr std::string_view ping = ": ping\n\n";
+                                if (!sink_dead && !sink.write(ping.data(), ping.size())) {
+                                    sink_dead = true;
+                                }
                             }
-                        });
+                        },
+                        client_gone);
 
                     if (!r) {
                         emit("error", json{{"error", r.error().message},
@@ -968,6 +1017,8 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                         sink.done();
                         return true;
                     }
+
+                    if (client_gone()) return true;
 
                     const auto calls = parse_tool_calls(r->text);
 
@@ -1002,6 +1053,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                     conv.push_back(std::move(assistant));
 
                     for (const auto& c : calls) {
+                        if (client_gone()) return true;
                         ++total_calls;
                         emit("tool_call", json{{"name", c.name},
                                                {"arguments", c.args},
@@ -1078,7 +1130,7 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                                 std::string{k_plan_path} + "\" and the phase list, "
                                 "then stop.";
                         } else {
-                            tr = dispatch_tool(*ws, c);
+                            tr = dispatch_tool(*ws, c, &s.skills);
                         }
                         emit("tool_result", json{{"name", tr.name},
                                                  {"ok", tr.ok},
@@ -1153,6 +1205,8 @@ Result<void> HttpServer::listen_blocking() {
         if (!ws) return Failure{ws.error()};
         impl_->ws.emplace(std::move(*ws));
         impl_->perm_mode = parse_permission_mode(impl_->cfg.permission_mode);
+        impl_->skills = SkillIndex::discover(
+            default_skill_roots(impl_->ws->root()));
     }
 
     if (!impl_->svr.listen(impl_->cfg.bind_host.c_str(),

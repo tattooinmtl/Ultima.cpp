@@ -75,7 +75,8 @@ std::string subject_command(const ToolCall& call) {
 }
 
 bool is_read_tool(std::string_view name) noexcept {
-    return name == "read_file" || name == "list_files";
+    // use_skill only reads a bundled reference sheet, so it is never gated.
+    return name == "read_file" || name == "list_files" || name == "use_skill";
 }
 
 bool is_exec_tool(std::string_view name) noexcept {

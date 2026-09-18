@@ -38,6 +38,7 @@ add_library(ultima_server STATIC
     tools.cpp
     session.cpp
     permissions.cpp
+    skills.cpp
     http_server.cpp
     "${TESTPAD_GEN}"
 )

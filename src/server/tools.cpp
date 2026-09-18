@@ -179,7 +179,7 @@ std::string canonical_tool_name(std::string_view raw) {
     const auto dot = n.find_last_of('_');
     static const std::vector<std::string> real{
         "list_files", "read_file", "write_project_file",
-        "edit_file", "rename_file", "delete_file",
+        "edit_file", "rename_file", "delete_file", "use_skill",
     };
     for (const auto& r : real) {
         if (n == r) return r;
@@ -210,6 +210,11 @@ std::string canonical_tool_name(std::string_view raw) {
         {"mv",              "rename_file"},
         {"remove_file",     "delete_file"},
         {"rm",              "delete_file"},
+        {"load_skill",      "use_skill"},
+        {"get_skill",       "use_skill"},
+        {"read_skill",      "use_skill"},
+        {"skill",           "use_skill"},
+        {"use_skills",      "use_skill"},
     };
     for (const auto& a : aliases) {
         if (n == a.from) return a.to;
@@ -227,6 +232,8 @@ std::string canonical_tool_name(std::string_view raw) {
     // argument error, which names exactly what to fix.
     struct Verb { const char* prefix; const char* to; };
     static const Verb verbs[] = {
+        {"use_",     "use_skill"},
+        {"skill_",   "use_skill"},
         {"read_",    "read_file"},
         {"get_",     "read_file"},
         {"write_",   "write_project_file"},
@@ -333,6 +340,14 @@ const json& tool_schemas() {
                   "Delete a file or directory.",
                   {{"path", str_param("Project-relative path.")}},
                   {"path"}),
+        make_tool("use_skill",
+                  "Load a reference sheet of canonical patterns for a domain "
+                  "(for example html5-canvas, threejs-3d, web-frontend, "
+                  "python-coding). Call this BEFORE writing code in that "
+                  "domain. A name that does not exist returns the closest "
+                  "matches, so an approximate name is still useful.",
+                  {{"name", str_param("Skill name, e.g. 'threejs-3d'.")}},
+                  {"name"}),
     });
     return schemas;
 }
@@ -489,7 +504,8 @@ std::string visible_prose_prefix(std::string_view acc) {
     return out;
 }
 
-ToolResult dispatch_tool(Workspace& ws, const ToolCall& call) {
+ToolResult dispatch_tool(Workspace& ws, const ToolCall& call,
+                         const SkillIndex* skills) {
     const std::string name = canonical_tool_name(call.name);
 
     // Path-valued arguments get the leading-slash normalization; everything
@@ -522,6 +538,45 @@ ToolResult dispatch_tool(Workspace& ws, const ToolCall& call) {
                                      "Call {} again with '{}' set.",
                                      key, name, key));
     };
+
+    if (name == "use_skill") {
+        std::string want;
+        if (!require("name", want)) {
+            // Models pass the skill under every noun; accept the obvious ones.
+            for (const char* alt : {"skill", "skill_name", "topic", "query"}) {
+                bool found = false;
+                want = arg_str(call.args, alt, &found);
+                if (found) break;
+            }
+        }
+        if (want.empty()) return missing("name");
+        if (!skills || skills->size() == 0) {
+            return err(name, "No skills are available in this workspace.");
+        }
+        if (const Skill* hit = skills->find(want)) {
+            auto body = load_skill_body(*hit);
+            if (!body) return err(name, body.error().message);
+            return ok(name, fmt::format("# Skill: {}\n{}\n\n{}", hit->name,
+                                        hit->description.empty() ? ""
+                                                                 : hit->description,
+                                        *body));
+        }
+        // A miss is where discovery happens: 300+ skills cannot be listed in
+        // the prompt, so the closest matches come back instead of a dead end.
+        auto near = skills->search(want, 8);
+        if (near.empty()) {
+            return err(name, fmt::format("No skill named '{}', and nothing similar. "
+                                         "Continue without one.", want));
+        }
+        std::string body = fmt::format("No skill named '{}'. Closest matches:\n", want);
+        for (auto* s2 : near) {
+            body += fmt::format("  {} - {}\n", s2->name,
+                                s2->description.empty() ? "(no description)"
+                                                        : s2->description);
+        }
+        body += "Call use_skill again with one of these names.";
+        return err(name, body);
+    }
 
     if (name == "list_files") {
         const std::string glob = arg_str(call.args, "glob");

@@ -33,6 +33,7 @@ add_executable(ultima_test
     unit/test_tools.cpp
     unit/test_session.cpp
     unit/test_permissions.cpp
+    unit/test_skills.cpp
 )
 
 target_link_libraries(ultima_test

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ultima/server/skills.hpp"
 #include "ultima/server/workspace.hpp"
 
 #include <nlohmann/json.hpp>
@@ -69,6 +70,10 @@ std::string canonical_tool_name(std::string_view raw);
 
 // Run one call against the workspace. Never throws: a malformed argument set
 // comes back as ok=false with a message telling the model what was wrong.
-ToolResult dispatch_tool(Workspace& ws, const ToolCall& call);
+//
+// `skills` may be null, in which case use_skill reports that none are
+// available rather than failing in a way the model cannot interpret.
+ToolResult dispatch_tool(Workspace& ws, const ToolCall& call,
+                         const SkillIndex* skills = nullptr);
 
 } // namespace ultima::server

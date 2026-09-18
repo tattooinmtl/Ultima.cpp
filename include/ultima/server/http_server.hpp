@@ -37,6 +37,11 @@ struct ServerConfig {
     // What the coding agent may do unattended: "auto" | "ask" | "yolo".
     // Unrecognized text falls back to "auto". See PERMISSIONS.md.
     std::string     permission_mode = "auto";
+
+    // Hard ceiling on one agent turn, in seconds. A turn holds the model
+    // mutex, so one that nobody is waiting for blocks everything behind it.
+    // 0 disables the cap.
+    std::size_t     max_turn_seconds = 600;
 };
 
 class HttpServer {
