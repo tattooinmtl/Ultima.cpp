@@ -41,7 +41,14 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
       workspace still held only that file and the pre-existing README. The Plan
       panel renders it, checking a phase off advances the active one and appends
       to .ultima/CHANGELOG.md. 210 unit tests.
-- [ ] Phase 5: Full-stack session — project scaffolding templates, the sandbox
+- [x] Phase 5: Permissions — three modes (auto / ask / yolo), an always-ask set
+      (destructive, escaping the project, plan edits, installs, execution), a
+      reason on every prompt, and reads never gated. See PERMISSIONS.md.
+      Provable by: a delete asks even in auto mode, an ordinary write does not,
+      denial reaches the model as a tool result, and yolo skips both.
+      **Done 2026-09-18.** All four verified live against the 7B. 230 unit
+      tests. The live run caught a gate bypass - see Notes.
+- [ ] Phase 6: Full-stack session — project scaffolding templates, the sandbox
       run tools from Decision 16 §16.3, and a live preview pane. Provable by
       "build me a todo app" producing a running page.
 
@@ -74,6 +81,15 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
   Parsing now retries with the quotes normalized, but only after a strict parse
   has already failed, so content that legitimately contains curly quotes is
   untouched.
+- Phase 5 caught a real gate bypass, and only because it was tested live. The
+  model called `delete_project`; the dispatcher resolves that to `delete_file`
+  by its leading verb, but `classify()` was comparing the RAW name, saw an
+  ordinary write, and deleted the file with no prompt. Anything that reasons
+  about a call must judge the tool that will actually run. The same class of
+  mismatch bit twice more in one session: the permission layer normalized a
+  leading slash before the dispatcher did, and accepted `file_path` when the
+  dispatcher did not. Rule of thumb: the gate and the dispatcher must agree
+  about every argument, or the gate is decoration.
 - Open, and the honest state of Phase 2: the loop, parsing, dispatch and
   events are solid, but a 7B given a two-step task ("read it, then edit it")
   frequently stops after one failed call rather than recovering. That is a

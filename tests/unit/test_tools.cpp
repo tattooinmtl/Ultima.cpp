@@ -475,3 +475,22 @@ TEST_CASE("parse_tool_calls: a well-formed call keeps curly quotes in its conten
     REQUIRE(calls.size() == 1);
     CHECK(calls[0].args["content"] == body);
 }
+
+TEST_CASE("dispatch: the path argument is accepted under its common synonyms") {
+    // Observed live: the model passed "file_path" to a delete. The permission
+    // layer understood it and prompted correctly, then the dispatcher bounced
+    // the call for a missing 'path' - the two disagreed about the same call.
+    TempWorkspace tmp;
+    auto ws = tmp.open();
+
+    for (const char* key : {"path", "file_path", "filepath", "filename", "file", "target"}) {
+        tmp.write("victim.js", "x");
+        nlohmann::json args;
+        args[key] = "victim.js";
+        ToolCall c;
+        c.name = "delete_file";
+        c.args = args;
+        const auto r = dispatch_tool(ws, c);
+        CHECK_MESSAGE(r.ok, "path synonym not accepted: ", key);
+    }
+}

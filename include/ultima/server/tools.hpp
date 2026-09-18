@@ -61,6 +61,12 @@ std::string strip_tool_calls(std::string_view text);
 // each delta and emit only what is new.
 std::string visible_prose_prefix(std::string_view accumulated);
 
+// Resolve what the model emitted onto a real tool name: separator and case
+// drift, aliases, and a leading-verb fallback. Exposed because anything that
+// reasons about a call (the permission layer, above all) must judge the tool
+// that will actually run, not the string the model typed.
+std::string canonical_tool_name(std::string_view raw);
+
 // Run one call against the workspace. Never throws: a malformed argument set
 // comes back as ok=false with a message telling the model what was wrong.
 ToolResult dispatch_tool(Workspace& ws, const ToolCall& call);

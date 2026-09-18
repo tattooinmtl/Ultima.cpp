@@ -33,6 +33,10 @@ struct ServerConfig {
     // Root the Coder IDE's file operations are confined to (Decision 18).
     // Every /api/fs/* path resolves against this and may not escape it.
     std::string     workspace_root = ".";
+
+    // What the coding agent may do unattended: "auto" | "ask" | "yolo".
+    // Unrecognized text falls back to "auto". See PERMISSIONS.md.
+    std::string     permission_mode = "auto";
 };
 
 class HttpServer {

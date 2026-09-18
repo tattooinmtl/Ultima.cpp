@@ -158,6 +158,8 @@ bool arg_bool(const json& args, const char* key, bool dflt) {
     return dflt;
 }
 
+} // namespace
+
 // Map what the model actually emitted onto a real tool name.
 //
 // Observed from Qwen2.5-Coder-7B on the first live run: it called
@@ -245,6 +247,8 @@ std::string canonical_tool_name(std::string_view raw) {
     }
     return n;
 }
+
+namespace {
 
 // A model writing "/hello.js" means the project root, not the filesystem root.
 // resolve() rightly refuses absolute paths, so normalize here instead of
@@ -494,9 +498,21 @@ ToolResult dispatch_tool(Workspace& ws, const ToolCall& call) {
         bool found = false;
         into = arg_str(call.args, key, &found);
         const std::string_view k{key};
-        if (found && (k == "path" || k == "from" || k == "to")) {
-            into = normalize_tool_path(into);
+        const bool is_path = (k == "path" || k == "from" || k == "to");
+
+        // Models rename the path argument constantly - "file_path" was
+        // observed live, and cost a whole round. Accept the obvious synonyms
+        // rather than bouncing a call whose intent is unambiguous. The
+        // permission layer accepts the same set, so the gate and the
+        // dispatcher never disagree about what a call is doing.
+        if (!found && is_path) {
+            for (const char* alt : {"file_path", "filepath", "filename",
+                                    "file", "target"}) {
+                into = arg_str(call.args, alt, &found);
+                if (found) break;
+            }
         }
+        if (found && is_path) into = normalize_tool_path(into);
         return found;
     };
     // A bare "missing argument X" leaves a small model with nowhere to go; it

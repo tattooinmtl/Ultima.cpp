@@ -41,7 +41,7 @@ int print_help() {
         "  ultima archs                                  list known architectures and their status\n"
         "  ultima scan <dir>                             report which GGUFs in <dir> Ultima can run\n"
         "  ultima run <path.gguf> [--prompt S] [--n-predict N]  one-shot completion, then exit\n"
-        "  ultima serve <path.gguf> [--port N] [--host H] [--workspace DIR]  HTTP API + Coder IDE\n"
+        "  ultima serve <path.gguf> [--port N] [--host H] [--workspace DIR] [--permissions auto|ask|yolo]  HTTP API + Coder IDE\n"
         "\n"
         "Defaults for `run`:\n"
         "  --prompt \"def fibonacci(n):\"                greedy (--temp 0) so runs are reproducible\n"
@@ -187,6 +187,7 @@ int serve(int argc, char** argv) {
     std::size_t   n_ctx = 4096;
     std::size_t   n_threads = 0;   // 0 => pool default
     std::string   workspace = ".";   // Coder IDE file root (Decision 18)
+    std::string   permissions = "auto";  // auto | ask | yolo (PERMISSIONS.md)
 
     for (int i = 3; i < argc; ++i) {
         std::string_view a = argv[i];
@@ -202,6 +203,7 @@ int serve(int argc, char** argv) {
         else if (a == "--n-ctx")     n_ctx    = static_cast<std::size_t>(std::stoi(next("--n-ctx")));
         else if (a == "--n-threads") n_threads = static_cast<std::size_t>(std::stoi(next("--n-threads")));
         else if (a == "--workspace")  workspace = next("--workspace");
+        else if (a == "--permissions") permissions = next("--permissions");
         else {
             std::fprintf(stderr, "ultima serve: unknown flag '%.*s'\n",
                          static_cast<int>(a.size()), a.data());
@@ -273,6 +275,7 @@ int serve(int argc, char** argv) {
     cfg.bind_host = host;
     cfg.bind_port = port;
     cfg.workspace_root = workspace;
+    cfg.permission_mode = permissions;
 
     std::printf("\nServing on http://%s:%u/  (testpad at /)\n", host.c_str(), port);
     ultima::server::HttpServer srv{std::move(ctx), cfg};

@@ -16,6 +16,38 @@ The model is expected to append here after every completed task, in the same req
 
 <!-- newest at the top -->
 
+2026-09-18 coder-ide-p5  Phase 5 done - agent permissions. The live test caught a gate bypass.
+    NEW PERMISSIONS.md - the user-facing contract.
+    NEW src/server/permissions.{hpp,cpp} - three modes and seven risk classes.
+      * auto (default): ordinary writes pass; the always-ask set asks.
+      * ask: every mutation asks.
+      * yolo: nothing asks, and the UI says so before switching.
+      * Always-ask set: destructive, escaping the project, plan edits, installs,
+        command execution. Reads (read_file, list_files) are never gated in any mode -
+        gating reads trains the user to approve without looking.
+      * Every prompt carries the tool, the subject and a plain-language reason.
+      * "Always allow this kind" remembers one risk class for the session only, never to disk.
+        Denials are not remembered. Changing mode clears the blanket approvals.
+    NEW POST /api/permission (answer a parked prompt), GET/POST /api/permissions (mode).
+      SSE gains permission_request / permission_result. The generating turn parks on a condvar
+      until the answer lands; 120s with no answer is a denial, because silence is not consent.
+    ui/testpad - prompt card with Allow / Always / Deny in the terminal panel, and a mode
+      selector in the Coder tab that confirms before switching to yolo.
+    CLI: ultima serve --permissions auto|ask|yolo. Unknown text falls back to auto, never yolo.
+    THE BUG THE LIVE TEST CAUGHT: the 7B called "delete_project". The dispatcher resolves that
+      to delete_file by its leading verb, but classify() compared the RAW name, saw an ordinary
+      write, and auto mode deleted the file with NO prompt - the exact failure this layer exists
+      to prevent. classify() now canonicalizes first. Two more instances of the same class of
+      mismatch surfaced in the same session: the permission layer normalized a leading slash
+      before the dispatcher did (so ordinary writes prompted), and it accepted "file_path" when
+      the dispatcher did not (so an approved delete then failed). The gate and the dispatcher
+      must agree about every argument or the gate is decoration.
+    Verified live against Qwen2.5-Coder-7B: auto lets an ordinary write through silently; a
+      delete prompts and the file is still on disk while the prompt is open; deny returns
+      "Permission denied by the user." to the model and the file survives; allow completes it;
+      yolo deletes with no prompt at all. 230 unit tests pass.
+
+
 2026-09-17 coder-ide-p4  Phase 4 done - phased planning. Also found the cause of the silent empty turns from Phase 2.
     NEW src/server/session.{hpp,cpp} - the workflow state lives in the workspace, not in memory:
       .ultima/plan.md (phase list, hand-editable), .ultima/todos.json (subtasks), .ultima/CHANGELOG.md

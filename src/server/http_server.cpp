@@ -12,13 +12,16 @@
 #include "ultima/model/imodel.hpp"
 #include "ultima/sampler/sampler.hpp"
 #include "ultima/tokenizer/chat_template.hpp"
+#include "ultima/server/permissions.hpp"
 #include "ultima/server/session.hpp"
 #include "ultima/server/tools.hpp"
 #include "ultima/server/workspace.hpp"
 #include "ultima/tokenizer/tokenizer.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <optional>
+#include <unordered_map>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -395,6 +398,17 @@ struct HttpServer::Impl {
     // startup error rather than thrown from a constructor.
     std::optional<Workspace> ws;
     std::mutex     ws_mutex;      // file ops are not otherwise serialized
+
+    // ---- Permissions (PERMISSIONS.md) ----
+    // A prompt is emitted on the agent's SSE stream and answered by a separate
+    // POST, so the generating thread parks on `perm_cv` until the answer lands
+    // or the wait times out. Answers live only for the process.
+    PermissionMode          perm_mode = PermissionMode::Auto;
+    std::vector<Risk>       perm_session_allowed;
+    std::mutex              perm_mutex;
+    std::condition_variable perm_cv;
+    std::unordered_map<std::string, std::string> perm_answers;  // id -> allow|always|deny
+    std::uint64_t           perm_next_id = 1;
 };
 
 HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
@@ -618,6 +632,56 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                                       plan->phases[number - 1].text);
             }
             res.set_content(plan_to_json(*plan).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    // ---- /api/permission — answer a parked prompt -----------------------
+    svr.Post("/api/permission", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        try {
+            const auto body = json::parse(req.body);
+            const auto id  = body.at("id").get<std::string>();
+            auto decision  = body.value("decision", std::string{"deny"});
+            if (decision != "allow" && decision != "always") decision = "deny";
+            {
+                std::lock_guard<std::mutex> lk{state.perm_mutex};
+                state.perm_answers[id] = decision;
+            }
+            state.perm_cv.notify_all();
+            res.set_content(json{{"id", id}, {"decision", decision}}.dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
+
+    // ---- /api/permissions — the current mode ----------------------------
+    svr.Get("/api/permissions", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        std::lock_guard<std::mutex> lk{state.perm_mutex};
+        json allowed = json::array();
+        for (auto r : state.perm_session_allowed) allowed.push_back(to_string(r));
+        res.set_content(json{{"mode", to_string(state.perm_mode)},
+                             {"session_allowed", allowed}}.dump(), "application/json");
+    });
+
+    svr.Post("/api/permissions", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth_token(state.cfg.auth_token, req, res)) return;
+        try {
+            const auto body = json::parse(req.body);
+            const auto mode = parse_permission_mode(body.value("mode", std::string{"auto"}));
+            {
+                std::lock_guard<std::mutex> lk{state.perm_mutex};
+                state.perm_mode = mode;
+                // Changing the mode clears blanket approvals: they were granted
+                // under the old policy and should not survive a tightening.
+                state.perm_session_allowed.clear();
+            }
+            res.set_content(json{{"mode", to_string(mode)}}.dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
@@ -943,14 +1007,69 @@ HttpServer::HttpServer(RuntimeContext ctx, ServerConfig cfg)
                                                {"arguments", c.args},
                                                {"round", round}});
 
+                        // Permission gate (PERMISSIONS.md). Reads are never
+                        // gated; ordinary writes pass in auto; the always-ask
+                        // set parks here until the user answers.
+                        ToolResult tr;
+                        bool refused = false;
+                        {
+                            Verdict verdict;
+                            {
+                                std::lock_guard<std::mutex> plk{s.perm_mutex};
+                                verdict = evaluate(s.perm_mode, c, s.perm_session_allowed);
+                            }
+                            if (verdict.needs_prompt) {
+                                std::string pid;
+                                {
+                                    std::lock_guard<std::mutex> plk{s.perm_mutex};
+                                    pid = "perm-" + std::to_string(s.perm_next_id++);
+                                }
+                                emit("permission_request", json{
+                                    {"id", pid},
+                                    {"tool", c.name},
+                                    {"risk", to_string(verdict.risk)},
+                                    {"reason", verdict.reason},
+                                    {"subject", verdict.subject},
+                                    {"arguments", c.args}});
+
+                                std::string answer = "deny";
+                                {
+                                    std::unique_lock<std::mutex> plk{s.perm_mutex};
+                                    // Silence is never consent: an unanswered
+                                    // prompt times out as a denial.
+                                    const bool got = s.perm_cv.wait_for(
+                                        plk, std::chrono::seconds(120),
+                                        [&] { return s.perm_answers.count(pid) > 0; });
+                                    if (got) {
+                                        answer = s.perm_answers[pid];
+                                        s.perm_answers.erase(pid);
+                                    }
+                                    if (answer == "always") {
+                                        s.perm_session_allowed.push_back(verdict.risk);
+                                    }
+                                }
+                                emit("permission_result", json{{"id", pid}, {"decision", answer}});
+
+                                if (answer == "deny") {
+                                    tr.name = c.name;
+                                    tr.ok = false;
+                                    tr.content = "Permission denied by the user. Do not retry "
+                                                 "this call; try a different approach or stop "
+                                                 "and ask what they would prefer.";
+                                    refused = true;
+                                }
+                            }
+                        }
+
                         // In planning mode the only legal act is writing the
                         // plan. Refusing anything else here is what stops a
                         // model from "helpfully" starting the work as well.
-                        ToolResult tr;
                         const std::string target = c.args.value("path", std::string{});
                         const bool writes_plan =
                             target.find("plan.md") != std::string::npos;
-                        if (planning && !writes_plan) {
+                        if (refused) {
+                            // already filled in above
+                        } else if (planning && !writes_plan) {
                             tr.name = c.name;
                             tr.ok = false;
                             tr.content =
@@ -1033,6 +1152,7 @@ Result<void> HttpServer::listen_blocking() {
         auto ws = Workspace::open(impl_->cfg.workspace_root);
         if (!ws) return Failure{ws.error()};
         impl_->ws.emplace(std::move(*ws));
+        impl_->perm_mode = parse_permission_mode(impl_->cfg.permission_mode);
     }
 
     if (!impl_->svr.listen(impl_->cfg.bind_host.c_str(),
