@@ -10,6 +10,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <span>
@@ -51,7 +52,7 @@ public:
         if (!tensors) return Failure{tensors.error()};
         tensors_ = std::move(*tensors);
 
-        scratch_.init(dims_, params_);
+        scratch_.init(dims_, params_, k_prefill_batch);
         scratch_.fold = fold_ ? &*fold_ : nullptr;
         if (auto r = preload_scratch_from_tensors(scratch_, tensors_, dims_, params_); !r)
             return r;
@@ -97,14 +98,19 @@ public:
                             "transformer_model");
             }
         }
-        for (std::size_t i = 0; i < tokens.size(); ++i) {
-            const std::size_t abs_pos = start_pos + i;
-            const bool is_last = (i + 1 == tokens.size());
-            if (auto r = forward_one(kv, slot, tokens[i], abs_pos,
-                                     is_last ? out_logits : nullptr); !r)
+        // Run the prompt in chunks so each projection streams its weights
+        // once for the whole chunk instead of once per token. Only the very
+        // last token's logits are wanted, so every earlier chunk skips the
+        // vocab-sized output matmul entirely.
+        for (std::size_t i = 0; i < tokens.size(); i += k_prefill_batch) {
+            const std::size_t n = std::min(k_prefill_batch, tokens.size() - i);
+            const bool last_chunk = (i + n == tokens.size());
+            if (auto r = forward_batch(kv, slot, tokens.data() + i, n, start_pos + i,
+                                       last_chunk ? out_logits : nullptr); !r) {
                 return r;
-            kv.commit_token(slot, tokens[i]);
-            if (params_.delta.active()) rstate_->advance(slot, 1);
+            }
+            for (std::size_t j = 0; j < n; ++j) kv.commit_token(slot, tokens[i + j]);
+            if (params_.delta.active()) rstate_->advance(slot, n);
         }
         return {};
     }
@@ -114,53 +120,65 @@ public:
                         std::int32_t token,
                         float* out_logits) override {
         const std::size_t abs_pos = kv.pos(slot);
-        if (auto r = forward_one(kv, slot, token, abs_pos, out_logits); !r) return r;
+        if (auto r = forward_batch(kv, slot, &token, 1, abs_pos, out_logits); !r) return r;
         kv.commit_token(slot, token);
         if (params_.delta.active()) rstate_->advance(slot, 1);
         return {};
     }
 
 private:
-    Result<void> forward_one(kv_cache::KVCache& kv,
-                             kv_cache::SlotHandle slot,
-                             std::int32_t token,
-                             std::size_t abs_pos,
-                             float* out_logits) {
-        // 1. Embedding lookup for the input token.
-        if (token < 0 || static_cast<std::size_t>(token) >= dims_.vocab) {
-            return fail(ErrorCode::InvalidModel,
-                        fmt::format("token id {} out of vocab [0, {})",
-                                    token, dims_.vocab),
-                        "transformer_model");
-        }
-        if (auto r = read_row(tensors_.token_embd.dtype, tensors_.token_embd.data,
-                              static_cast<std::size_t>(token), dims_.hidden,
-                              scratch_.x.data()); !r) return r;
+    // `n_tok` consecutive tokens starting at `start_pos`. Writes logits for
+    // the LAST token only, which is all any caller needs: prefill wants the
+    // token after the prompt, and decode has one token anyway.
+    Result<void> forward_batch(kv_cache::KVCache& kv,
+                               kv_cache::SlotHandle slot,
+                               const std::int32_t* tokens,
+                               std::size_t n_tok,
+                               std::size_t start_pos,
+                               float* out_logits) {
+        if (n_tok == 0) return {};
 
-        // A Hadamard-latent embedding table stores rotated rows, so the
-        // primal basis has to be restored right after the lookup: h = s * (H z).
-        if (fold_ && fold_->is_inverse("token_embd.weight")) {
-            kernels::hadamard_unfold_f32(scratch_.x.data(), scratch_.x.data(),
-                                         dims_.hidden, fold_->block,
-                                         fold_->signs_for(dims_.hidden));
-        }
+        // 1. Embedding lookup for each token in the chunk.
+        for (std::size_t t = 0; t < n_tok; ++t) {
+            const std::int32_t token = tokens[t];
+            if (token < 0 || static_cast<std::size_t>(token) >= dims_.vocab) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("token id {} out of vocab [0, {})",
+                                        token, dims_.vocab),
+                            "transformer_model");
+            }
+            float* dst = scratch_.x.data() + t * dims_.hidden;
+            if (auto r = read_row(tensors_.token_embd.dtype, tensors_.token_embd.data,
+                                  static_cast<std::size_t>(token), dims_.hidden,
+                                  dst); !r) return r;
 
-        // Granite scales the embedding before the first block.
-        if (params_.embedding_scale != 1.0f) {
-            for (std::size_t i = 0; i < dims_.hidden; ++i)
-                scratch_.x[i] *= params_.embedding_scale;
+            // A Hadamard-latent embedding table stores rotated rows, so the
+            // primal basis has to be restored right after the lookup:
+            // h = s * (H z).
+            if (fold_ && fold_->is_inverse("token_embd.weight")) {
+                kernels::hadamard_unfold_f32(dst, dst, dims_.hidden, fold_->block,
+                                             fold_->signs_for(dims_.hidden));
+            }
+
+            // Granite scales the embedding before the first block.
+            if (params_.embedding_scale != 1.0f) {
+                for (std::size_t i = 0; i < dims_.hidden; ++i)
+                    dst[i] *= params_.embedding_scale;
+            }
         }
 
         // 2. Transformer stack.
         for (std::size_t L = 0; L < dims_.n_layers; ++L) {
             if (auto r = block_forward(scratch_, tensors_.blocks[L],
                                        dims_, params_, rope_, kv, slot, L,
-                                       abs_pos, pool_, rstate_.get()); !r) return r;
+                                       start_pos, n_tok, pool_, rstate_.get()); !r)
+                return r;
         }
 
-        // 3. If logits requested, finalize.
+        // 3. If logits requested, finalize from the last token's row.
         if (out_logits) {
-            kernels::rmsnorm_f32(scratch_.x.data(),
+            const float* last = scratch_.x.data() + (n_tok - 1) * dims_.hidden;
+            kernels::rmsnorm_f32(last,
                                  scratch_.output_norm_f32.data(),
                                  scratch_.x_norm.data(),
                                  dims_.hidden, dims_.rms_eps);
@@ -194,6 +212,12 @@ private:
     // Matches the KV cache's slot count; both are indexed by the same
     // SlotHandle, so they must agree.
     static constexpr std::size_t k_state_slots = 8;
+
+    // Prompt tokens processed per forward pass. Wider means each
+    // projection streams its weights once for more tokens; the
+    // measured curve (benchmarks/bench_gemm) is still climbing at 32,
+    // and 32 costs about 15 MiB of scratch on the widest model here.
+    static constexpr std::size_t k_prefill_batch = 32;
     std::unique_ptr<kv_cache::RecurrentState> rstate_;
 
     std::optional<HadamardFold> fold_;

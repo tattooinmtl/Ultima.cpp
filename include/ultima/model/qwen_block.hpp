@@ -16,7 +16,13 @@ namespace ultima::model {
 
 // Per-model scratch: sized once from ModelDims + ArchParams and reused across
 // every forward-pass call. Nothing here is allocated in the hot path.
+//
+// Every activation buffer holds up to `max_batch` tokens, laid out
+// token-major so one token's vector is contiguous — that is what the
+// batched projection path needs for its X operand. Decode is simply the
+// one-token case and touches only the first slice.
 struct BlockScratch {
+    std::size_t max_batch = 1;
     std::vector<float> x;            // hidden — residual stream
     std::vector<float> residual;     // hidden — saved branch input
     std::vector<float> x_norm;       // hidden — pre-norm output
@@ -86,12 +92,19 @@ struct BlockScratch {
     std::vector<float>  fold_buf;
     std::vector<float>  fold_perm;   // gdn v reorder, ssm_out only
 
-    void init(const ModelDims& d, const ArchParams& p);
+    void init(const ModelDims& d, const ArchParams& p,
+              std::size_t max_batch_tokens = 1);
 };
 
-// One layer's forward pass. Consumes and produces the residual stream in
-// scratch.x (in-place). Writes the layer's K/V into the KV cache at the
-// given absolute position; attention reads positions [0, position+1).
+// One layer's forward pass over `n_tok` consecutive tokens starting at
+// `start_position`. Consumes and produces the residual stream in scratch.x
+// (in-place), token-major. Writes each token's K/V into the cache and
+// attends causally, so token t sees positions [0, start_position + t].
+//
+// There is deliberately no separate single-token entry point: decode is
+// n_tok == 1, and the projection dispatch falls back to a fused matvec
+// below the batching crossover. Two code paths here would be two chances
+// for prefill and decode to disagree.
 //
 // Covers every llama-family layout in the arch registry: `params` selects
 // between separate/fused QKV, dense/fused/MoE feed-forward, the RoPE
@@ -105,7 +118,8 @@ block_forward(BlockScratch& s,
               kv_cache::KVCache& kv,
               kv_cache::SlotHandle slot,
               std::size_t layer,
-              std::size_t absolute_position,
+              std::size_t start_position,
+              std::size_t n_tok,
               runtime::ThreadPool& pool,
               kv_cache::RecurrentState* rs = nullptr);
 

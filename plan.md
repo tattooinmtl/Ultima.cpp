@@ -182,7 +182,9 @@ acceptance rate. The drafter is blocked on this, and batched prefill is
 independently the largest perf item in the project: prompt processing is
 7.3x slower than the reference, which for a coding IDE is the dominant cost.
 
-- [ ] Q7: batched prefill. A GEMM path so N tokens stream the weights once
+- [x] Q7: **Done 2026-09-18.** Prefill 4.3 -> 8.8 tok/s on Qwopus (2.05x);
+      dense 7B now prefills at 2.7x its decode rate where it was 1.1x. Gap
+      to llama.cpp narrowed from 7.3x to 3.8x. Batched prefill. A GEMM path so N tokens stream the weights once
       instead of N times. Prerequisite for everything below, and the win on
       its own. Note the delta-net layers are sequential in time and cannot
       batch the same way -- llama.cpp uses a chunked formulation there.

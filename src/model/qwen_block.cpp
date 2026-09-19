@@ -49,10 +49,14 @@ inline void trace(const char* name, std::size_t layer,
 // share an activation: the transform is O(width log block) against a
 // matvec's O(rows * width), which at these shapes is well under a percent.
 const float* folded_input(BlockScratch& s, const WeightRef& w,
-                          const float* x, std::size_t width) {
-    if (!w.hadamard_folded || !s.fold) return x;
-    kernels::hadamard_fold_f32(x, s.fold_buf.data(), width,
-                               s.fold->block, s.fold->signs_for(width));
+                          const float* X, std::size_t width,
+                          std::size_t n_tok) {
+    if (!w.hadamard_folded || !s.fold) return X;
+    const float* signs = s.fold->signs_for(width);
+    for (std::size_t t = 0; t < n_tok; ++t) {
+        kernels::hadamard_fold_f32(X + t * width, s.fold_buf.data() + t * width,
+                                   width, s.fold->block, signs);
+    }
     return s.fold_buf.data();
 }
 
@@ -160,47 +164,62 @@ inline void gated_act(FfnAct act, const float* gate, const float* up,
 
 Result<void>
 ffn_dense(BlockScratch& s, const ModelTensors::Block& b,
-          const ModelDims& d, const ArchParams& p, runtime::ThreadPool& pool) {
-    if (auto r = matvec_dispatch_threaded(pool, b.ffn_gate.dtype, b.ffn_gate.data,
-                                          folded_input(s, b.ffn_gate, s.x_norm.data(), d.hidden),
+          const ModelDims& d, const ArchParams& p, std::size_t n_tok,
+          runtime::ThreadPool& pool) {
+    if (auto r = matmul_dispatch_threaded(pool, b.ffn_gate.dtype, b.ffn_gate.data,
+                                          folded_input(s, b.ffn_gate, s.x_norm.data(), d.hidden, n_tok),
                                           s.gate.data(),
-                                          d.ffn_hidden, d.hidden); !r) return r;
-    if (auto r = matvec_dispatch_threaded(pool, b.ffn_up.dtype, b.ffn_up.data,
-                                          folded_input(s, b.ffn_up, s.x_norm.data(), d.hidden),
+                                          d.ffn_hidden, d.hidden, n_tok); !r) return r;
+    if (auto r = matmul_dispatch_threaded(pool, b.ffn_up.dtype, b.ffn_up.data,
+                                          folded_input(s, b.ffn_up, s.x_norm.data(), d.hidden, n_tok),
                                           s.up.data(),
-                                          d.ffn_hidden, d.hidden); !r) return r;
-    gated_act(p.ffn_act, s.gate.data(), s.up.data(), s.gate.data(), d.ffn_hidden);
-    return matvec_dispatch_threaded(pool, b.ffn_down.dtype, b.ffn_down.data,
-                                    folded_input(s, b.ffn_down, s.gate.data(), d.ffn_hidden),
+                                          d.ffn_hidden, d.hidden, n_tok); !r) return r;
+    gated_act(p.ffn_act, s.gate.data(), s.up.data(), s.gate.data(), n_tok * d.ffn_hidden);
+    return matmul_dispatch_threaded(pool, b.ffn_down.dtype, b.ffn_down.data,
+                                    folded_input(s, b.ffn_down, s.gate.data(), d.ffn_hidden, n_tok),
                                     s.x.data(),
-                                    d.hidden, d.ffn_hidden);
+                                    d.hidden, d.ffn_hidden, n_tok);
 }
 
 // Phi-3 packs gate and up into one matrix stacked on the output axis, with
 // gate first. One matvec produces both halves.
 Result<void>
 ffn_fused(BlockScratch& s, const ModelTensors::Block& b,
-          const ModelDims& d, const ArchParams& p, runtime::ThreadPool& pool) {
-    if (auto r = matvec_dispatch_threaded(pool, b.ffn_up.dtype, b.ffn_up.data,
+          const ModelDims& d, const ArchParams& p, std::size_t n_tok,
+          runtime::ThreadPool& pool) {
+    if (auto r = matmul_dispatch_threaded(pool, b.ffn_up.dtype, b.ffn_up.data,
                                           s.x_norm.data(), s.gate.data(),
-                                          2 * d.ffn_hidden, d.hidden); !r) return r;
-    float* gate_half = s.gate.data();
-    float* up_half   = s.gate.data() + d.ffn_hidden;
-    gated_act(p.ffn_act, gate_half, up_half, gate_half, d.ffn_hidden);
-    return matvec_dispatch_threaded(pool, b.ffn_down.dtype, b.ffn_down.data,
-                                    gate_half, s.x.data(),
-                                    d.hidden, d.ffn_hidden);
+                                          2 * d.ffn_hidden, d.hidden, n_tok); !r) return r;
+    // gate||up are stacked per token, so the halves have to be recombined
+    // token by token and compacted to the narrower ffn width for ffn_down.
+    for (std::size_t t = 0; t < n_tok; ++t) {
+        const float* gate_half = s.gate.data() + t * 2 * d.ffn_hidden;
+        const float* up_half   = gate_half + d.ffn_hidden;
+        gated_act(p.ffn_act, gate_half, up_half,
+                  s.up.data() + t * d.ffn_hidden, d.ffn_hidden);
+    }
+    return matmul_dispatch_threaded(pool, b.ffn_down.dtype, b.ffn_down.data,
+                                    s.up.data(), s.x.data(),
+                                    d.hidden, d.ffn_hidden, n_tok);
 }
 
 // Sparse MoE: softmax the router over all experts, take the top-k, renormalize
 // those k to sum to 1, then accumulate each expert's SwiGLU output weighted by
 // its share. Matches llama.cpp's build_moe_ffn with norm_w=true, scale_w=false.
+// Not batched across tokens, deliberately: each token routes to its own
+// top-k experts, so there is no shared weight matrix to amortize. Batching
+// would mean grouping tokens by expert, which is worth doing only once a
+// MoE model is actually the bottleneck.
 Result<void>
-ffn_moe(BlockScratch& s, const ModelTensors::Block& b,
-        const ModelDims& d, const ArchParams& p, runtime::ThreadPool& pool) {
+ffn_moe_one(BlockScratch& s, const ModelTensors::Block& b,
+            const ModelDims& d, const ArchParams& p, std::size_t t,
+            runtime::ThreadPool& pool) {
+    const float* x_norm_t = s.x_norm.data() + t * d.hidden;
+    float*       x_t      = s.x.data()      + t * d.hidden;
+
     // Router over the full expert set.
     if (auto r = matvec_dispatch_threaded(pool, b.ffn_gate_inp.dtype, b.ffn_gate_inp.data,
-                                          s.x_norm.data(), s.router_probs.data(),
+                                          x_norm_t, s.router_probs.data(),
                                           p.n_expert, d.hidden); !r) return r;
     kernels::softmax_f32(s.router_probs.data(), s.router_probs.data(), p.n_expert);
 
@@ -219,11 +238,11 @@ ffn_moe(BlockScratch& s, const ModelTensors::Block& b,
 
         if (auto r = matvec_dispatch_threaded(pool, b.ffn_gate_exps.dtype,
                                               b.ffn_gate_exps.expert(e),
-                                              s.x_norm.data(), s.gate.data(),
+                                              x_norm_t, s.gate.data(),
                                               p.expert_ffn, d.hidden); !r) return r;
         if (auto r = matvec_dispatch_threaded(pool, b.ffn_up_exps.dtype,
                                               b.ffn_up_exps.expert(e),
-                                              s.x_norm.data(), s.up.data(),
+                                              x_norm_t, s.up.data(),
                                               p.expert_ffn, d.hidden); !r) return r;
         gated_act(p.ffn_act, s.gate.data(), s.up.data(), s.gate.data(), p.expert_ffn);
 
@@ -235,13 +254,19 @@ ffn_moe(BlockScratch& s, const ModelTensors::Block& b,
         for (std::size_t j = 0; j < d.hidden; ++j) s.moe_accum[j] += w * s.expert_out[j];
     }
 
-    std::copy(s.moe_accum.begin(), s.moe_accum.end(), s.x.begin());
+    std::copy_n(s.moe_accum.begin(), d.hidden, x_t);
     return {};
 }
 
-// The gated delta-net mixer, for one token. Replaces attention entirely on
-// three of every four qwen35 blocks: there is no KV here, only the slot's
-// recurrent state, which this both reads and advances.
+// The gated delta-net mixer. Replaces attention entirely on three of every
+// four qwen35 blocks: there is no KV here, only the slot's recurrent state,
+// which this both reads and advances.
+//
+// The projections batch across tokens, but the recurrence cannot: token t's
+// state depends on t-1, so the conv and the delta rule run strictly in
+// order. That split is the whole design here — the matmuls are nearly all
+// of the work and they batch; the sequential part touches only a fixed-size
+// state and is cheap.
 //
 // Reads s.x_norm (the attention pre-norm output) and writes s.x, so the
 // caller's residual add is unchanged.
@@ -249,13 +274,16 @@ Result<void>
 delta_net_forward(BlockScratch& s, const ModelTensors::Block& b,
                   const ModelDims& d, const ArchParams& p,
                   kv_cache::RecurrentState& rs, kv_cache::SlotHandle slot,
-                  std::size_t layer, runtime::ThreadPool& pool) {
+                  std::size_t layer, std::size_t n_tok,
+                  runtime::ThreadPool& pool) {
     const auto& dn = p.delta;
-    const std::size_t key_dim   = dn.key_dim();
-    const std::size_t v_dim     = dn.head_v_dim();
-    const std::size_t n_v       = dn.n_v_heads;
-    const std::size_t n_k       = dn.n_k_heads;
-    const std::size_t d_state   = dn.d_state;
+    const std::size_t key_dim = dn.key_dim();
+    const std::size_t v_dim   = dn.head_v_dim();
+    const std::size_t n_v     = dn.n_v_heads;
+    const std::size_t n_k     = dn.n_k_heads;
+    const std::size_t d_state = dn.d_state;
+    const std::size_t cdim    = dn.conv_dim();
+    const std::size_t vdim    = dn.value_dim();
 
     float* conv_state = rs.conv(slot, layer);
     if (!conv_state) {
@@ -264,145 +292,147 @@ delta_net_forward(BlockScratch& s, const ModelTensors::Block& b,
                     "delta_net");
     }
 
-    // 1. The fused q||k||v projection, and the output gate branch.
-    if (auto r = matvec_dispatch_threaded(pool, b.ssm_in.dtype, b.ssm_in.data,
-                                          folded_input(s, b.ssm_in, s.x_norm.data(), d.hidden),
-                                          s.dn_mixed.data(),
-                                          dn.conv_dim(), d.hidden); !r) return r;
-    if (auto r = matvec_dispatch_threaded(pool, b.ssm_gate.dtype, b.ssm_gate.data,
-                                          folded_input(s, b.ssm_gate, s.x_norm.data(), d.hidden),
-                                          s.dn_z.data(),
-                                          dn.value_dim(), d.hidden); !r) return r;
-
-    trace("linear_attn_qkv_mixed", layer, s.dn_mixed.data(), dn.conv_dim());
-
-    // 2. beta (the write strength) and the per-head decay.
-    if (auto r = matvec_dispatch_threaded(pool, b.ssm_beta.dtype, b.ssm_beta.data,
+    // ---- batched: every projection off the normed residual ---------------
+    if (auto r = matmul_dispatch_threaded(pool, b.ssm_in.dtype, b.ssm_in.data,
+                                          folded_input(s, b.ssm_in, s.x_norm.data(), d.hidden, n_tok),
+                                          s.dn_mixed.data(), cdim, d.hidden, n_tok); !r) return r;
+    if (auto r = matmul_dispatch_threaded(pool, b.ssm_gate.dtype, b.ssm_gate.data,
+                                          folded_input(s, b.ssm_gate, s.x_norm.data(), d.hidden, n_tok),
+                                          s.dn_z.data(), vdim, d.hidden, n_tok); !r) return r;
+    if (auto r = matmul_dispatch_threaded(pool, b.ssm_beta.dtype, b.ssm_beta.data,
                                           s.x_norm.data(), s.dn_beta.data(),
-                                          n_v, d.hidden); !r) return r;
-    if (auto r = matvec_dispatch_threaded(pool, b.ssm_alpha.dtype, b.ssm_alpha.data,
+                                          n_v, d.hidden, n_tok); !r) return r;
+    if (auto r = matmul_dispatch_threaded(pool, b.ssm_alpha.dtype, b.ssm_alpha.data,
                                           s.x_norm.data(), s.dn_alpha.data(),
-                                          n_v, d.hidden); !r) return r;
+                                          n_v, d.hidden, n_tok); !r) return r;
 
     const float* dt_bias = s.ssm_dt_bias.data() + layer * n_v;
     const float* a_log   = s.ssm_a.data()       + layer * n_v;
-    for (std::size_t h = 0; h < n_v; ++h) {
-        s.dn_beta[h] = 1.0f / (1.0f + std::exp(-s.dn_beta[h]));
-        s.dn_alpha[h] += dt_bias[h];
+    for (std::size_t i = 0; i < n_tok * n_v; ++i) {
+        s.dn_beta[i] = 1.0f / (1.0f + std::exp(-s.dn_beta[i]));
+        s.dn_alpha[i] += dt_bias[i % n_v];
     }
-    trace("alpha", layer, s.dn_alpha.data(), n_v);
-    kernels::softplus_f32(s.dn_alpha.data(), s.dn_alpha.data(), n_v);
-    trace("a_softplus", layer, s.dn_alpha.data(), n_v);
-    trace("beta_sigmoid", layer, s.dn_beta.data(), n_v);
-    for (std::size_t h = 0; h < n_v; ++h) {
+    kernels::softplus_f32(s.dn_alpha.data(), s.dn_alpha.data(), n_tok * n_v);
+    for (std::size_t i = 0; i < n_tok * n_v; ++i) {
         // ssm_a is stored already negated (-exp(A_log)), so the product is
         // negative and the decay lands in (0, 1).
-        s.dn_decay[h] = std::exp(s.dn_alpha[h] * a_log[h]);
+        s.dn_decay[i] = std::exp(s.dn_alpha[i] * a_log[i % n_v]);
     }
 
-    // 3. Causal depthwise conv over the q||k||v mix, then SiLU. This is the
-    //    only place the conv history is touched, and the kernel rolls it.
-    kernels::causal_conv1d_step_f32(conv_state, s.dn_mixed.data(),
-                                    s.ssm_conv_w.data() + layer * dn.conv_dim() * dn.d_conv,
-                                    s.dn_conv_out.data(), dn.conv_dim(), dn.d_conv);
-    trace("conv_output_raw", layer, s.dn_conv_out.data(), dn.conv_dim());
-    kernels::silu_f32(s.dn_conv_out.data(), s.dn_conv_out.data(), dn.conv_dim());
-    trace("conv_output_silu", layer, s.dn_conv_out.data(), dn.conv_dim());
+    trace("linear_attn_qkv_mixed", layer, s.dn_mixed.data(), cdim);
+    trace("alpha", layer, s.dn_alpha.data(), n_v);
+    trace("a_softplus", layer, s.dn_alpha.data(), n_v);
+    trace("beta_sigmoid", layer, s.dn_beta.data(), n_v);
 
-    const float* q_all = s.dn_conv_out.data();
-    const float* k_all = s.dn_conv_out.data() + key_dim;
-    const float* v_all = s.dn_conv_out.data() + 2 * key_dim;
-
-    trace("q_conv", layer, q_all, key_dim);
-    trace("k_conv", layer, k_all, key_dim);
-    trace("v_conv_predelta", layer, v_all, dn.value_dim());
-
-    // 4. The recurrence, one value head at a time.
+    // ---- sequential: conv history and the delta rule ---------------------
     const float q_scale = 1.0f / std::sqrt(static_cast<float>(d_state));
-    for (std::size_t h = 0; h < n_v; ++h) {
-        // Value head h reads key head h % n_k, NOT h / (n_v/n_k). The
-        // reference tiles q and k with ggml_repeat and the fused kernel
-        // indexes `iv1 % nek1`, both of which interleave. This is the
-        // opposite of the blocked mapping ordinary GQA attention uses, and
-        // getting it backwards still produces fluent output.
-        const std::size_t hk = h % n_k;
+    const float* conv_w = s.ssm_conv_w.data() + layer * cdim * dn.d_conv;
 
-        kernels::l2_norm_f32(q_all + hk * d_state, s.dn_qh.data(), d_state, d.rms_eps);
-        kernels::l2_norm_f32(k_all + hk * d_state, s.dn_kh.data(), d_state, d.rms_eps);
-        for (std::size_t i = 0; i < d_state; ++i) s.dn_qh[i] *= q_scale;
+    for (std::size_t t = 0; t < n_tok; ++t) {
+        float* conv_out = s.dn_conv_out.data() + t * cdim;
+        kernels::causal_conv1d_step_f32(conv_state, s.dn_mixed.data() + t * cdim,
+                                        conv_w, conv_out, cdim, dn.d_conv);
+        kernels::silu_f32(conv_out, conv_out, cdim);
+        if (t == 0) {
+            trace("conv_output_silu", layer, conv_out, cdim);
+        }
 
-        kernels::delta_net_step_f32(rs.delta_head(slot, layer, h),
-                                    s.dn_qh.data(), s.dn_kh.data(),
-                                    v_all + h * v_dim,
-                                    s.dn_decay[h], s.dn_beta[h],
-                                    s.dn_out.data() + h * v_dim,
-                                    s.dn_scratch.data(), d_state);
+        const float* q_all = conv_out;
+        const float* k_all = conv_out + key_dim;
+        const float* v_all = conv_out + 2 * key_dim;
+
+        for (std::size_t h = 0; h < n_v; ++h) {
+            // Value head h reads key head h % n_k, NOT h / (n_v/n_k). The
+            // reference tiles q and k with ggml_repeat and the fused kernel
+            // indexes `iv1 % nek1`, both of which interleave. This is the
+            // opposite of the blocked mapping ordinary GQA attention uses,
+            // and getting it backwards still produces fluent output.
+            const std::size_t hk = h % n_k;
+
+            kernels::l2_norm_f32(q_all + hk * d_state, s.dn_qh.data(), d_state, d.rms_eps);
+            kernels::l2_norm_f32(k_all + hk * d_state, s.dn_kh.data(), d_state, d.rms_eps);
+            for (std::size_t i = 0; i < d_state; ++i) s.dn_qh[i] *= q_scale;
+
+            kernels::delta_net_step_f32(rs.delta_head(slot, layer, h),
+                                        s.dn_qh.data(), s.dn_kh.data(),
+                                        v_all + h * v_dim,
+                                        s.dn_decay[t * n_v + h],
+                                        s.dn_beta[t * n_v + h],
+                                        s.dn_out.data() + t * vdim + h * v_dim,
+                                        s.dn_scratch.data(), d_state);
+        }
     }
+    trace("core_attn_out", layer, s.dn_out.data(), vdim);
 
-    trace("core_attn_out", layer, s.dn_out.data(), dn.value_dim());
-
-    // 5. Per-head RMSNorm of the readout, gated by silu(z).
+    // ---- batched again: gated norm and the output projection -------------
     const float* nw = s.ssm_norm.data() + layer * v_dim;
-    for (std::size_t h = 0; h < n_v; ++h) {
-        float* o = s.dn_out.data() + h * v_dim;
-        kernels::rmsnorm_f32(o, nw, o, v_dim, d.rms_eps);
+    for (std::size_t t = 0; t < n_tok; ++t) {
+        for (std::size_t h = 0; h < n_v; ++h) {
+            float* o = s.dn_out.data() + t * vdim + h * v_dim;
+            kernels::rmsnorm_f32(o, nw, o, v_dim, d.rms_eps);
+        }
     }
-    kernels::silu_f32(s.dn_z.data(), s.dn_z.data(), dn.value_dim());
-    kernels::mul_f32(s.dn_out.data(), s.dn_z.data(), s.dn_out.data(), dn.value_dim());
+    kernels::silu_f32(s.dn_z.data(), s.dn_z.data(), n_tok * vdim);
+    kernels::mul_f32(s.dn_out.data(), s.dn_z.data(), s.dn_out.data(), n_tok * vdim);
+    trace("final_output", layer, s.dn_out.data(), vdim);
 
-    trace("final_output", layer, s.dn_out.data(), dn.value_dim());
-
-    // 6. Output projection back into the residual width.
-    //
     // The fold for ssm_out was computed with the feature axis in grouped
     // head order [head_dim, rep, n_k_heads], but the recurrence emits tiled
     // order [head_dim, n_k_heads, rep]. Reorder before rotating, or the
     // signs line up with the wrong channels.
     const float* out_act = s.dn_out.data();
     if (b.ssm_out.hadamard_folded && s.fold && s.fold->gdn_v_grouped) {
-        hadamard_permute_gdn_v(s.dn_out.data(), s.fold_perm.data(),
-                               v_dim, n_k, n_v / n_k);
+        for (std::size_t t = 0; t < n_tok; ++t) {
+            hadamard_permute_gdn_v(s.dn_out.data() + t * vdim,
+                                   s.fold_perm.data() + t * vdim,
+                                   v_dim, n_k, n_v / n_k);
+        }
         out_act = s.fold_perm.data();
     }
-    return matvec_dispatch_threaded(pool, b.ssm_out.dtype, b.ssm_out.data,
-                                    folded_input(s, b.ssm_out, out_act, dn.value_dim()),
-                                    s.x.data(),
-                                    d.hidden, dn.value_dim());
+    return matmul_dispatch_threaded(pool, b.ssm_out.dtype, b.ssm_out.data,
+                                    folded_input(s, b.ssm_out, out_act, vdim, n_tok),
+                                    s.x.data(), d.hidden, vdim, n_tok);
 }
 
 } // namespace
 
-void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
-    x.assign(d.hidden, 0.0f);
-    residual.assign(d.hidden, 0.0f);
-    x_norm.assign(d.hidden, 0.0f);
-    q_full.assign(d.q_dim, 0.0f);
-    k_full.assign(d.kv_dim, 0.0f);
-    v_full.assign(d.kv_dim, 0.0f);
-    attn_out.assign(d.q_dim, 0.0f);
+void BlockScratch::init(const ModelDims& d, const ArchParams& p,
+                        std::size_t max_batch_tokens) {
+    const std::size_t B = std::max<std::size_t>(max_batch_tokens, 1);
+    max_batch = B;
+
+    x.assign(B * d.hidden, 0.0f);
+    residual.assign(B * d.hidden, 0.0f);
+    x_norm.assign(B * d.hidden, 0.0f);
+    q_full.assign(B * d.q_dim, 0.0f);
+    k_full.assign(B * d.kv_dim, 0.0f);
+    v_full.assign(B * d.kv_dim, 0.0f);
+    attn_out.assign(B * d.q_dim, 0.0f);
+    // Scores are per head per token and consumed immediately, so one
+    // token's worth is enough no matter how wide the batch is.
     attn_scores.assign(std::max<std::size_t>(d.n_ctx_train, 1), 0.0f);
     logits_tmp.assign(d.vocab, 0.0f);
 
     if (p.qkv == QkvKind::Fused) {
-        qkv_full.assign(d.q_dim + 2 * d.kv_dim, 0.0f);
+        qkv_full.assign(B * (d.q_dim + 2 * d.kv_dim), 0.0f);
     }
     if (p.qkv == QkvKind::SeparateQGate) {
-        qg_full.assign(2 * d.q_dim, 0.0f);
-        elem_gate.assign(d.q_dim, 0.0f);
+        qg_full.assign(B * 2 * d.q_dim, 0.0f);
+        elem_gate.assign(B * d.q_dim, 0.0f);
     }
     if (p.attn_gate) {
-        head_gate.assign(d.n_heads, 0.0f);
+        head_gate.assign(B * d.n_heads, 0.0f);
     }
 
     if (p.delta.active()) {
         const auto& dn = p.delta;
-        dn_mixed.assign(dn.conv_dim(), 0.0f);
-        dn_conv_out.assign(dn.conv_dim(), 0.0f);
-        dn_z.assign(dn.value_dim(), 0.0f);
-        dn_beta.assign(dn.n_v_heads, 0.0f);
-        dn_alpha.assign(dn.n_v_heads, 0.0f);
-        dn_decay.assign(dn.n_v_heads, 0.0f);
-        dn_out.assign(dn.value_dim(), 0.0f);
+        dn_mixed.assign(B * dn.conv_dim(), 0.0f);
+        dn_conv_out.assign(B * dn.conv_dim(), 0.0f);
+        dn_z.assign(B * dn.value_dim(), 0.0f);
+        dn_beta.assign(B * dn.n_v_heads, 0.0f);
+        dn_alpha.assign(B * dn.n_v_heads, 0.0f);
+        dn_decay.assign(B * dn.n_v_heads, 0.0f);
+        dn_out.assign(B * dn.value_dim(), 0.0f);
         dn_qh.assign(dn.d_state, 0.0f);
         dn_kh.assign(dn.d_state, 0.0f);
         dn_scratch.assign(dn.d_state, 0.0f);
@@ -418,12 +448,14 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
     // narrower per-expert width.
     switch (p.ffn) {
     case FfnKind::DenseSwiGLU:
-        gate.assign(d.ffn_hidden, 0.0f);
-        up.assign(d.ffn_hidden, 0.0f);
+        gate.assign(B * d.ffn_hidden, 0.0f);
+        up.assign(B * d.ffn_hidden, 0.0f);
         break;
     case FfnKind::FusedSwiGLU:
-        gate.assign(2 * d.ffn_hidden, 0.0f);
-        up.clear();
+        gate.assign(B * 2 * d.ffn_hidden, 0.0f);
+        // The fused path compacts gate*up down to the narrow width before
+        // ffn_down, so it needs the second buffer too once batched.
+        up.assign(B * d.ffn_hidden, 0.0f);
         break;
     case FfnKind::SparseMoE:
         gate.assign(p.expert_ffn, 0.0f);
@@ -441,8 +473,8 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
         std::size_t w = std::max({d.hidden, d.q_dim, d.ffn_hidden});
         if (p.delta.active()) w = std::max(w, p.delta.value_dim());
         if (p.ffn == FfnKind::SparseMoE) w = std::max(w, p.expert_ffn);
-        fold_buf.assign(w, 0.0f);
-        if (p.delta.active()) fold_perm.assign(p.delta.value_dim(), 0.0f);
+        fold_buf.assign(B * w, 0.0f);
+        if (p.delta.active()) fold_perm.assign(B * p.delta.value_dim(), 0.0f);
     }
 
     attn_norm.assign(d.n_layers * d.hidden, 0.0f);
@@ -525,18 +557,31 @@ block_forward(BlockScratch& s,
               kv_cache::KVCache& kv,
               kv_cache::SlotHandle slot,
               std::size_t layer,
-              std::size_t absolute_position,
+              std::size_t start_position,
+              std::size_t n_tok,
               runtime::ThreadPool& pool,
               kv_cache::RecurrentState* rs)
 {
-    // Save residual stream.
-    std::copy(s.x.begin(), s.x.end(), s.residual.begin());
+    if (n_tok == 0) return {};
+    if (n_tok > s.max_batch) {
+        return fail(ErrorCode::InvalidModel,
+                    fmt::format("block_forward got {} tokens but the scratch was "
+                                "sized for {}", n_tok, s.max_batch),
+                    "block_forward");
+    }
 
-    // 1. Attention pre-norm.
-    kernels::rmsnorm_f32(s.x.data(),
-                         s.attn_norm.data() + layer * dims.hidden,
-                         s.x_norm.data(), dims.hidden, dims.rms_eps);
-    trace("attn_norm", layer, s.x_norm.data(), dims.hidden);
+    const std::size_t H = dims.hidden;
+
+    // Save the residual stream for the attention branch.
+    std::copy_n(s.x.begin(), n_tok * H, s.residual.begin());
+
+    // 1. Attention pre-norm, per token.
+    for (std::size_t t = 0; t < n_tok; ++t) {
+        kernels::rmsnorm_f32(s.x.data() + t * H,
+                             s.attn_norm.data() + layer * H,
+                             s.x_norm.data() + t * H, H, dims.rms_eps);
+    }
+    trace("attn_norm", layer, s.x_norm.data(), H);
 
     // 2. Either the recurrent mixer or attention. A delta-net layer has no
     //    KV at all, so it short-circuits straight to the residual add.
@@ -547,202 +592,177 @@ block_forward(BlockScratch& s,
                                     layer),
                         "block_forward");
         }
-        if (auto r = delta_net_forward(s, block, dims, params, *rs, slot, layer, pool); !r)
-            return r;
-        scale_in_place(s.x.data(), params.residual_scale, dims.hidden);
-        kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), dims.hidden);
-
-        // FFN, identical to an attention layer's.
-        std::copy(s.x.begin(), s.x.end(), s.residual.begin());
-        kernels::rmsnorm_f32(s.x.data(),
-                             s.ffn_norm.data() + layer * dims.hidden,
-                             s.x_norm.data(), dims.hidden, dims.rms_eps);
-        switch (params.ffn) {
-        case FfnKind::DenseSwiGLU:
-            if (auto r = ffn_dense(s, block, dims, params, pool); !r) return r;
-            break;
-        case FfnKind::FusedSwiGLU:
-            if (auto r = ffn_fused(s, block, dims, params, pool); !r) return r;
-            break;
-        case FfnKind::SparseMoE:
-            if (auto r = ffn_moe(s, block, dims, params, pool); !r) return r;
-            break;
-        }
-        scale_in_place(s.x.data(), params.residual_scale, dims.hidden);
-        kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), dims.hidden);
-        return {};
-    }
-
-    if (params.qkv == QkvKind::SeparateQGate) {
-        // attn_q emits query and gate interleaved per head, so a head's
-        // 2*head_dim run is [query | gate]. Split them apart here; the gate
-        // is applied to the attention output further down.
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_q.dtype, block.attn_q.data,
-                                              folded_input(s, block.attn_q, s.x_norm.data(), dims.hidden),
-                                              s.qg_full.data(),
-                                              2 * dims.q_dim, dims.hidden); !r) return r;
-        for (std::size_t h = 0; h < dims.n_heads; ++h) {
-            const float* src = s.qg_full.data() + h * 2 * dims.head_dim;
-            std::memcpy(s.q_full.data()    + h * dims.head_dim, src,
-                        dims.head_dim * sizeof(float));
-            std::memcpy(s.elem_gate.data() + h * dims.head_dim, src + dims.head_dim,
-                        dims.head_dim * sizeof(float));
-        }
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_k.dtype, block.attn_k.data,
-                                              folded_input(s, block.attn_k, s.x_norm.data(), dims.hidden),
-                                              s.k_full.data(),
-                                              dims.kv_dim, dims.hidden); !r) return r;
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_v.dtype, block.attn_v.data,
-                                              folded_input(s, block.attn_v, s.x_norm.data(), dims.hidden),
-                                              s.v_full.data(),
-                                              dims.kv_dim, dims.hidden); !r) return r;
-        trace("Qcur_reshaped", layer, s.q_full.data(), dims.q_dim);
-        trace("gate_reshaped", layer, s.elem_gate.data(), dims.q_dim);
-        trace("Kcur", layer, s.k_full.data(), dims.kv_dim);
-        trace("Vcur", layer, s.v_full.data(), dims.kv_dim);
-    } else if (params.qkv == QkvKind::Fused) {
-        // One matrix produces [Q || K || V] stacked on the output axis.
-        const std::size_t qkv_rows = dims.q_dim + 2 * dims.kv_dim;
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_qkv.dtype, block.attn_qkv.data,
-                                              s.x_norm.data(), s.qkv_full.data(),
-                                              qkv_rows, dims.hidden); !r) return r;
-        std::memcpy(s.q_full.data(), s.qkv_full.data(),
-                    dims.q_dim * sizeof(float));
-        std::memcpy(s.k_full.data(), s.qkv_full.data() + dims.q_dim,
-                    dims.kv_dim * sizeof(float));
-        std::memcpy(s.v_full.data(), s.qkv_full.data() + dims.q_dim + dims.kv_dim,
-                    dims.kv_dim * sizeof(float));
+        if (auto r = delta_net_forward(s, block, dims, params, *rs, slot, layer,
+                                       n_tok, pool); !r) return r;
     } else {
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_q.dtype, block.attn_q.data,
-                                              s.x_norm.data(), s.q_full.data(),
-                                              dims.q_dim, dims.hidden); !r) return r;
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_k.dtype, block.attn_k.data,
-                                              s.x_norm.data(), s.k_full.data(),
-                                              dims.kv_dim, dims.hidden); !r) return r;
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_v.dtype, block.attn_v.data,
-                                              s.x_norm.data(), s.v_full.data(),
-                                              dims.kv_dim, dims.hidden); !r) return r;
-    }
-
-    if (s.has_biases[layer]) {
-        add_bias(s.q_full.data(),
-                 block.attn_q_bias ? s.attn_q_bias.data() + layer * dims.q_dim : nullptr,
-                 dims.q_dim);
-        add_bias(s.k_full.data(),
-                 block.attn_k_bias ? s.attn_k_bias.data() + layer * dims.kv_dim : nullptr,
-                 dims.kv_dim);
-        add_bias(s.v_full.data(),
-                 block.attn_v_bias ? s.attn_v_bias.data() + layer * dims.kv_dim : nullptr,
-                 dims.kv_dim);
-    }
-
-    // 3. Qwen3 Q/K RMSNorm per head.
-    if (s.has_qk_norm[layer]) {
-        rmsnorm_per_head(s.q_full.data(), dims.n_heads,    dims.head_dim,
-                         s.attn_q_norm.data() + layer * dims.head_dim, dims.rms_eps);
-        rmsnorm_per_head(s.k_full.data(), dims.n_kv_heads, dims.head_dim,
-                         s.attn_k_norm.data() + layer * dims.head_dim, dims.rms_eps);
-    }
-
-    trace("Qcur_normed", layer, s.q_full.data(), dims.q_dim);
-    trace("Kcur_normed", layer, s.k_full.data(), dims.kv_dim);
-
-    // 4. RoPE on Q and K at the absolute position. Sliding-window layers can
-    //    rotate a different number of dims at a different base.
-    const bool  is_swa = params.is_swa_layer(layer);
-    const bool  neox   = (params.rope_style == RopeStyle::NeoX);
-    const float* ff    = rope.freq_factors.empty() ? nullptr : rope.freq_factors.data();
-    const std::size_t rope_dim  = is_swa ? rope.rope_dim_swa  : rope.rope_dim;
-    const float       freq_base = is_swa ? rope.freq_base_swa : rope.freq_base;
-    kernels::rope_f32_ext(s.q_full.data(), dims.n_heads, dims.head_dim,
-                          rope_dim, absolute_position, freq_base,
-                          neox, ff, rope.attn_factor);
-    kernels::rope_f32_ext(s.k_full.data(), dims.n_kv_heads, dims.head_dim,
-                          rope_dim, absolute_position, freq_base,
-                          neox, ff, rope.attn_factor);
-
-    // 5. Write K, V into cache at absolute position; then read up to pos+1.
-    kv.write_at(slot, layer, absolute_position, s.k_full.data(), s.v_full.data());
-    auto lv = kv.read_at(slot, layer, absolute_position + 1);
-
-    // 6. Attention (K, V read as f32 from the cache).
-    const float attn_scale = (params.attn_scale != 0.0f)
-        ? params.attn_scale
-        : 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
-    const float* K = static_cast<const float*>(lv.k);
-    const float* V = static_cast<const float*>(lv.v);
-
-    // Sliding-window layers see only the most recent `sliding_window` keys.
-    // The older entries stay in the cache — masking here costs nothing and
-    // avoids a second, ring-buffered cache geometry.
-    std::size_t pos_begin = 0;
-    if (is_swa && params.sliding_window > 0 && lv.pos > params.sliding_window) {
-        pos_begin = lv.pos - params.sliding_window;
-    }
-    gqa_attention(s.q_full.data(), K, V,
-                  lv.stride_head, pos_begin, lv.pos,
-                  dims.n_heads, dims.n_kv_heads, dims.head_dim,
-                  attn_scale,
-                  s.attn_out.data(), s.attn_scores.data());
-
-    // 6b. Per-head sigmoid gate on the attention output. The gate is one
-    //     scalar per head derived from the normed residual, so it has to be
-    //     applied here, while the output is still laid out per head.
-    if (params.attn_gate) {
-        if (auto r = matvec_dispatch_threaded(pool, block.attn_gate.dtype,
-                                              block.attn_gate.data,
-                                              s.x_norm.data(), s.head_gate.data(),
-                                              dims.n_heads, dims.hidden); !r) return r;
-        for (std::size_t h = 0; h < dims.n_heads; ++h) {
-            const float g = 1.0f / (1.0f + std::exp(-s.head_gate[h]));
-            float* out_h = s.attn_out.data() + h * dims.head_dim;
-            for (std::size_t i = 0; i < dims.head_dim; ++i) out_h[i] *= g;
+        // ---- Q/K/V projections, batched ---------------------------------
+        if (params.qkv == QkvKind::SeparateQGate) {
+            // attn_q emits query and gate interleaved per head, so a head's
+            // 2*head_dim run is [query | gate]. Split them apart here; the
+            // gate is applied to the attention output further down.
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_q.dtype, block.attn_q.data,
+                                                  folded_input(s, block.attn_q, s.x_norm.data(), H, n_tok),
+                                                  s.qg_full.data(),
+                                                  2 * dims.q_dim, H, n_tok); !r) return r;
+            for (std::size_t t = 0; t < n_tok; ++t) {
+                for (std::size_t h = 0; h < dims.n_heads; ++h) {
+                    const float* src = s.qg_full.data() + t * 2 * dims.q_dim
+                                     + h * 2 * dims.head_dim;
+                    std::memcpy(s.q_full.data() + t * dims.q_dim + h * dims.head_dim,
+                                src, dims.head_dim * sizeof(float));
+                    std::memcpy(s.elem_gate.data() + t * dims.q_dim + h * dims.head_dim,
+                                src + dims.head_dim, dims.head_dim * sizeof(float));
+                }
+            }
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_k.dtype, block.attn_k.data,
+                                                  folded_input(s, block.attn_k, s.x_norm.data(), H, n_tok),
+                                                  s.k_full.data(), dims.kv_dim, H, n_tok); !r) return r;
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_v.dtype, block.attn_v.data,
+                                                  folded_input(s, block.attn_v, s.x_norm.data(), H, n_tok),
+                                                  s.v_full.data(), dims.kv_dim, H, n_tok); !r) return r;
+        } else if (params.qkv == QkvKind::Fused) {
+            const std::size_t qkv_rows = dims.q_dim + 2 * dims.kv_dim;
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_qkv.dtype, block.attn_qkv.data,
+                                                  folded_input(s, block.attn_qkv, s.x_norm.data(), H, n_tok),
+                                                  s.qkv_full.data(), qkv_rows, H, n_tok); !r) return r;
+            for (std::size_t t = 0; t < n_tok; ++t) {
+                const float* src = s.qkv_full.data() + t * qkv_rows;
+                std::memcpy(s.q_full.data() + t * dims.q_dim,  src, dims.q_dim * sizeof(float));
+                std::memcpy(s.k_full.data() + t * dims.kv_dim, src + dims.q_dim,
+                            dims.kv_dim * sizeof(float));
+                std::memcpy(s.v_full.data() + t * dims.kv_dim, src + dims.q_dim + dims.kv_dim,
+                            dims.kv_dim * sizeof(float));
+            }
+        } else {
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_q.dtype, block.attn_q.data,
+                                                  folded_input(s, block.attn_q, s.x_norm.data(), H, n_tok),
+                                                  s.q_full.data(), dims.q_dim, H, n_tok); !r) return r;
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_k.dtype, block.attn_k.data,
+                                                  folded_input(s, block.attn_k, s.x_norm.data(), H, n_tok),
+                                                  s.k_full.data(), dims.kv_dim, H, n_tok); !r) return r;
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_v.dtype, block.attn_v.data,
+                                                  folded_input(s, block.attn_v, s.x_norm.data(), H, n_tok),
+                                                  s.v_full.data(), dims.kv_dim, H, n_tok); !r) return r;
         }
-    }
 
-    trace("attn_pregate", layer, s.attn_out.data(), dims.q_dim);
+        // 3. Biases, Q/K norm, RoPE — all per token.
+        const bool  is_swa = params.is_swa_layer(layer);
+        const bool  neox   = (params.rope_style == RopeStyle::NeoX);
+        const float* ff    = rope.freq_factors.empty() ? nullptr : rope.freq_factors.data();
+        const std::size_t rope_dim  = is_swa ? rope.rope_dim_swa  : rope.rope_dim;
+        const float       freq_base = is_swa ? rope.freq_base_swa : rope.freq_base;
 
-    // 6c. qwen35's gate is per element, not per head: the sigmoid of the
-    //     second half of the Q projection scales the attention output
-    //     position by position.
-    if (params.qkv == QkvKind::SeparateQGate) {
-        for (std::size_t i = 0; i < dims.q_dim; ++i) {
-            s.attn_out[i] *= 1.0f / (1.0f + std::exp(-s.elem_gate[i]));
+        for (std::size_t t = 0; t < n_tok; ++t) {
+            float* q_t = s.q_full.data() + t * dims.q_dim;
+            float* k_t = s.k_full.data() + t * dims.kv_dim;
+            float* v_t = s.v_full.data() + t * dims.kv_dim;
+
+            if (s.has_biases[layer]) {
+                add_bias(q_t, block.attn_q_bias ? s.attn_q_bias.data() + layer * dims.q_dim : nullptr,
+                         dims.q_dim);
+                add_bias(k_t, block.attn_k_bias ? s.attn_k_bias.data() + layer * dims.kv_dim : nullptr,
+                         dims.kv_dim);
+                add_bias(v_t, block.attn_v_bias ? s.attn_v_bias.data() + layer * dims.kv_dim : nullptr,
+                         dims.kv_dim);
+            }
+            if (s.has_qk_norm[layer]) {
+                rmsnorm_per_head(q_t, dims.n_heads,    dims.head_dim,
+                                 s.attn_q_norm.data() + layer * dims.head_dim, dims.rms_eps);
+                rmsnorm_per_head(k_t, dims.n_kv_heads, dims.head_dim,
+                                 s.attn_k_norm.data() + layer * dims.head_dim, dims.rms_eps);
+            }
+            const std::size_t pos = start_position + t;
+            kernels::rope_f32_ext(q_t, dims.n_heads,    dims.head_dim, rope_dim,
+                                  pos, freq_base, neox, ff, rope.attn_factor);
+            kernels::rope_f32_ext(k_t, dims.n_kv_heads, dims.head_dim, rope_dim,
+                                  pos, freq_base, neox, ff, rope.attn_factor);
+
+            // Write this token's K/V before attending, so a token can see
+            // itself; earlier tokens of the batch are already in place.
+            kv.write_at(slot, layer, pos, k_t, v_t);
         }
+
+        // 4. Attention, per token. Causality inside the batch is automatic:
+        //    token t reads only up to its own position.
+        const float attn_scale = (params.attn_scale != 0.0f)
+            ? params.attn_scale
+            : 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
+
+        for (std::size_t t = 0; t < n_tok; ++t) {
+            const std::size_t pos = start_position + t;
+            auto lv = kv.read_at(slot, layer, pos + 1);
+            const float* K = static_cast<const float*>(lv.k);
+            const float* V = static_cast<const float*>(lv.v);
+
+            std::size_t pos_begin = 0;
+            if (is_swa && params.sliding_window > 0 && lv.pos > params.sliding_window) {
+                pos_begin = lv.pos - params.sliding_window;
+            }
+            gqa_attention(s.q_full.data() + t * dims.q_dim, K, V,
+                          lv.stride_head, pos_begin, lv.pos,
+                          dims.n_heads, dims.n_kv_heads, dims.head_dim,
+                          attn_scale,
+                          s.attn_out.data() + t * dims.q_dim, s.attn_scores.data());
+        }
+
+        // 5. Output gates.
+        if (params.attn_gate) {
+            if (auto r = matmul_dispatch_threaded(pool, block.attn_gate.dtype,
+                                                  block.attn_gate.data,
+                                                  s.x_norm.data(), s.head_gate.data(),
+                                                  dims.n_heads, H, n_tok); !r) return r;
+            for (std::size_t t = 0; t < n_tok; ++t) {
+                for (std::size_t h = 0; h < dims.n_heads; ++h) {
+                    const float g = 1.0f / (1.0f + std::exp(-s.head_gate[t * dims.n_heads + h]));
+                    float* out_h = s.attn_out.data() + t * dims.q_dim + h * dims.head_dim;
+                    for (std::size_t i = 0; i < dims.head_dim; ++i) out_h[i] *= g;
+                }
+            }
+        }
+        if (params.qkv == QkvKind::SeparateQGate) {
+            // qwen35's gate is per element, not per head.
+            for (std::size_t i = 0; i < n_tok * dims.q_dim; ++i) {
+                s.attn_out[i] *= 1.0f / (1.0f + std::exp(-s.elem_gate[i]));
+            }
+        }
+
+        // 6. Output projection.
+        if (auto r = matmul_dispatch_threaded(pool, block.attn_out.dtype, block.attn_out.data,
+                                              folded_input(s, block.attn_out, s.attn_out.data(),
+                                                           dims.q_dim, n_tok),
+                                              s.x.data(), H, dims.q_dim, n_tok); !r) return r;
     }
 
-    trace("attn_gated", layer, s.attn_out.data(), dims.q_dim);
-
-    // 7. Output projection + residual add.
-    if (auto r = matvec_dispatch_threaded(pool, block.attn_out.dtype, block.attn_out.data,
-                                          folded_input(s, block.attn_out, s.attn_out.data(), dims.q_dim),
-                                          s.x.data(),
-                                          dims.hidden, dims.q_dim); !r) return r;
-    scale_in_place(s.x.data(), params.residual_scale, dims.hidden);
-    kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), dims.hidden);
+    // 7. Attention (or delta-net) residual add.
+    scale_in_place(s.x.data(), params.residual_scale, n_tok * H);
+    kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), n_tok * H);
 
     // 8. FFN pre-norm.
-    std::copy(s.x.begin(), s.x.end(), s.residual.begin());
-    kernels::rmsnorm_f32(s.x.data(),
-                         s.ffn_norm.data() + layer * dims.hidden,
-                         s.x_norm.data(), dims.hidden, dims.rms_eps);
+    std::copy_n(s.x.begin(), n_tok * H, s.residual.begin());
+    for (std::size_t t = 0; t < n_tok; ++t) {
+        kernels::rmsnorm_f32(s.x.data() + t * H,
+                             s.ffn_norm.data() + layer * H,
+                             s.x_norm.data() + t * H, H, dims.rms_eps);
+    }
 
     // 9. Feed-forward, writing its output into s.x.
     switch (params.ffn) {
     case FfnKind::DenseSwiGLU:
-        if (auto r = ffn_dense(s, block, dims, params, pool); !r) return r;
+        if (auto r = ffn_dense(s, block, dims, params, n_tok, pool); !r) return r;
         break;
     case FfnKind::FusedSwiGLU:
-        if (auto r = ffn_fused(s, block, dims, params, pool); !r) return r;
+        if (auto r = ffn_fused(s, block, dims, params, n_tok, pool); !r) return r;
         break;
     case FfnKind::SparseMoE:
-        if (auto r = ffn_moe(s, block, dims, params, pool); !r) return r;
+        for (std::size_t t = 0; t < n_tok; ++t) {
+            if (auto r = ffn_moe_one(s, block, dims, params, t, pool); !r) return r;
+        }
         break;
     }
 
     // 10. Residual add.
-    scale_in_place(s.x.data(), params.residual_scale, dims.hidden);
-    kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), dims.hidden);
+    scale_in_place(s.x.data(), params.residual_scale, n_tok * H);
+    kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), n_tok * H);
     return {};
 }
 
