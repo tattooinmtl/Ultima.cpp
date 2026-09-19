@@ -1,2 +1,5 @@
 add_executable(bench_gemm bench_gemm.cpp)
 target_link_libraries(bench_gemm PRIVATE ultima_model ultima_runtime)
+
+add_executable(check_taps check_taps.cpp)
+target_link_libraries(check_taps PRIVATE ultima_model ultima_runtime ultima_kv_cache)

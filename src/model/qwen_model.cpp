@@ -74,6 +74,9 @@ public:
         return !params_.delta.active();
     }
 
+    void set_layer_taps(const LayerTaps* taps) override { taps_ = taps; }
+    bool supports_layer_taps() const noexcept override { return true; }
+
     Result<void> prefill(kv_cache::KVCache& kv,
                          kv_cache::SlotHandle slot,
                          std::span<const std::int32_t> tokens,
@@ -167,8 +170,9 @@ private:
             }
         }
 
-        // 2. Transformer stack.
+        // 2. Transformer stack, capturing layer inputs on the way through.
         for (std::size_t L = 0; L < dims_.n_layers; ++L) {
+            capture_taps(L, n_tok, start_pos);
             if (auto r = block_forward(scratch_, tensors_.blocks[L],
                                        dims_, params_, rope_, kv, slot, L,
                                        start_pos, n_tok, pool_, rstate_.get()); !r)
@@ -220,6 +224,24 @@ private:
     static constexpr std::size_t k_prefill_batch = 32;
     std::unique_ptr<kv_cache::RecurrentState> rstate_;
 
+    // Copy the residual stream entering block `L` into the tap buffer, for
+    // every tap that names this layer. Done before the block runs, so it is
+    // the input and not the output.
+    void capture_taps(std::size_t L, std::size_t n_tok, std::size_t start_pos) {
+        if (!taps_ || !taps_->active()) return;
+        const std::size_t n_taps = taps_->layers.size();
+        const std::size_t stride = taps_->stride ? taps_->stride : n_taps * dims_.hidden;
+
+        for (std::size_t i = 0; i < n_taps; ++i) {
+            if (taps_->layers[i] != L) continue;
+            for (std::size_t t = 0; t < n_tok; ++t) {
+                std::copy_n(scratch_.x.data() + t * dims_.hidden, dims_.hidden,
+                            taps_->out + (start_pos + t) * stride + i * dims_.hidden);
+            }
+        }
+    }
+
+    const LayerTaps*            taps_ = nullptr;
     std::optional<HadamardFold> fold_;
 
     ModelDims               dims_{};

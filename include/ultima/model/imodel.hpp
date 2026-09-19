@@ -142,6 +142,29 @@ struct RopeConfig {
     std::size_t rope_dim_swa    = 0;      // 0 => same as rope_dim
 };
 
+// A request to capture the residual stream as it *enters* selected blocks.
+//
+// This is what a speculative drafter feeds on: the dspark head reads the
+// target's hidden state at a handful of depths and projects the
+// concatenation down to one embedding width. Note it is the layer *input*,
+// matching llama.cpp's t_layer_inp — the output of block L is the input of
+// block L+1, so the distinction only matters at the ends.
+//
+// `out` is filled token-major, each token's row holding the taps
+// concatenated in `layers` order:
+//
+//   out[t * (layers.size() * hidden) + i * hidden + j]
+//       = hidden[j] entering layers[i], for token t
+//
+// The caller owns the buffer and must size it for the tokens it passes.
+struct LayerTaps {
+    std::vector<std::size_t> layers;   // block indices, ascending
+    float*      out    = nullptr;
+    std::size_t stride = 0;            // floats per token; 0 => layers.size()*hidden
+
+    bool active() const noexcept { return out != nullptr && !layers.empty(); }
+};
+
 // Per Decision 06 — the seam every future architecture speaks. Neither
 // prefill nor decode allocates KV; the caller owns the KVCache and hands in
 // a slot handle.
@@ -153,6 +176,14 @@ public:
     virtual const RopeConfig& rope()   const noexcept = 0;
     virtual const ArchParams& params() const noexcept = 0;
     virtual const char*       arch()   const noexcept = 0;   // general.architecture
+
+    // Capture layer inputs on subsequent prefill/decode calls. Pass nullptr
+    // to stop. The pointer is borrowed, not owned, and must outlive the
+    // calls it applies to. Architectures that do not implement it simply
+    // ignore the request, which a drafter must check for rather than
+    // silently reading a zeroed buffer.
+    virtual void set_layer_taps(const LayerTaps* taps) { (void)taps; }
+    virtual bool supports_layer_taps() const noexcept { return false; }
 
     // Whether a slot's cache can be truncated to a shared prefix and only
     // the suffix re-run. True for ordinary transformers, where every KV
