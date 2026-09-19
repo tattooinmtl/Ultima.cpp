@@ -48,7 +48,7 @@ Unless noted, a supported dtype works in matvec, row reads and 1-D dequant.
 | Q5_K   | 256   | 176   | |
 | Q6_K   | 256   | 210   | |
 | Q8_K   | 256   | 292   | **not implemented** |
-| PQ2_0  | 128   | 34    | ternary {−1,0,+1,+2} at 2.125 bpw. Prism-private type id 142; stock llama.cpp rejects the file |
+| PQ2_0  | 128   | 34    | ternary {−1,0,+1,+2} at 2.125 bpw. Prism-private type id 142; stock llama.cpp rejects the file. AVX2 via a permuted activation |
 | PTQ1_0 | 128   | 28    | **not implemented** — base-3 trits, 1.75 bpw. No local file uses it, so nothing to verify against |
 
 IQ-series (`IQ1_*`…`IQ4_*`) and the ternary `TQ*` formats are not implemented.

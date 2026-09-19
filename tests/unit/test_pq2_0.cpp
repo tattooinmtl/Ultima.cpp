@@ -241,3 +241,34 @@ TEST_CASE("Q2_0 dequant walks consecutive blocks") {
         CHECK(out[i] == doctest::Approx(expect[i]));
     }
 }
+
+TEST_CASE("PQ2_0 vectorized path matches the scalar one") {
+    // The earlier matvec test uses M=5, below the row count at which the
+    // permuted AVX2 path engages, so it exercises only the scalar kernel.
+    // This one is deliberately wide enough to take the other branch, and
+    // wide enough in K to span several 128-groups.
+    constexpr std::size_t M = 33, K = 512;
+    std::mt19937 rng{31337};
+    std::uniform_int_distribution<int>    cd{0, 3};
+    std::uniform_real_distribution<float> xd{-2.0f, 2.0f};
+
+    std::vector<std::uint8_t> w;
+    for (std::size_t m = 0; m < M; ++m) {
+        for (std::size_t b = 0; b < K / kBlock; ++b) {
+            std::vector<std::uint8_t> codes(kBlock);
+            for (auto& c : codes) c = static_cast<std::uint8_t>(cd(rng));
+            auto blk = make_block(codes, 0.03f + 0.01f * static_cast<float>(b));
+            w.insert(w.end(), blk.begin(), blk.end());
+        }
+    }
+    std::vector<float> x(K);
+    for (auto& v : x) v = xd(rng);
+
+    std::vector<float> fast(M, 0.0f), slow(M, 0.0f);
+    matvec_pq2_0_f32(w.data(), x.data(), fast.data(), M, K);
+    matvec_pq2_0_f32_scalar(w.data(), x.data(), slow.data(), M, K);
+
+    for (std::size_t m = 0; m < M; ++m) {
+        CHECK(fast[m] == doctest::Approx(slow[m]).epsilon(1e-4));
+    }
+}
