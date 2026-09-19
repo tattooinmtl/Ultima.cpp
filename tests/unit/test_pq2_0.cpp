@@ -272,3 +272,28 @@ TEST_CASE("PQ2_0 vectorized path matches the scalar one") {
         CHECK(fast[m] == doctest::Approx(slow[m]).epsilon(1e-4));
     }
 }
+
+TEST_CASE("a non-finite block scale yields zeros, not NaN") {
+    // Ternary-Bonsai-27B-dspark really does carry NaN scales in about 0.08%
+    // of its embedding blocks, including the row for its own mask token.
+    // A ternary block whose scale is not a number carries no information,
+    // so zero is the only sane reading — and it keeps the damage inside the
+    // block instead of turning a whole forward pass into NaN.
+    std::vector<std::uint8_t> codes(kBlock, 2);      // all +1 * d
+    auto blk = make_block(codes, 1.0f);
+    blk[0] = 0x88; blk[1] = 0x7C;                    // raw fp16 0x7C88 = NaN
+
+    std::vector<float> out(kBlock, 1.0f);
+    dequant_pq2_0_block(blk.data(), out.data());
+    for (float f : out) CHECK(f == 0.0f);
+
+    // Infinity is treated the same way.
+    blk[0] = 0x00; blk[1] = 0x7C;                    // +inf
+    dequant_pq2_0_block(blk.data(), out.data());
+    for (float f : out) CHECK(f == 0.0f);
+
+    // A finite scale is of course untouched.
+    auto good = make_block(codes, 0.5f);
+    dequant_pq2_0_block(good.data(), out.data());
+    for (float f : out) CHECK(f == doctest::Approx(0.5f));
+}

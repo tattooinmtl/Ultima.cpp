@@ -1,6 +1,7 @@
 add_library(ultima_model STATIC
     dtype.cpp
     hadamard.cpp
+    dspark.cpp
     tensor_info.cpp
     metadata_store.cpp
     loaded_model.cpp

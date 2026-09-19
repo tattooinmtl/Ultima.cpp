@@ -47,7 +47,19 @@ constexpr std::size_t k_bytes_q2_0 = 18;
 // identical, only the run length differs.
 inline void dequant_2bit_group(const std::uint8_t* block_bytes, float* out,
                                std::size_t n) noexcept {
-    const float d = read_fp16_le(block_bytes);
+    float d = read_fp16_le(block_bytes);
+
+    // A non-finite scale is a defect in the file, not a representable
+    // weight: the codes are ternary, so the only meaning a NaN or infinite
+    // scale can carry is "this block holds nothing". Treating it as zero
+    // confines the damage to its own 64 or 128 weights instead of letting
+    // one bad group turn an entire forward pass into NaN.
+    //
+    // This is not hypothetical. Ternary-Bonsai-27B-dspark's token embedding
+    // carries NaN scales in roughly 0.08% of its blocks, concentrated in
+    // the unused tail of the vocabulary — including the row for its own
+    // mask token, which is exactly the row a draft block reads.
+    if (!(d == d) || d > 3.0e38f || d < -3.0e38f) d = 0.0f;
     const std::uint8_t* qs = block_bytes + 2;
 
     // Four codes per byte, low pair first.
