@@ -2,6 +2,7 @@
 
 #include "ultima/kernels/dequant_q4_1.hpp"
 #include "ultima/kernels/dequant_q4k.hpp"
+#include "ultima/kernels/dequant_pq2_0.hpp"
 #include "ultima/kernels/dequant_q5_0.hpp"
 #include "ultima/kernels/dequant_q5k.hpp"
 #include "ultima/kernels/dequant_q6k.hpp"
@@ -79,6 +80,12 @@ matvec_dispatch(DataType dtype, const void* w, const float* x, float* y,
         case DataType::Q5_0:
             kernels::matvec_q5_0_f32(wb, x, y, M, K);
             return {};
+        case DataType::PQ2_0:
+            kernels::matvec_pq2_0_f32(wb, x, y, M, K);
+            return {};
+        case DataType::BF16:
+            kernels::matvec_bf16_f32(wb, x, y, M, K);
+            return {};
         case DataType::Q5_K:
             kernels::matvec_q5k_f32(wb, x, y, M, K);
             return {};
@@ -119,6 +126,12 @@ matvec_dispatch_threaded(runtime::ThreadPool& pool,
             return {};
         case DataType::Q5_0:
             kernels::matvec_q5_0_f32_threaded(pool, wb, x, y, M, K);
+            return {};
+        case DataType::PQ2_0:
+            kernels::matvec_pq2_0_f32_threaded(pool, wb, x, y, M, K);
+            return {};
+        case DataType::BF16:
+            kernels::matvec_bf16_f32_threaded(pool, wb, x, y, M, K);
             return {};
         default:
             return fail(ErrorCode::InvalidModel,
@@ -162,6 +175,15 @@ dequant_1d(DataType dtype, const void* src, float* dst, std::size_t n) {
                             "weight_dispatch");
             }
             kernels::dequant_q5_0(sb, n / 32u, dst);
+            return {};
+        }
+        case DataType::PQ2_0: {
+            if ((n % 128u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("PQ2_0 dequant_1d requires n%128==0, got {}", n),
+                            "weight_dispatch");
+            }
+            kernels::dequant_pq2_0(sb, n / 128u, dst);
             return {};
         }
         case DataType::Q4_K: {
@@ -248,6 +270,16 @@ read_row(DataType dtype, const void* base, std::size_t row, std::size_t K,
             }
             const std::size_t bytes_per_row = (K / 32u) * 22u;
             kernels::dequant_q5_0(bb + row * bytes_per_row, K / 32u, dst);
+            return {};
+        }
+        case DataType::PQ2_0: {
+            if ((K % 128u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("PQ2_0 read_row requires K%128==0, got {}", K),
+                            "weight_dispatch");
+            }
+            const std::size_t bytes_per_row = (K / 128u) * 34u;
+            kernels::dequant_pq2_0(bb + row * bytes_per_row, K / 128u, dst);
             return {};
         }
         case DataType::Q4_K: {

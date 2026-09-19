@@ -144,7 +144,11 @@ Oracles, both required, both built/cloned under C:\Llama:
       text input. All four dense qwen35 files run. MRoPE + the full-attention layer (fused QKV whose Q half is
       query+gate), post_attention_norm, then wire block_forward. Provable:
       greedy decode matches the oracle token-for-token on Qwopus.
-- [ ] Q5: PQ2_0 (+PTQ1_0) kernels. Block 128, one fp16 scale + 2 bits each =
+- [x] Q5: **Done 2026-09-18.** PQ2_0 + a BF16 matvec the file also needed.
+      Bonsai now runs end to end and emits garbage, exactly as the model card
+      says it must without the Hadamard pass. PTQ1_0 declared but NOT
+      implemented: no local file uses it, so it cannot be verified.
+      Original note: PQ2_0 (+PTQ1_0) kernels. Block 128, one fp16 scale + 2 bits each =
       34 B, y=(q-1)*d over {-1,0,+1,+2}. Simpler than the K-quants.
 - [ ] Q6: Hadamard activation transform. The GGUF is self-describing:
       prism.hadamard.{transform,block_size=1024,axis,sign_mode=explicit,

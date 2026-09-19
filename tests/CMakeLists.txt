@@ -21,6 +21,7 @@ add_executable(ultima_test
     unit/test_matvec_q4k.cpp
     unit/test_q8_0.cpp
     unit/test_q6k.cpp
+    unit/test_pq2_0.cpp
     unit/test_q5_0.cpp
     unit/test_q5k.cpp
     unit/test_q4_1.cpp

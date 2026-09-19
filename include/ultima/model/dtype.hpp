@@ -27,6 +27,13 @@ enum class DataType : std::uint32_t {
     Q8_K = 15,
     BF16 = 30,
 
+    // Prism-private ternary formats, used by the Ternary-Bonsai builds.
+    // Not in the public GGUF spec — these ids come from the PrismML-Eng
+    // llama.cpp fork, and stock llama.cpp rejects such files outright
+    // rather than misreading them.
+    PQ2_0  = 142,   // {-1, 0, +1, +2} at 2 bits, one fp16 scale per 128
+    PTQ1_0 = 143,   // base-3 trits, one fp16 scale per 128
+
     Unknown = 0xFFFF'FFFFu,
 };
 
@@ -41,8 +48,8 @@ const char* to_string(DataType t) noexcept;
 // architecture stores a projection matrix in them.
 bool is_active(DataType t) noexcept;
 
-// K-quants are stored in super-blocks of 256 elements. Non-K quants are
-// stored in blocks of 32.
+// K-quants are stored in super-blocks of 256 elements, non-K quants in
+// blocks of 32, and the Prism ternary formats in groups of 128.
 std::uint32_t block_size(DataType t) noexcept;
 
 // Bytes-per-block for computing tensor size in bytes given element count.

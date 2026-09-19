@@ -58,6 +58,21 @@ void matvec_q5_0_f32       (const std::uint8_t* w, const float* x, float* y,
 void matvec_q5_0_f32_scalar(const std::uint8_t* w, const float* x, float* y,
                             std::size_t M, std::size_t K) noexcept;
 
+// y[m] = sum_k bf16_to_f32(W)[m, k] * x[k]
+// No block structure, so K is unconstrained. Widening bf16 is a shift.
+void matvec_bf16_f32       (const std::uint8_t* w, const float* x, float* y,
+                            std::size_t M, std::size_t K) noexcept;
+void matvec_bf16_f32_scalar(const std::uint8_t* w, const float* x, float* y,
+                            std::size_t M, std::size_t K) noexcept;
+
+// y[m] = sum_k dequant(W_pq2_0)[m, k] * x[k]
+// K must be a multiple of 128 (the Prism ternary group size). No AVX2
+// variant: see the note in the implementation.
+void matvec_pq2_0_f32       (const std::uint8_t* w, const float* x, float* y,
+                             std::size_t M, std::size_t K) noexcept;
+void matvec_pq2_0_f32_scalar(const std::uint8_t* w, const float* x, float* y,
+                             std::size_t M, std::size_t K) noexcept;
+
 // y[m] = sum_k dequant(W_q5k)[m, k] * x[k]
 // K must be a multiple of 256 (Q5_K super-block size). Q5_K shows up as the
 // attention/FFN quant in Q5_K_M mixes and in several MoE releases.
@@ -102,6 +117,14 @@ void matvec_q5k_f32_threaded(ultima::runtime::ThreadPool& pool,
 void matvec_q4_1_f32_threaded(ultima::runtime::ThreadPool& pool,
                               const std::uint8_t* w, const float* x, float* y,
                               std::size_t M, std::size_t K) noexcept;
+
+void matvec_bf16_f32_threaded(ultima::runtime::ThreadPool& pool,
+                              const std::uint8_t* w, const float* x, float* y,
+                              std::size_t M, std::size_t K) noexcept;
+
+void matvec_pq2_0_f32_threaded(ultima::runtime::ThreadPool& pool,
+                               const std::uint8_t* w, const float* x, float* y,
+                               std::size_t M, std::size_t K) noexcept;
 
 void matvec_q5_0_f32_threaded(ultima::runtime::ThreadPool& pool,
                               const std::uint8_t* w, const float* x, float* y,
