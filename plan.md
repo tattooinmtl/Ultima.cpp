@@ -140,7 +140,8 @@ Oracles, both required, both built/cloned under C:\Llama:
       state, per-head L2 norm, softplus, the gated delta rule. The state cache
       is new engine plumbing beside the KV cache: conv state [d_conv-1,
       conv_channels] and delta state [head_v_dim, head_v_dim, n_v_heads].
-- [ ] Q4: MRoPE + the full-attention layer (fused QKV whose Q half is
+- [x] Q4: **Done 2026-09-18.** MRoPE turned out to reduce to plain RoPE for
+      text input. All four dense qwen35 files run. MRoPE + the full-attention layer (fused QKV whose Q half is
       query+gate), post_attention_norm, then wire block_forward. Provable:
       greedy decode matches the oracle token-for-token on Qwopus.
 - [ ] Q5: PQ2_0 (+PTQ1_0) kernels. Block 128, one fp16 scale + 2 bits each =

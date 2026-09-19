@@ -2,6 +2,7 @@
 
 #include "ultima/core/error.hpp"
 #include "ultima/kv_cache/kv_cache.hpp"
+#include "ultima/kv_cache/recurrent_state.hpp"
 #include "ultima/model/imodel.hpp"
 #include "ultima/model/qwen_tensor_slots.hpp"
 
@@ -53,6 +54,31 @@ struct BlockScratch {
     std::vector<float> attn_k_norm;
     std::vector<bool>  has_qk_norm;
 
+    // QkvKind::SeparateQGate: attn_q emits query and gate interleaved per
+    // head, so it needs a 2*q_dim landing buffer before the two are split.
+    std::vector<float> qg_full;
+    std::vector<float> elem_gate;    // q_dim — the de-interleaved gate half
+
+    // ---- Gated delta-net working set (qwen35) ---------------------------
+    // Empty for architectures with no recurrent layers.
+    std::vector<float> dn_mixed;     // conv_dim  — the fused q||k||v projection
+    std::vector<float> dn_conv_out;  // conv_dim  — after the causal conv + SiLU
+    std::vector<float> dn_z;         // value_dim — the output gate branch
+    std::vector<float> dn_beta;      // n_v_heads
+    std::vector<float> dn_alpha;     // n_v_heads
+    std::vector<float> dn_decay;     // n_v_heads
+    std::vector<float> dn_out;       // value_dim
+    std::vector<float> dn_qh;        // d_state — one L2-normed, scaled q head
+    std::vector<float> dn_kh;        // d_state — one L2-normed k head
+    std::vector<float> dn_scratch;   // d_state — delta_net_step_f32 workspace
+
+    // Per-layer delta-net weights that are small enough to keep dequantized.
+    // The conv kernel is the big one: conv_dim * d_conv floats per layer.
+    std::vector<float> ssm_conv_w;   // n_layers * conv_dim * d_conv
+    std::vector<float> ssm_dt_bias;  // n_layers * n_v_heads
+    std::vector<float> ssm_a;        // n_layers * n_v_heads
+    std::vector<float> ssm_norm;     // n_layers * head_v_dim
+
     void init(const ModelDims& d, const ArchParams& p);
 };
 
@@ -73,7 +99,8 @@ block_forward(BlockScratch& s,
               kv_cache::SlotHandle slot,
               std::size_t layer,
               std::size_t absolute_position,
-              runtime::ThreadPool& pool);
+              runtime::ThreadPool& pool,
+              kv_cache::RecurrentState* rs = nullptr);
 
 // Loads norm + bias tensors from the ModelTensors into the scratch's
 // pre-dequantized f32 buffers. Call once at model construction after
@@ -81,6 +108,7 @@ block_forward(BlockScratch& s,
 core::Result<void>
 preload_scratch_from_tensors(BlockScratch& s,
                              const ModelTensors& t,
-                             const ModelDims& d);
+                             const ModelDims& d,
+                             const ArchParams& p);
 
 } // namespace ultima::model

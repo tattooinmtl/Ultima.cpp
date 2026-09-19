@@ -154,6 +154,17 @@ public:
     virtual const ArchParams& params() const noexcept = 0;
     virtual const char*       arch()   const noexcept = 0;   // general.architecture
 
+    // Whether a slot's cache can be truncated to a shared prefix and only
+    // the suffix re-run. True for ordinary transformers, where every KV
+    // entry is indexed by position and keeping the first N is meaningful.
+    //
+    // False for a hybrid model with recurrent layers: their state after N
+    // tokens cannot be recovered from the state after M > N, so a caller
+    // that truncates and prefills only the suffix would be feeding the
+    // recurrence a prompt it never saw the start of. Such a model must be
+    // re-prefilled from position zero on any prompt change.
+    virtual bool supports_prefix_reuse() const noexcept { return true; }
+
     // Prefill a run of tokens starting at kv.pos(slot). Writes ONLY the
     // last token's logits into out_logits[0..vocab). Advances slot.pos.
     // Returns Ok on success; caller errors on shape/OOB.

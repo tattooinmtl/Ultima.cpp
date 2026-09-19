@@ -117,8 +117,19 @@ run_chat_stream(RuntimeContext& ctx,
     static std::atomic<std::uint64_t> session_counter{1};
     const auto sid = session_counter.fetch_add(1);
     auto slot = ctx.kv.acquire(sid);
-    ctx.kv.reuse_prefix(slot, prompt_ids);
-    const std::size_t already = ctx.kv.pos(slot);
+
+    // A hybrid model's recurrent layers cannot resume from a truncated
+    // prefix — their state has no per-position structure to keep. Such a
+    // model re-prefills from zero instead; reuse_prefix would leave the
+    // recurrence holding tokens the KV cache no longer agrees with.
+    const bool reuse = ctx.model.supports_prefix_reuse();
+    if (reuse) {
+        ctx.kv.reuse_prefix(slot, prompt_ids);
+    } else {
+        ctx.kv.release(slot);
+        slot = ctx.kv.acquire(sid);
+    }
+    const std::size_t already = reuse ? ctx.kv.pos(slot) : 0;
 
     std::vector<float> logits(ctx.model.dims().vocab, 0.0f);
 
@@ -131,6 +142,8 @@ run_chat_stream(RuntimeContext& ctx,
             return Failure{r.error()};
         }
     } else {
+        // Every prompt token is already cached, so rewind by one and decode
+        // the last. Only reachable when prefix reuse applies at all.
         const auto last = prompt_ids.back();
         ctx.kv.reuse_prefix(slot, std::span<const std::int32_t>(prompt_ids.data(),
                                                                 prompt_ids.size() - 1));

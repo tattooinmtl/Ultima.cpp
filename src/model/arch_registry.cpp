@@ -50,10 +50,11 @@ constexpr std::array<ArchSpec, 14> k_archs{{
     // config parsing and tensor resolution (Q2) land before the forward pass
     // (Q3/Q4), and they read this entry. Flip `supported` when decode matches
     // the reference, not before.
-    {"qwen35", false, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::SeparateQGate,
+    {"qwen35", true, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::SeparateQGate,
      RopeStyle::NeoX, /*attn_gate=*/false, /*hybrid_recurrent=*/true,
-     "gated delta-net linear attention on 3 of every 4 blocks: config and "
-     "tensors resolve, the recurrence and its state cache do not exist yet"},
+     "Qwen3.5 / Qwen3-Next hybrid: gated delta-net linear attention on 3 of "
+     "every 4 blocks, full attention with a per-element output gate on the "
+     "fourth. No KV for the recurrent layers, so context is cheap"},
 
     {"qwen35moe", false, FfnKind::SparseMoE, FfnAct::SiLU, QkvKind::SeparateQGate,
      RopeStyle::NeoX, /*attn_gate=*/false, /*hybrid_recurrent=*/true,

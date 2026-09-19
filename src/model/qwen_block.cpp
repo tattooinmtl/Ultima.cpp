@@ -1,5 +1,6 @@
 #include "ultima/model/qwen_block.hpp"
 
+#include "ultima/kernels/delta_net.hpp"
 #include "ultima/kernels/elementwise.hpp"
 #include "ultima/kernels/norms.hpp"
 #include "ultima/kernels/rope.hpp"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <numeric>
 
 namespace ultima::model {
@@ -22,6 +24,21 @@ using core::ErrorCode;
 using core::Failure;
 using core::Result;
 using core::fail;
+
+// Diagnostic checksum, printed only when ULTIMA_TRACE is set in the
+// environment. The format mirrors llama.cpp's eval-callback output so a run
+// can be diffed against the reference line by line — which is the only
+// practical way to localize a fault in a 32-layer stack that produces
+// fluent-looking output either way.
+inline void trace(const char* name, std::size_t layer,
+                  const float* x, std::size_t n) {
+    static const bool on = std::getenv("ULTIMA_TRACE") != nullptr;
+    if (!on) return;
+    double sum = 0.0;
+    for (std::size_t i = 0; i < n; ++i) sum += x[i];
+    std::fprintf(stderr, "ultima_trace: %22s-%zu = {%zu} sum = %.6f\n",
+                 name, layer, n, sum);
+}
 
 // Add an optional bias vector to `y` in place; no-op if `bias` is null.
 inline void add_bias(float* y, const float* bias, std::size_t n) {
@@ -203,6 +220,123 @@ ffn_moe(BlockScratch& s, const ModelTensors::Block& b,
     return {};
 }
 
+// The gated delta-net mixer, for one token. Replaces attention entirely on
+// three of every four qwen35 blocks: there is no KV here, only the slot's
+// recurrent state, which this both reads and advances.
+//
+// Reads s.x_norm (the attention pre-norm output) and writes s.x, so the
+// caller's residual add is unchanged.
+Result<void>
+delta_net_forward(BlockScratch& s, const ModelTensors::Block& b,
+                  const ModelDims& d, const ArchParams& p,
+                  kv_cache::RecurrentState& rs, kv_cache::SlotHandle slot,
+                  std::size_t layer, runtime::ThreadPool& pool) {
+    const auto& dn = p.delta;
+    const std::size_t key_dim   = dn.key_dim();
+    const std::size_t v_dim     = dn.head_v_dim();
+    const std::size_t n_v       = dn.n_v_heads;
+    const std::size_t n_k       = dn.n_k_heads;
+    const std::size_t d_state   = dn.d_state;
+
+    float* conv_state = rs.conv(slot, layer);
+    if (!conv_state) {
+        return fail(ErrorCode::InvalidModel,
+                    fmt::format("layer {} is recurrent but has no state buffer", layer),
+                    "delta_net");
+    }
+
+    // 1. The fused q||k||v projection, and the output gate branch.
+    if (auto r = matvec_dispatch_threaded(pool, b.ssm_in.dtype, b.ssm_in.data,
+                                          s.x_norm.data(), s.dn_mixed.data(),
+                                          dn.conv_dim(), d.hidden); !r) return r;
+    if (auto r = matvec_dispatch_threaded(pool, b.ssm_gate.dtype, b.ssm_gate.data,
+                                          s.x_norm.data(), s.dn_z.data(),
+                                          dn.value_dim(), d.hidden); !r) return r;
+
+    trace("linear_attn_qkv_mixed", layer, s.dn_mixed.data(), dn.conv_dim());
+
+    // 2. beta (the write strength) and the per-head decay.
+    if (auto r = matvec_dispatch_threaded(pool, b.ssm_beta.dtype, b.ssm_beta.data,
+                                          s.x_norm.data(), s.dn_beta.data(),
+                                          n_v, d.hidden); !r) return r;
+    if (auto r = matvec_dispatch_threaded(pool, b.ssm_alpha.dtype, b.ssm_alpha.data,
+                                          s.x_norm.data(), s.dn_alpha.data(),
+                                          n_v, d.hidden); !r) return r;
+
+    const float* dt_bias = s.ssm_dt_bias.data() + layer * n_v;
+    const float* a_log   = s.ssm_a.data()       + layer * n_v;
+    for (std::size_t h = 0; h < n_v; ++h) {
+        s.dn_beta[h] = 1.0f / (1.0f + std::exp(-s.dn_beta[h]));
+        s.dn_alpha[h] += dt_bias[h];
+    }
+    trace("alpha", layer, s.dn_alpha.data(), n_v);
+    kernels::softplus_f32(s.dn_alpha.data(), s.dn_alpha.data(), n_v);
+    trace("a_softplus", layer, s.dn_alpha.data(), n_v);
+    trace("beta_sigmoid", layer, s.dn_beta.data(), n_v);
+    for (std::size_t h = 0; h < n_v; ++h) {
+        // ssm_a is stored already negated (-exp(A_log)), so the product is
+        // negative and the decay lands in (0, 1).
+        s.dn_decay[h] = std::exp(s.dn_alpha[h] * a_log[h]);
+    }
+
+    // 3. Causal depthwise conv over the q||k||v mix, then SiLU. This is the
+    //    only place the conv history is touched, and the kernel rolls it.
+    kernels::causal_conv1d_step_f32(conv_state, s.dn_mixed.data(),
+                                    s.ssm_conv_w.data() + layer * dn.conv_dim() * dn.d_conv,
+                                    s.dn_conv_out.data(), dn.conv_dim(), dn.d_conv);
+    trace("conv_output_raw", layer, s.dn_conv_out.data(), dn.conv_dim());
+    kernels::silu_f32(s.dn_conv_out.data(), s.dn_conv_out.data(), dn.conv_dim());
+    trace("conv_output_silu", layer, s.dn_conv_out.data(), dn.conv_dim());
+
+    const float* q_all = s.dn_conv_out.data();
+    const float* k_all = s.dn_conv_out.data() + key_dim;
+    const float* v_all = s.dn_conv_out.data() + 2 * key_dim;
+
+    trace("q_conv", layer, q_all, key_dim);
+    trace("k_conv", layer, k_all, key_dim);
+    trace("v_conv_predelta", layer, v_all, dn.value_dim());
+
+    // 4. The recurrence, one value head at a time.
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(d_state));
+    for (std::size_t h = 0; h < n_v; ++h) {
+        // Value head h reads key head h % n_k, NOT h / (n_v/n_k). The
+        // reference tiles q and k with ggml_repeat and the fused kernel
+        // indexes `iv1 % nek1`, both of which interleave. This is the
+        // opposite of the blocked mapping ordinary GQA attention uses, and
+        // getting it backwards still produces fluent output.
+        const std::size_t hk = h % n_k;
+
+        kernels::l2_norm_f32(q_all + hk * d_state, s.dn_qh.data(), d_state, d.rms_eps);
+        kernels::l2_norm_f32(k_all + hk * d_state, s.dn_kh.data(), d_state, d.rms_eps);
+        for (std::size_t i = 0; i < d_state; ++i) s.dn_qh[i] *= q_scale;
+
+        kernels::delta_net_step_f32(rs.delta_head(slot, layer, h),
+                                    s.dn_qh.data(), s.dn_kh.data(),
+                                    v_all + h * v_dim,
+                                    s.dn_decay[h], s.dn_beta[h],
+                                    s.dn_out.data() + h * v_dim,
+                                    s.dn_scratch.data(), d_state);
+    }
+
+    trace("core_attn_out", layer, s.dn_out.data(), dn.value_dim());
+
+    // 5. Per-head RMSNorm of the readout, gated by silu(z).
+    const float* nw = s.ssm_norm.data() + layer * v_dim;
+    for (std::size_t h = 0; h < n_v; ++h) {
+        float* o = s.dn_out.data() + h * v_dim;
+        kernels::rmsnorm_f32(o, nw, o, v_dim, d.rms_eps);
+    }
+    kernels::silu_f32(s.dn_z.data(), s.dn_z.data(), dn.value_dim());
+    kernels::mul_f32(s.dn_out.data(), s.dn_z.data(), s.dn_out.data(), dn.value_dim());
+
+    trace("final_output", layer, s.dn_out.data(), dn.value_dim());
+
+    // 6. Output projection back into the residual width.
+    return matvec_dispatch_threaded(pool, b.ssm_out.dtype, b.ssm_out.data,
+                                    s.dn_out.data(), s.x.data(),
+                                    d.hidden, dn.value_dim());
+}
+
 } // namespace
 
 void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
@@ -219,8 +353,31 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
     if (p.qkv == QkvKind::Fused) {
         qkv_full.assign(d.q_dim + 2 * d.kv_dim, 0.0f);
     }
+    if (p.qkv == QkvKind::SeparateQGate) {
+        qg_full.assign(2 * d.q_dim, 0.0f);
+        elem_gate.assign(d.q_dim, 0.0f);
+    }
     if (p.attn_gate) {
         head_gate.assign(d.n_heads, 0.0f);
+    }
+
+    if (p.delta.active()) {
+        const auto& dn = p.delta;
+        dn_mixed.assign(dn.conv_dim(), 0.0f);
+        dn_conv_out.assign(dn.conv_dim(), 0.0f);
+        dn_z.assign(dn.value_dim(), 0.0f);
+        dn_beta.assign(dn.n_v_heads, 0.0f);
+        dn_alpha.assign(dn.n_v_heads, 0.0f);
+        dn_decay.assign(dn.n_v_heads, 0.0f);
+        dn_out.assign(dn.value_dim(), 0.0f);
+        dn_qh.assign(dn.d_state, 0.0f);
+        dn_kh.assign(dn.d_state, 0.0f);
+        dn_scratch.assign(dn.d_state, 0.0f);
+
+        ssm_conv_w.assign(d.n_layers * dn.conv_dim() * dn.d_conv, 0.0f);
+        ssm_dt_bias.assign(d.n_layers * dn.n_v_heads, 0.0f);
+        ssm_a.assign(d.n_layers * dn.n_v_heads, 0.0f);
+        ssm_norm.assign(d.n_layers * dn.head_v_dim(), 0.0f);
     }
 
     // The FFN scratch has to cover whichever path this architecture takes:
@@ -263,7 +420,8 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
 Result<void>
 preload_scratch_from_tensors(BlockScratch& s,
                              const ModelTensors& t,
-                             const ModelDims& d) {
+                             const ModelDims& d,
+                             const ArchParams& p) {
     // Output norm.
     if (auto r = dequant_1d(t.output_norm.dtype, t.output_norm.data,
                             s.output_norm_f32.data(), d.hidden); !r) return r;
@@ -290,6 +448,20 @@ preload_scratch_from_tensors(BlockScratch& s,
                                     s.attn_v_bias.data() + i * d.kv_dim, d.kv_dim); !r) return r;
         }
 
+        if (b.is_recurrent && p.delta.active()) {
+            const auto& dn = p.delta;
+            const std::size_t conv_n = dn.conv_dim() * dn.d_conv;
+            if (auto r = dequant_1d(b.ssm_conv1d.dtype, b.ssm_conv1d.data,
+                                    s.ssm_conv_w.data() + i * conv_n, conv_n); !r) return r;
+            if (auto r = dequant_1d(b.ssm_dt_bias.dtype, b.ssm_dt_bias.data,
+                                    s.ssm_dt_bias.data() + i * dn.n_v_heads, dn.n_v_heads); !r) return r;
+            if (auto r = dequant_1d(b.ssm_a.dtype, b.ssm_a.data,
+                                    s.ssm_a.data() + i * dn.n_v_heads, dn.n_v_heads); !r) return r;
+            if (auto r = dequant_1d(b.ssm_norm.dtype, b.ssm_norm.data,
+                                    s.ssm_norm.data() + i * dn.head_v_dim(),
+                                    dn.head_v_dim()); !r) return r;
+        }
+
         const bool qk = b.attn_q_norm && b.attn_k_norm;
         s.has_qk_norm[i] = qk;
         if (qk) {
@@ -312,7 +484,8 @@ block_forward(BlockScratch& s,
               kv_cache::SlotHandle slot,
               std::size_t layer,
               std::size_t absolute_position,
-              runtime::ThreadPool& pool)
+              runtime::ThreadPool& pool,
+              kv_cache::RecurrentState* rs)
 {
     // Save residual stream.
     std::copy(s.x.begin(), s.x.end(), s.residual.begin());
@@ -321,9 +494,68 @@ block_forward(BlockScratch& s,
     kernels::rmsnorm_f32(s.x.data(),
                          s.attn_norm.data() + layer * dims.hidden,
                          s.x_norm.data(), dims.hidden, dims.rms_eps);
+    trace("attn_norm", layer, s.x_norm.data(), dims.hidden);
 
-    // 2. Q/K/V projections.
-    if (params.qkv == QkvKind::Fused) {
+    // 2. Either the recurrent mixer or attention. A delta-net layer has no
+    //    KV at all, so it short-circuits straight to the residual add.
+    if (block.is_recurrent) {
+        if (!rs) {
+            return fail(ErrorCode::InvalidModel,
+                        fmt::format("layer {} is recurrent but no state was supplied",
+                                    layer),
+                        "block_forward");
+        }
+        if (auto r = delta_net_forward(s, block, dims, params, *rs, slot, layer, pool); !r)
+            return r;
+        scale_in_place(s.x.data(), params.residual_scale, dims.hidden);
+        kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), dims.hidden);
+
+        // FFN, identical to an attention layer's.
+        std::copy(s.x.begin(), s.x.end(), s.residual.begin());
+        kernels::rmsnorm_f32(s.x.data(),
+                             s.ffn_norm.data() + layer * dims.hidden,
+                             s.x_norm.data(), dims.hidden, dims.rms_eps);
+        switch (params.ffn) {
+        case FfnKind::DenseSwiGLU:
+            if (auto r = ffn_dense(s, block, dims, params, pool); !r) return r;
+            break;
+        case FfnKind::FusedSwiGLU:
+            if (auto r = ffn_fused(s, block, dims, params, pool); !r) return r;
+            break;
+        case FfnKind::SparseMoE:
+            if (auto r = ffn_moe(s, block, dims, params, pool); !r) return r;
+            break;
+        }
+        scale_in_place(s.x.data(), params.residual_scale, dims.hidden);
+        kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), dims.hidden);
+        return {};
+    }
+
+    if (params.qkv == QkvKind::SeparateQGate) {
+        // attn_q emits query and gate interleaved per head, so a head's
+        // 2*head_dim run is [query | gate]. Split them apart here; the gate
+        // is applied to the attention output further down.
+        if (auto r = matvec_dispatch_threaded(pool, block.attn_q.dtype, block.attn_q.data,
+                                              s.x_norm.data(), s.qg_full.data(),
+                                              2 * dims.q_dim, dims.hidden); !r) return r;
+        for (std::size_t h = 0; h < dims.n_heads; ++h) {
+            const float* src = s.qg_full.data() + h * 2 * dims.head_dim;
+            std::memcpy(s.q_full.data()    + h * dims.head_dim, src,
+                        dims.head_dim * sizeof(float));
+            std::memcpy(s.elem_gate.data() + h * dims.head_dim, src + dims.head_dim,
+                        dims.head_dim * sizeof(float));
+        }
+        if (auto r = matvec_dispatch_threaded(pool, block.attn_k.dtype, block.attn_k.data,
+                                              s.x_norm.data(), s.k_full.data(),
+                                              dims.kv_dim, dims.hidden); !r) return r;
+        if (auto r = matvec_dispatch_threaded(pool, block.attn_v.dtype, block.attn_v.data,
+                                              s.x_norm.data(), s.v_full.data(),
+                                              dims.kv_dim, dims.hidden); !r) return r;
+        trace("Qcur_reshaped", layer, s.q_full.data(), dims.q_dim);
+        trace("gate_reshaped", layer, s.elem_gate.data(), dims.q_dim);
+        trace("Kcur", layer, s.k_full.data(), dims.kv_dim);
+        trace("Vcur", layer, s.v_full.data(), dims.kv_dim);
+    } else if (params.qkv == QkvKind::Fused) {
         // One matrix produces [Q || K || V] stacked on the output axis.
         const std::size_t qkv_rows = dims.q_dim + 2 * dims.kv_dim;
         if (auto r = matvec_dispatch_threaded(pool, block.attn_qkv.dtype, block.attn_qkv.data,
@@ -366,6 +598,9 @@ block_forward(BlockScratch& s,
         rmsnorm_per_head(s.k_full.data(), dims.n_kv_heads, dims.head_dim,
                          s.attn_k_norm.data() + layer * dims.head_dim, dims.rms_eps);
     }
+
+    trace("Qcur_normed", layer, s.q_full.data(), dims.q_dim);
+    trace("Kcur_normed", layer, s.k_full.data(), dims.kv_dim);
 
     // 4. RoPE on Q and K at the absolute position. Sliding-window layers can
     //    rotate a different number of dims at a different base.
@@ -419,6 +654,19 @@ block_forward(BlockScratch& s,
             for (std::size_t i = 0; i < dims.head_dim; ++i) out_h[i] *= g;
         }
     }
+
+    trace("attn_pregate", layer, s.attn_out.data(), dims.q_dim);
+
+    // 6c. qwen35's gate is per element, not per head: the sigmoid of the
+    //     second half of the Q projection scales the attention output
+    //     position by position.
+    if (params.qkv == QkvKind::SeparateQGate) {
+        for (std::size_t i = 0; i < dims.q_dim; ++i) {
+            s.attn_out[i] *= 1.0f / (1.0f + std::exp(-s.elem_gate[i]));
+        }
+    }
+
+    trace("attn_gated", layer, s.attn_out.data(), dims.q_dim);
 
     // 7. Output projection + residual add.
     if (auto r = matvec_dispatch_threaded(pool, block.attn_out.dtype, block.attn_out.data,

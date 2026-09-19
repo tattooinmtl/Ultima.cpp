@@ -43,7 +43,14 @@ public:
         tensors_ = std::move(*tensors);
 
         scratch_.init(dims_, params_);
-        if (auto r = preload_scratch_from_tensors(scratch_, tensors_, dims_); !r) return r;
+        if (auto r = preload_scratch_from_tensors(scratch_, tensors_, dims_, params_); !r)
+            return r;
+
+        // The recurrent layers need their own per-slot state beside the KV
+        // cache. Sized here so the allocation is visible at load time rather
+        // than appearing on the first token.
+        rstate_ = std::make_unique<kv_cache::RecurrentState>(
+            kv_cache::recurrent_config_for(params_, dims_.n_layers, k_state_slots));
         return {};
     }
 
@@ -52,12 +59,34 @@ public:
     const ArchParams& params() const noexcept override { return params_; }
     const char*       arch()   const noexcept override { return arch_.c_str(); }
 
+    bool supports_prefix_reuse() const noexcept override {
+        return !params_.delta.active();
+    }
+
     Result<void> prefill(kv_cache::KVCache& kv,
                          kv_cache::SlotHandle slot,
                          std::span<const std::int32_t> tokens,
                          float* out_logits) override {
         if (tokens.empty()) return {};
         const std::size_t start_pos = kv.pos(slot);
+
+        // The recurrent state must have absorbed exactly the tokens the KV
+        // cache holds. A caller that truncated the KV to a shared prefix
+        // would break that, and the recurrence has no way to rewind — so
+        // this is an error rather than a silent wrong answer.
+        if (params_.delta.active()) {
+            if (start_pos == 0) {
+                rstate_->reset(slot);
+            } else if (rstate_->pos(slot) != start_pos) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("recurrent state holds {} tokens but prefill "
+                                        "starts at {}: a hybrid model cannot resume "
+                                        "from a truncated prefix, it must re-prefill "
+                                        "from zero",
+                                        rstate_->pos(slot), start_pos),
+                            "transformer_model");
+            }
+        }
         for (std::size_t i = 0; i < tokens.size(); ++i) {
             const std::size_t abs_pos = start_pos + i;
             const bool is_last = (i + 1 == tokens.size());
@@ -65,6 +94,7 @@ public:
                                      is_last ? out_logits : nullptr); !r)
                 return r;
             kv.commit_token(slot, tokens[i]);
+            if (params_.delta.active()) rstate_->advance(slot, 1);
         }
         return {};
     }
@@ -76,6 +106,7 @@ public:
         const std::size_t abs_pos = kv.pos(slot);
         if (auto r = forward_one(kv, slot, token, abs_pos, out_logits); !r) return r;
         kv.commit_token(slot, token);
+        if (params_.delta.active()) rstate_->advance(slot, 1);
         return {};
     }
 
@@ -106,7 +137,7 @@ private:
         for (std::size_t L = 0; L < dims_.n_layers; ++L) {
             if (auto r = block_forward(scratch_, tensors_.blocks[L],
                                        dims_, params_, rope_, kv, slot, L,
-                                       abs_pos, pool_); !r) return r;
+                                       abs_pos, pool_, rstate_.get()); !r) return r;
         }
 
         // 3. If logits requested, finalize.
@@ -134,6 +165,11 @@ private:
     const ArchSpec&         spec_;
     const LoadedModel&      gguf_;
     runtime::ThreadPool&    pool_;
+    // Matches the KV cache's slot count; both are indexed by the same
+    // SlotHandle, so they must agree.
+    static constexpr std::size_t k_state_slots = 8;
+    std::unique_ptr<kv_cache::RecurrentState> rstate_;
+
     ModelDims               dims_{};
     RopeConfig              rope_{};
     ArchParams              params_{};

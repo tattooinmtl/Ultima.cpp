@@ -16,8 +16,8 @@ GGUFs and reports each file individually.
 | `phi3`       | runnable | Fused QKV and fused gate/up, LongRoPE frequency factors |
 | `spark2_5`   | runnable | Fused QKV, per-head sigmoid attention gate, GEGLU FFN, 3-of-4 sliding-window layers with their own RoPE dim and base |
 | `gemma4`     | not yet  | per-layer KV head counts, alternating sliding-window attention, dual RoPE bases, post-attention/post-FFN norms, final logit softcapping |
-| `qwen35`     | not yet  | gated delta-net linear attention (`ssm_*`, 3 of every 4 blocks) + a recurrent state cache. **Reference exists**: supported upstream in llama.cpp as Qwen3-Next/Qwen3.5 |
-| `qwen35moe`  | not yet  | the `qwen35` SSM hybrid plus MoE with shared experts |
+| `qwen35`     | runnable | Qwen3.5 / Qwen3-Next hybrid: gated delta-net linear attention on 3 of every 4 blocks, full attention with a per-element output gate on the fourth. No KV for the recurrent layers |
+| `qwen35moe`  | not yet  | the `qwen35` delta-net hybrid plus MoE with shared experts (the one local file is blocked on shared experts, not on the hybrid) |
 | `deepseek2`  | not yet  | multi-head latent attention (compressed KV) and MoE with grouped routing, shared experts, expert bias |
 | `dspark`     | never*   | diffusion LM — block denoising is not autoregressive, so it does not fit prefill/decode at all |
 | `dflash-draft` | never* | speculative-decoding draft head: no tokenizer, no `token_embd`, no output head. Only usable attached to its target model |
@@ -104,6 +104,13 @@ Verified token-for-token against llama.cpp `llama-tokenize` for `qwen2`,
   reason.
 - **Multi-file (split) GGUFs** are rejected at load.
 - KV cache is F32 only.
+- **Hybrid models cannot reuse a cached prefix.** A recurrent layer's state
+  has no per-position structure, so it cannot be truncated to a shared prefix
+  the way KV entries can; `qwen35` re-prefills from zero on every prompt.
+  `IModel::supports_prefix_reuse()` reports this and the server honours it.
+- **Multi-token-prediction (MTP) blocks are skipped.** They are a
+  speculative-decoding draft head, not part of the trunk. The model runs
+  correctly without them; it just does not get the speculative speedup.
 
 ## Notes
 
