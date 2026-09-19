@@ -7,10 +7,13 @@
 #include "ultima/kernels/dequant_q5k.hpp"
 #include "ultima/kernels/dequant_q6k.hpp"
 #include "ultima/kernels/dequant_q8_0.hpp"
+#include "ultima/kernels/dot_batched.hpp"
 #include "ultima/kernels/matvec.hpp"
 #include "ultima/runtime/thread_pool.hpp"
 
 #include <fmt/format.h>
+#include <vector>
+#include <atomic>
 
 #include <cstdint>
 #include <cstring>
@@ -327,6 +330,95 @@ read_row(DataType dtype, const void* base, std::size_t row, std::size_t K,
                         fmt::format("read_row dtype {} not supported", to_string(dtype)),
                         "weight_dispatch");
     }
+}
+
+
+namespace {
+
+// Same row-splitting rule the matvec kernels use.
+constexpr std::size_t kMinRowsPerWorker = 2;
+
+template <class Fn>
+inline void dispatch_rows(runtime::ThreadPool& pool, std::size_t M, Fn&& per_range) {
+    const std::size_t nt = pool.size();
+    if (nt <= 1 || M < nt * kMinRowsPerWorker) {
+        per_range(std::size_t{0}, M);
+        return;
+    }
+    pool.parallel_for(M, [&](std::size_t begin, std::size_t end) {
+        per_range(begin, end);
+    });
+}
+
+} // namespace
+
+Result<void>
+matmul_dispatch_threaded(runtime::ThreadPool& pool,
+                         DataType dtype, const void* w,
+                         const float* X, float* Y,
+                         std::size_t M, std::size_t K, std::size_t n_tok) {
+    if (n_tok == 0 || M == 0) return {};
+
+    // Below the crossover the fused matvec wins: it decodes quants straight
+    // into FMAs and never materializes the row, so there is nothing for
+    // batching to amortize yet. Measured on the reference box with
+    // benchmarks/bench_gemm (Q8_0, 12288x4096): N=2 is 0.62x, N=4 is 1.17x,
+    // N=8 2.19x, N=32 3.39x. Four is where it turns over.
+    constexpr std::size_t k_batch_crossover = 4;
+    if (n_tok < k_batch_crossover) {
+        for (std::size_t t = 0; t < n_tok; ++t) {
+            if (auto r = matvec_dispatch_threaded(pool, dtype, w, X + t * K,
+                                                  Y + t * M, M, K); !r) {
+                return r;
+            }
+        }
+        return {};
+    }
+
+    // F32 weights need no dequant, so the row is already in memory and the
+    // generic path below would copy it for nothing.
+    if (dtype == DataType::F32) {
+        const float* wf = static_cast<const float*>(w);
+        std::atomic<bool> ok{true};
+        dispatch_rows(pool, M, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t m = begin; m < end; ++m) {
+                kernels::dot_rows_f32(wf + m * K, X, K, n_tok, Y + m, M);
+            }
+        });
+        (void)ok;
+        return {};
+    }
+
+    // Generic path: dequantize each weight row once into a per-thread
+    // scratch, then dot it against every token. Built on read_row so it
+    // covers every dtype the loader can read, rather than needing one
+    // hand-written GEMM per quantization format.
+    //
+    // The scratch is K floats — 68 KiB at the widest projection here — so
+    // it stays in L2 while the n_tok dots run over it.
+    std::atomic<bool> failed{false};
+    std::atomic<ErrorCode> err{ErrorCode::InvalidModel};
+
+    dispatch_rows(pool, M, [&](std::size_t begin, std::size_t end) {
+        std::vector<float> row(K);
+        for (std::size_t m = begin; m < end; ++m) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            if (auto r = read_row(dtype, w, m, K, row.data()); !r) {
+                err.store(r.error().code, std::memory_order_relaxed);
+                failed.store(true, std::memory_order_relaxed);
+                return;
+            }
+            kernels::dot_rows_f32(row.data(), X, K, n_tok, Y + m, M);
+        }
+    });
+
+    if (failed.load(std::memory_order_relaxed)) {
+        return fail(err.load(std::memory_order_relaxed),
+                    fmt::format("matmul_dispatch dtype {} not supported",
+                                to_string(dtype)),
+                    "weight_dispatch");
+    }
+    return {};
 }
 
 } // namespace ultima::model

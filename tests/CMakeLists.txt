@@ -10,6 +10,7 @@ add_executable(ultima_test
     unit/test_tensor.cpp
     unit/test_thread_pool.cpp
     unit/test_cpu_features.cpp
+    unit/test_matmul_batched.cpp
     unit/test_matvec.cpp
     unit/test_delta_net.cpp
     unit/test_hadamard.cpp

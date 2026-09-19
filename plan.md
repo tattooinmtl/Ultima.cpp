@@ -161,3 +161,36 @@ Oracles, both required, both built/cloned under C:\Llama:
 Q2-Q4 get the 9B coder running using quant types we already support. Q5-Q6 add
 Bonsai. Doing them in that order means the architecture is verified against a
 working oracle before the ternary layers are stacked on top.
+
+## dspark drafter track (started 2026-09-18)
+
+Goal: Ternary-Bonsai-27B-dspark, which is not a model but a block-denoising
+speculative drafter for Ternary-Bonsai-2-27B. It taps the host's hidden
+states at layers [1,16,31,46,61], denoises a block of 4 tokens, and scores
+them with a confidence head.
+
+MEASURED FIRST, because the premise needed checking. Same model, same box:
+
+                      prefill(281 tok)   decode   batching win
+    llama.cpp             31.26 t/s      6.14 t/s     5.1x
+    Ultima                 4.3  t/s      3.8  t/s     1.13x
+
+Speculative decoding cannot pay off until verification is batched. Drafting
+k tokens costs k*D and verifying them costs k*T while prefill is sequential
+matvec, so the total is strictly worse than plain decoding for any
+acceptance rate. The drafter is blocked on this, and batched prefill is
+independently the largest perf item in the project: prompt processing is
+7.3x slower than the reference, which for a coding IDE is the dominant cost.
+
+- [ ] Q7: batched prefill. A GEMM path so N tokens stream the weights once
+      instead of N times. Prerequisite for everything below, and the win on
+      its own. Note the delta-net layers are sequential in time and cannot
+      batch the same way -- llama.cpp uses a chunked formulation there.
+- [ ] Q8: Q2_0 (upstream type 42). The drafter stores token_embd in it.
+- [ ] Q9: the dspark drafter model - tap projection fc [25600->5120],
+      log-SNR conditioning, 6 non-causal blocks, confidence head.
+- [ ] Q10: the host-side loop. Reference is common/speculative.cpp in the
+      PrismML fork (3622 lines, ~70 dspark sites).
+
+Host-side tap capture is also needed: the target must expose hidden states
+at five layer depths, which no current seam does.
