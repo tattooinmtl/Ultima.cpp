@@ -14,6 +14,7 @@ add_library(ultima_kernels STATIC
     dequant_q5_0.cpp
     dequant_q5k.cpp
     dequant_q4_1.cpp
+    delta_net.cpp
     elementwise.cpp
     rmsnorm.cpp
     softmax.cpp

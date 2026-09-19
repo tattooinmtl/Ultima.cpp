@@ -11,6 +11,8 @@ add_executable(ultima_test
     unit/test_thread_pool.cpp
     unit/test_cpu_features.cpp
     unit/test_matvec.cpp
+    unit/test_delta_net.cpp
+    unit/test_recurrent_state.cpp
     unit/test_elementwise.cpp
     unit/test_rmsnorm.cpp
     unit/test_softmax.cpp

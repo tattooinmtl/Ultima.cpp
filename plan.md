@@ -134,7 +134,9 @@ Oracles, both required, both built/cloned under C:\Llama:
       map (explicit `recurrent_layers` key, else (i+1)%4!=0), rope_sections[4],
       and both layer kinds' tensor slots. Provable: all 427/851 tensors resolve
       with the dims the reference computes.
-- [ ] Q3: delta-net kernels + recurrent state cache. Causal conv1d carrying
+- [x] Q3: delta-net kernels + recurrent state cache. **Done 2026-09-18.**
+      270 tests pass (19 new). Prefix reuse turns out NOT to apply to a
+      recurrent layer: see can_extend(). Causal conv1d carrying
       state, per-head L2 norm, softplus, the gated delta rule. The state cache
       is new engine plumbing beside the KV cache: conv state [d_conv-1,
       conv_channels] and delta state [head_v_dim, head_v_dim, n_v_heads].

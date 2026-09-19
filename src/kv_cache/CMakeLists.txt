@@ -1,5 +1,6 @@
 add_library(ultima_kv_cache STATIC
     kv_cache.cpp
+    recurrent_state.cpp
 )
 
 target_include_directories(ultima_kv_cache
