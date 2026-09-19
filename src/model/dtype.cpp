@@ -38,6 +38,7 @@ bool is_active(DataType t) noexcept {
     case DataType::Q5_K:
     case DataType::Q6_K:
     case DataType::PQ2_0:
+    case DataType::Q2_0:
         return true;
     default:
         return false;
@@ -66,6 +67,8 @@ std::uint32_t block_size(DataType t) noexcept {
     case DataType::PQ2_0:
     case DataType::PTQ1_0:
         return 128;
+    case DataType::Q2_0:
+        return 64;
     default:
         return 0;
     }
@@ -92,6 +95,8 @@ std::uint32_t bytes_per_block(DataType t) noexcept {
 
     // fp16 scale + 128 two-bit codes = 2 + 32 = 34 bytes, 2.125 bpw.
     case DataType::PQ2_0:  return 34;
+    // The same format at group 64: 2 + 16 = 18 bytes, 2.25 bpw.
+    case DataType::Q2_0:   return 18;
     // 24 B of base-3 trits (5 per byte) + 2 B high trits + fp16 scale.
     case DataType::PTQ1_0: return 28;
 

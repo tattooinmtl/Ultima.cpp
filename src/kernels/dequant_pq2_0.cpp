@@ -40,16 +40,18 @@ inline float read_fp16_le(const std::uint8_t* p) noexcept {
 
 constexpr std::size_t k_block  = 128;
 constexpr std::size_t k_bytes  = 34;
+constexpr std::size_t k_block_q2_0 = 64;
+constexpr std::size_t k_bytes_q2_0 = 18;
 
-} // namespace
-
-void dequant_pq2_0_block(const std::uint8_t* block_bytes, float* out) noexcept {
+// Shared by both group sizes: the packing and the code mapping are
+// identical, only the run length differs.
+inline void dequant_2bit_group(const std::uint8_t* block_bytes, float* out,
+                               std::size_t n) noexcept {
     const float d = read_fp16_le(block_bytes);
     const std::uint8_t* qs = block_bytes + 2;
 
-    // Four codes per byte, low pair first. Unrolled so the shifts are
-    // constants — the whole block is one scale and 32 byte loads.
-    for (std::size_t b = 0; b < k_block / 4; ++b) {
+    // Four codes per byte, low pair first.
+    for (std::size_t b = 0; b < n / 4; ++b) {
         const std::uint8_t byte = qs[b];
         out[4 * b + 0] = (static_cast<int>( byte        & 0x03) - 1) * d;
         out[4 * b + 1] = (static_cast<int>((byte >> 2)  & 0x03) - 1) * d;
@@ -58,10 +60,27 @@ void dequant_pq2_0_block(const std::uint8_t* block_bytes, float* out) noexcept {
     }
 }
 
+} // namespace
+
+void dequant_pq2_0_block(const std::uint8_t* block_bytes, float* out) noexcept {
+    dequant_2bit_group(block_bytes, out, k_block);
+}
+
 void dequant_pq2_0(const std::uint8_t* blocks, std::size_t block_count,
                    float* out) noexcept {
     for (std::size_t i = 0; i < block_count; ++i) {
         dequant_pq2_0_block(blocks + i * k_bytes, out + i * k_block);
+    }
+}
+
+void dequant_q2_0_block(const std::uint8_t* block_bytes, float* out) noexcept {
+    dequant_2bit_group(block_bytes, out, k_block_q2_0);
+}
+
+void dequant_q2_0(const std::uint8_t* blocks, std::size_t block_count,
+                  float* out) noexcept {
+    for (std::size_t i = 0; i < block_count; ++i) {
+        dequant_q2_0_block(blocks + i * k_bytes_q2_0, out + i * k_block_q2_0);
     }
 }
 

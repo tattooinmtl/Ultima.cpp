@@ -41,7 +41,7 @@ Unless noted, a supported dtype works in matvec, row reads and 1-D dequant.
 | Q5_0   | 32    | 22    | |
 | Q5_1   | 32    | 24    | **not implemented** |
 | Q8_0   | 32    | 34    | |
-| Q2_0   | 32    | ?     | **not implemented** — upstream type 42; only the dspark drafter's embedding uses it |
+| Q2_0   | 64    | 18    | ternary {−1,0,+1,+2} at 2.25 bpw. Upstream type 42; the same format as PQ2_0 at half the group |
 | Q2_K   | 256   | 84    | **not implemented** |
 | Q3_K   | 256   | 110   | **not implemented** |
 | Q4_K   | 256   | 144   | |

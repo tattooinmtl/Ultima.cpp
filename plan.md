@@ -188,7 +188,7 @@ independently the largest perf item in the project: prompt processing is
       instead of N times. Prerequisite for everything below, and the win on
       its own. Note the delta-net layers are sequential in time and cannot
       batch the same way -- llama.cpp uses a chunked formulation there.
-- [ ] Q8: Q2_0 (upstream type 42). The drafter stores token_embd in it.
+- [x] Q8: **Done 2026-09-18.** Q2_0 (upstream type 42). The drafter stores token_embd in it.
 - [ ] Q9: the dspark drafter model - tap projection fc [25600->5120],
       log-SNR conditioning, 6 non-causal blocks, confidence head.
 - [ ] Q10: the host-side loop. Reference is common/speculative.cpp in the

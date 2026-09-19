@@ -165,3 +165,79 @@ TEST_CASE("PQ2_0 matvec refuses a K that is not a whole number of groups") {
     CHECK(y[0] == 0.0f);
     CHECK(y[1] == 0.0f);
 }
+
+// ---- Q2_0: the same format at group 64 --------------------------------------
+
+namespace {
+
+std::vector<std::uint8_t> make_q2_0_block(const std::vector<std::uint8_t>& codes,
+                                          float d) {
+    std::vector<std::uint8_t> blk(18, 0);
+    const std::uint16_t h = float_to_fp16(d);
+    blk[0] = static_cast<std::uint8_t>(h & 0xFFu);
+    blk[1] = static_cast<std::uint8_t>(h >> 8);
+    for (std::size_t i = 0; i < 64; ++i) {
+        blk[2 + i / 4] |= static_cast<std::uint8_t>((codes[i] & 0x03u) << (2 * (i % 4)));
+    }
+    return blk;
+}
+
+} // namespace
+
+TEST_CASE("Q2_0 geometry is the 64-wide sibling of PQ2_0") {
+    using ultima::model::DataType;
+    CHECK(ultima::model::block_size(DataType::Q2_0)      == 64);
+    CHECK(ultima::model::bytes_per_block(DataType::Q2_0) == 18);
+    CHECK(ultima::model::is_active(DataType::Q2_0));
+    CHECK(18.0 * 8.0 / 64.0 == doctest::Approx(2.25));
+}
+
+TEST_CASE("Q2_0 uses the same code mapping as PQ2_0") {
+    std::vector<std::uint8_t> codes(64);
+    for (std::size_t i = 0; i < 64; ++i) codes[i] = static_cast<std::uint8_t>(i % 4);
+    auto blk = make_q2_0_block(codes, 0.5f);
+
+    std::vector<float> out(64);
+    dequant_q2_0_block(blk.data(), out.data());
+    for (std::size_t i = 0; i < 64; ++i) {
+        CHECK(out[i] == doctest::Approx((static_cast<int>(i % 4) - 1) * 0.5f));
+    }
+}
+
+TEST_CASE("Q2_0 and PQ2_0 agree on identical leading data") {
+    // The formats differ only in run length, so the first 64 values of a
+    // PQ2_0 block and a Q2_0 block built from the same codes must match.
+    std::vector<std::uint8_t> c128(128);
+    for (std::size_t i = 0; i < 128; ++i) c128[i] = static_cast<std::uint8_t>((i * 7) % 4);
+    std::vector<std::uint8_t> c64(c128.begin(), c128.begin() + 64);
+
+    auto b128 = make_block(c128, 0.75f);
+    auto b64  = make_q2_0_block(c64, 0.75f);
+
+    std::vector<float> o128(128), o64(64);
+    dequant_pq2_0_block(b128.data(), o128.data());
+    dequant_q2_0_block(b64.data(), o64.data());
+    for (std::size_t i = 0; i < 64; ++i) CHECK(o64[i] == doctest::Approx(o128[i]));
+}
+
+TEST_CASE("Q2_0 dequant walks consecutive blocks") {
+    std::vector<std::uint8_t> bytes;
+    std::vector<float> expect;
+    for (int b = 0; b < 3; ++b) {
+        std::vector<std::uint8_t> codes(64);
+        for (std::size_t i = 0; i < 64; ++i) {
+            codes[i] = static_cast<std::uint8_t>((i + b) % 4);
+        }
+        const float d = 0.25f * static_cast<float>(b + 1);
+        auto blk = make_q2_0_block(codes, d);
+        bytes.insert(bytes.end(), blk.begin(), blk.end());
+        for (std::size_t i = 0; i < 64; ++i) {
+            expect.push_back((static_cast<int>(codes[i]) - 1) * d);
+        }
+    }
+    std::vector<float> out(3 * 64);
+    dequant_q2_0(bytes.data(), 3, out.data());
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        CHECK(out[i] == doctest::Approx(expect[i]));
+    }
+}

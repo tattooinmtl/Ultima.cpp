@@ -130,6 +130,7 @@ DataType map_dtype(std::uint32_t raw) noexcept {
     case 14: return DataType::Q6_K;
     case 15: return DataType::Q8_K;
     case 30: return DataType::BF16;
+    case 42: return DataType::Q2_0;   // upstream 2-bit, group 64
     // Prism-private ternary ids, outside the public GGUF range. Stock
     // llama.cpp fails tensor-info parsing on these rather than mapping
     // them, which is why such a file cannot be run by it at all.

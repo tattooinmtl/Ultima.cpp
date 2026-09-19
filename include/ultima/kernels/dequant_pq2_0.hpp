@@ -35,4 +35,15 @@ void dequant_pq2_0_block(const std::uint8_t* block_bytes, float* out) noexcept;
 void dequant_pq2_0(const std::uint8_t* blocks, std::size_t block_count,
                    float* out) noexcept;
 
+// ---- Q2_0 (upstream type 42, 64 elements, 18 bytes) ------------------------
+//
+// Byte-for-byte the same layout and the same (code - 1) * d mapping, with a
+// group of 64 rather than 128. Sharing the implementation is not a
+// convenience here — it is the same format, and the only local file using
+// it is the dspark drafter's token embedding.
+void dequant_q2_0_block(const std::uint8_t* block_bytes, float* out) noexcept;
+
+void dequant_q2_0(const std::uint8_t* blocks, std::size_t block_count,
+                  float* out) noexcept;
+
 } // namespace ultima::kernels

@@ -189,6 +189,15 @@ dequant_1d(DataType dtype, const void* src, float* dst, std::size_t n) {
             kernels::dequant_pq2_0(sb, n / 128u, dst);
             return {};
         }
+        case DataType::Q2_0: {
+            if ((n % 64u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("Q2_0 dequant_1d requires n%64==0, got {}", n),
+                            "weight_dispatch");
+            }
+            kernels::dequant_q2_0(sb, n / 64u, dst);
+            return {};
+        }
         case DataType::Q4_K: {
             if ((n % 256u) != 0) {
                 return fail(ErrorCode::InvalidModel,
@@ -283,6 +292,16 @@ read_row(DataType dtype, const void* base, std::size_t row, std::size_t K,
             }
             const std::size_t bytes_per_row = (K / 128u) * 34u;
             kernels::dequant_pq2_0(bb + row * bytes_per_row, K / 128u, dst);
+            return {};
+        }
+        case DataType::Q2_0: {
+            if ((K % 64u) != 0) {
+                return fail(ErrorCode::InvalidModel,
+                            fmt::format("Q2_0 read_row requires K%64==0, got {}", K),
+                            "weight_dispatch");
+            }
+            const std::size_t bytes_per_row = (K / 64u) * 18u;
+            kernels::dequant_q2_0(bb + row * bytes_per_row, K / 64u, dst);
             return {};
         }
         case DataType::Q4_K: {
