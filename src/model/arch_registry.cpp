@@ -64,9 +64,14 @@ constexpr std::array<ArchSpec, 14> k_archs{{
      "needs multi-head latent attention (compressed KV, q_a/q_b/kv_a/kv_b "
      "projections) and MoE with grouped routing, shared experts and expert bias"},
 
+    // Not a standalone model: Ternary-Bonsai-27B-dspark is 6 blocks / 3.6B
+    // with no tokenizer, and its target_layers key names layers of a
+    // 64-layer host. It is a diffusion drafter that reads the host's hidden
+    // states and denoises a block of tokens ahead of it.
     {"dspark", false, {}, {}, {}, {}, {}, false,
-     "diffusion language model, not autoregressive: block denoising does not "
-     "fit prefill/decode. Also needs ternary weight kernels"},
+     "speculative-decoding drafter for a host model, not standalone: no "
+     "tokenizer, and target_layers indexes into the host. Needs a block "
+     "denoising loop (not autoregressive) plus the Q2_0 dtype"},
 
     {"dflash-draft", false, {}, {}, {}, {}, {}, false,
      "speculative-decoding draft head, not a standalone model: the file has no "

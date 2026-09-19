@@ -18,6 +18,7 @@ const char* to_string(DataType t) noexcept {
     case DataType::Q5_K: return "Q5_K";
     case DataType::Q8_K: return "Q8_K";
     case DataType::BF16: return "BF16";
+    case DataType::Q2_0: return "Q2_0";
     case DataType::PQ2_0:  return "PQ2_0";
     case DataType::PTQ1_0: return "PTQ1_0";
     case DataType::Unknown: return "Unknown";

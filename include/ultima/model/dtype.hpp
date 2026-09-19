@@ -26,6 +26,7 @@ enum class DataType : std::uint32_t {
     Q5_K = 13,
     Q8_K = 15,
     BF16 = 30,
+    Q2_0 = 42,   // upstream 2-bit; the dspark drafter stores its embedding in it
 
     // Prism-private ternary formats, used by the Ternary-Bonsai builds.
     // Not in the public GGUF spec — these ids come from the PrismML-Eng

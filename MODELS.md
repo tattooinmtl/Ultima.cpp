@@ -19,7 +19,7 @@ GGUFs and reports each file individually.
 | `qwen35`     | runnable | Qwen3.5 / Qwen3-Next hybrid: gated delta-net linear attention on 3 of every 4 blocks, full attention with a per-element output gate on the fourth. No KV for the recurrent layers. Covers the ternary Bonsai builds too |
 | `qwen35moe`  | not yet  | the `qwen35` delta-net hybrid plus MoE with shared experts (the one local file is blocked on shared experts, not on the hybrid) |
 | `deepseek2`  | not yet  | multi-head latent attention (compressed KV) and MoE with grouped routing, shared experts, expert bias |
-| `dspark`     | never*   | diffusion LM — block denoising is not autoregressive, so it does not fit prefill/decode at all |
+| `dspark`     | not yet  | **not a standalone model**: a diffusion drafter that attaches to a host. `Ternary-Bonsai-27B-dspark` is 6 blocks / 3.6B, has no tokenizer, and its `target_layers` [1,16,31,46,61] index a 64-layer host — its dims match `Ternary-Bonsai-2-27B` exactly. Needs a block-denoising speculative loop plus `Q2_0` |
 | `dflash-draft` | never* | speculative-decoding draft head: no tokenizer, no `token_embd`, no output head. Only usable attached to its target model |
 | `llama`      | not yet  | Norm-style RoPE validation and llama-specific tensor aliases |
 | `bert`       | not yet  | encoder-only; needs a pooling path rather than causal prefill/decode |
@@ -41,6 +41,7 @@ Unless noted, a supported dtype works in matvec, row reads and 1-D dequant.
 | Q5_0   | 32    | 22    | |
 | Q5_1   | 32    | 24    | **not implemented** |
 | Q8_0   | 32    | 34    | |
+| Q2_0   | 32    | ?     | **not implemented** — upstream type 42; only the dspark drafter's embedding uses it |
 | Q2_K   | 256   | 84    | **not implemented** |
 | Q3_K   | 256   | 110   | **not implemented** |
 | Q4_K   | 256   | 144   | |

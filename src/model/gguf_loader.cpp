@@ -263,7 +263,8 @@ Result<void> GgufLoader::read_tensor_directory_(GgufReader& r, std::uint64_t ten
         }
         auto raw_type = r.read_scalar<std::uint32_t>();
         if (!raw_type) return Failure{raw_type.error()};
-        t.dtype = map_dtype(*raw_type);
+        t.dtype     = map_dtype(*raw_type);
+        t.raw_dtype = *raw_type;
 
         auto off = r.read_scalar<std::uint64_t>();
         if (!off) return Failure{off.error()};

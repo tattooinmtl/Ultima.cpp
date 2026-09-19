@@ -211,10 +211,18 @@ int inspect(const char* path_cstr, const char* filter_cstr) {
                         tensors.size() - t_printed);
             break;
         }
-        std::printf("  %-40s %-16s %-6s %s\n",
+        // Name the raw GGUF id for a type we do not know, so an unsupported
+        // file can be identified rather than only rejected.
+        char dts[32];
+        if (t.dtype == ultima::model::DataType::Unknown) {
+            std::snprintf(dts, sizeof(dts), "id:%u", t.raw_dtype);
+        } else {
+            std::snprintf(dts, sizeof(dts), "%s", ultima::model::to_string(t.dtype));
+        }
+        std::printf("  %-40s %-16s %-8s %s\n",
                     t.name.c_str(),
                     format_dims(t.dims).c_str(),
-                    ultima::model::to_string(t.dtype),
+                    dts,
                     format_bytes(t.size_bytes).c_str());
         ++t_printed;
     }
