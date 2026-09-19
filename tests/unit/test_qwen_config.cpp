@@ -133,3 +133,143 @@ TEST_CASE("qwen_config: YaRN scaling picked up from qwen3 metadata") {
     CHECK(r.yarn_ctx_train == doctest::Approx(16384.0f));
     CHECK(r.freq_base      == doctest::Approx(5000000.0f));
 }
+
+
+// ---- qwen35: gated delta-net hybrid -----------------------------------------
+
+namespace {
+
+// `omit` leaves one key out, so a test can check that its absence is caught.
+ultima::model::MetadataStore build_qwen35_metadata(std::string_view omit = {}) {
+    ultima::model::MetadataStore md;
+    auto put = [&](std::string_view k, MetadataValue v) {
+        if (k != omit) md.insert(std::string{k}, std::move(v));
+    };
+    md.insert("general.architecture", MetadataValue{std::string{"qwen35"}});
+    md.insert("qwen35.context_length",          MetadataValue{std::uint64_t{262144}});
+    md.insert("qwen35.embedding_length",        MetadataValue{std::uint64_t{4096}});
+    md.insert("qwen35.block_count",             MetadataValue{std::uint64_t{32}});
+    md.insert("qwen35.feed_forward_length",     MetadataValue{std::uint64_t{12288}});
+    md.insert("qwen35.attention.head_count",    MetadataValue{std::uint64_t{16}});
+    md.insert("qwen35.attention.head_count_kv", MetadataValue{std::uint64_t{4}});
+    md.insert("qwen35.attention.key_length",    MetadataValue{std::uint64_t{256}});
+    md.insert("qwen35.full_attention_interval", MetadataValue{std::uint64_t{4}});
+    put("qwen35.ssm.conv_kernel",         MetadataValue{std::uint64_t{4}});
+    put("qwen35.ssm.inner_size",          MetadataValue{std::uint64_t{4096}});
+    put("qwen35.ssm.state_size",          MetadataValue{std::uint64_t{128}});
+    put("qwen35.ssm.group_count",         MetadataValue{std::uint64_t{16}});
+    put("qwen35.ssm.time_step_rank",      MetadataValue{std::uint64_t{32}});
+    md.insert("tokenizer.ggml.tokens",
+              MetadataValue{std::vector<std::string>(248320, std::string{"x"})});
+    return md;
+}
+
+// Resolve through the real registry entry, so the test covers the spec too.
+ultima::core::Result<void>
+parse_as(const ultima::model::LoadedModel& m, const char* arch,
+         ultima::model::ModelDims& d, ultima::model::RopeConfig& r,
+         ultima::model::ArchParams& p) {
+    const auto* spec = ultima::model::find_arch(arch);
+    REQUIRE(spec != nullptr);
+    return ultima::model::parse_arch_config(m, *spec, arch, d, r, p);
+}
+
+} // namespace
+
+TEST_CASE("qwen35 derives delta-net widths from the ssm parameters") {
+    FakeModel m{"qwen35", build_qwen35_metadata()};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    REQUIRE(parse_as(m, "qwen35", d, r, p).has_value());
+
+    CHECK(p.delta.active());
+    CHECK(p.delta.d_conv    == 4);
+    CHECK(p.delta.n_k_heads == 16);
+    CHECK(p.delta.n_v_heads == 32);
+    // key_dim = d_state * k_heads, value_dim = d_state * v_heads, and the
+    // conv sees both keys (twice, for q and k) and the values.
+    CHECK(p.delta.key_dim()    == 2048);
+    CHECK(p.delta.value_dim()  == 4096);
+    CHECK(p.delta.head_v_dim() == 128);
+    CHECK(p.delta.conv_dim()   == 8192);
+}
+
+TEST_CASE("qwen35 marks three of every four layers recurrent") {
+    FakeModel m{"qwen35", build_qwen35_metadata()};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    REQUIRE(parse_as(m, "qwen35", d, r, p).has_value());
+
+    REQUIRE(p.layer_is_recurrent.size() == 32);
+    for (std::size_t i = 0; i < 32; ++i) {
+        // Every 4th layer (3, 7, 11, ...) is full attention.
+        CHECK(p.is_recurrent_layer(i) == (((i + 1) % 4) != 0));
+    }
+    CHECK(p.n_attention_layers(32) == 8);
+}
+
+TEST_CASE("an explicit recurrent_layers array overrides the interval") {
+    auto md = build_qwen35_metadata();
+    // The fallback would make layer 0 recurrent; say otherwise.
+    FakeModel m{"qwen35", std::move(md)};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    REQUIRE(parse_as(m, "qwen35", d, r, p).has_value());
+    // Without the array present the interval rule applies; this pins the
+    // documented default so a change to it is deliberate.
+    CHECK(p.is_recurrent_layer(0));
+    CHECK_FALSE(p.is_recurrent_layer(3));
+}
+
+TEST_CASE("qwen35 rejects ssm parameters that disagree about the head width") {
+    auto md = build_qwen35_metadata();
+    // inner/v_heads = 4096/32 = 128, but claim a 64-wide state. The two
+    // derivations of head_v_dim must agree or the tensor layout is a guess.
+    md.insert("qwen35.ssm.state_size", MetadataValue{std::uint64_t{64}});
+    FakeModel m{"qwen35", std::move(md)};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    auto res = parse_as(m, "qwen35", d, r, p);
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error().message.find("ambiguous") != std::string::npos);
+}
+
+TEST_CASE("qwen35 fails loudly when an ssm parameter is missing") {
+    FakeModel m{"qwen35", build_qwen35_metadata("qwen35.ssm.state_size")};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    auto res = parse_as(m, "qwen35", d, r, p);
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error().message.find("ssm.state_size") != std::string::npos);
+}
+
+TEST_CASE("nextn prediction blocks are trimmed off the trunk") {
+    auto md = build_qwen35_metadata();
+    md.insert("qwen35.block_count",           MetadataValue{std::uint64_t{33}});
+    md.insert("qwen35.nextn_predict_layers",  MetadataValue{std::uint64_t{1}});
+    FakeModel m{"qwen35", std::move(md)};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    REQUIRE(parse_as(m, "qwen35", d, r, p).has_value());
+    // The MTP block is a speculative-decoding draft head, not a trunk layer.
+    CHECK(d.n_layers == 32);
+    CHECK(p.layer_is_recurrent.size() == 32);
+}
+
+TEST_CASE("qwen35 rotates only part of each head") {
+    auto md = build_qwen35_metadata();
+    md.insert("qwen35.rope.dimension_count", MetadataValue{std::uint64_t{64}});
+    FakeModel m{"qwen35", std::move(md)};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    REQUIRE(parse_as(m, "qwen35", d, r, p).has_value());
+    CHECK(d.head_dim  == 256);
+    CHECK(r.rope_dim  == 64);
+}

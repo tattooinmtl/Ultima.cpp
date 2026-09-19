@@ -23,6 +23,10 @@ enum class FfnAct {
 enum class QkvKind {
     Separate,       // attn_q / attn_k / attn_v
     Fused,          // one attn_qkv holding [Q || K || V]
+    // attn_q is double width and carries an output gate alongside the query,
+    // interleaved per head: [h0_q | h0_gate | h1_q | h1_gate | ...]. The gate
+    // goes through a sigmoid and scales the attention result (qwen35).
+    SeparateQGate,
 };
 
 // Rotary convention. NeoX rotates (i, i + rope_dim/2); Norm rotates the
@@ -50,6 +54,12 @@ struct ArchSpec {
     // derivable from metadata, so it lives here rather than being probed
     // from the presence of an attn_gate tensor.
     bool      attn_gate  = false;
+
+    // Blocks alternate between full attention and a recurrent mixer
+    // (gated delta-net linear attention). qwen35 runs the delta-net on 3 of
+    // every 4 blocks. This flag only says to go looking; which layers are
+    // recurrent comes from metadata.
+    bool      hybrid_recurrent = false;
 
     // Human-readable. For supported archs, a short family description; for
     // unsupported ones, the engine work the file still needs.

@@ -113,3 +113,43 @@ look at. Subtasks for a phase live in `.ultima/todos.json`, not here.
   frequently stops after one failed call rather than recovering. That is a
   model-capability limit, and the reason Phase 4 exists: one phase at a time,
   each small enough to be a single confident step.
+
+## qwen35 track (started 2026-09-18)
+
+Goal: run Qwopus3.5-9B-Coder (a 9B coder, on-target for this box) and then
+Ternary-Bonsai-2-27B-PQ2_0. Both are arch `qwen35`; Bonsai adds two layers.
+
+Correction on the record: qwen35 was noted as "unreferenced". Wrong. Upstream
+llama.cpp implements it in full at src/models/qwen35.cpp.
+
+Oracles, both required, both built/cloned under C:\Llama:
+- llama.cpp @ master     -> qwen35 base. Verified: runs Qwopus at 6.24 tok/s.
+- prism-llama.cpp @ prism -> PQ2_0 + Hadamard. Upstream hard-rejects PQ2_0 at
+  tensor-info parse, so it cannot serve as the oracle for the ternary files.
+  Note the hadamard-* branches are v1-era; the live line is `prism`/`fwht`.
+
+- [x] Q2: qwen35 config + tensor resolution. **Done 2026-09-18.** All five
+      dense qwen35 files resolve every tensor; `ultima archinfo` prints the
+      layout. 251 tests pass (7 new). ssm_* params, the recurrent-layer
+      map (explicit `recurrent_layers` key, else (i+1)%4!=0), rope_sections[4],
+      and both layer kinds' tensor slots. Provable: all 427/851 tensors resolve
+      with the dims the reference computes.
+- [ ] Q3: delta-net kernels + recurrent state cache. Causal conv1d carrying
+      state, per-head L2 norm, softplus, the gated delta rule. The state cache
+      is new engine plumbing beside the KV cache: conv state [d_conv-1,
+      conv_channels] and delta state [head_v_dim, head_v_dim, n_v_heads].
+- [ ] Q4: MRoPE + the full-attention layer (fused QKV whose Q half is
+      query+gate), post_attention_norm, then wire block_forward. Provable:
+      greedy decode matches the oracle token-for-token on Qwopus.
+- [ ] Q5: PQ2_0 (+PTQ1_0) kernels. Block 128, one fp16 scale + 2 bits each =
+      34 B, y=(q-1)*d over {-1,0,+1,+2}. Simpler than the K-quants.
+- [ ] Q6: Hadamard activation transform. The GGUF is self-describing:
+      prism.hadamard.{transform,block_size=1024,axis,sign_mode=explicit,
+      sign_values<28672>,weight_names<401>,inverse_weight_names<1>}. Applied to
+      the activation before the matvec for each registered weight, which is one
+      choke point in our matvec path. Implement as in-place FWHT with sign
+      flips, not a materialized 1024x1024 matrix.
+
+Q2-Q4 get the 9B coder running using quant types we already support. Q5-Q6 add
+Bonsai. Doing them in that order means the architecture is verified against a
+working oracle before the ternary layers are stacked on top.

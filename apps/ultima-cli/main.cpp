@@ -3,6 +3,8 @@
 #include "ultima/kv_cache/kv_cache.hpp"
 #include "ultima/model/arch_registry.hpp"
 #include "ultima/model/i_model_loader.hpp"
+#include "ultima/model/qwen_config.hpp"
+#include "ultima/model/qwen_tensor_slots.hpp"
 #include "ultima/model/imodel.hpp"
 #include "ultima/model/metadata_store.hpp"
 #include "ultima/runtime/thread_pool.hpp"
@@ -11,6 +13,7 @@
 #include "ultima/tokenizer/tokenizer.hpp"
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <chrono>
@@ -37,7 +40,8 @@ int print_help() {
         "Usage:\n"
         "  ultima --version                              print version and exit\n"
         "  ultima --help                                 print this help and exit\n"
-        "  ultima --inspect <path.gguf>                  parse a GGUF file, print metadata + tensors\n"
+        "  ultima --inspect <path.gguf> [filter]         parse a GGUF file, print metadata + tensors\n"
+        "                                                filter: case-insensitive substring, shows all matches\n"
         "  ultima archs                                  list known architectures and their status\n"
         "  ultima scan <dir>                             report which GGUFs in <dir> Ultima can run\n"
         "  ultima run <path.gguf> [--prompt S] [--n-predict N]  one-shot completion, then exit\n"
@@ -107,7 +111,52 @@ std::string format_value(const ultima::model::MetadataValue& v) {
     return std::visit(Visitor{}, v);
 }
 
-int inspect(const char* path_cstr) {
+// Short numeric arrays are almost always structural parameters — MRoPE
+// dimension sections, per-layer flags — so print them rather than just their
+// length. Long ones stay summarised; nobody needs 28672 Hadamard signs inline.
+std::string format_array_value(const ultima::model::LoadedModel& model,
+                               const ultima::model::MetadataValue& v) {
+    using namespace ultima::model;
+    const auto* a = std::get_if<MetadataArrayView>(&v);
+    if (!a || a->count == 0 || a->count > 16) return format_value(v);
+
+    std::vector<std::string> parts;
+    switch (a->element_type) {
+    case 4: case 5: case 10: case 11: {           // u32 / i32 / u64 / i64
+        for (auto x : read_i32_array(model, *a)) parts.push_back(fmt::format("{}", x));
+        break;
+    }
+    case 6: {                                     // f32
+        for (auto x : read_f32_array(model, *a)) parts.push_back(fmt::format("{}", x));
+        break;
+    }
+    case 0: case 1: case 7: {                     // u8 / i8 / bool
+        for (auto x : read_u8_array(model, *a)) parts.push_back(fmt::format("{}", x));
+        break;
+    }
+    default: return format_value(v);
+    }
+    if (parts.empty()) return format_value(v);
+    return "[" + fmt::format("{}", fmt::join(parts, ", ")) + "]";
+}
+
+std::string to_lower(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
+}
+
+// `filter` is an optional case-insensitive substring. When given, every
+// matching key and tensor is printed with no truncation — the default
+// 30-key/12-tensor summary is for orientation, but tracking down one
+// architecture's parameters means seeing all of them.
+int inspect(const char* path_cstr, const char* filter_cstr) {
+    const std::string filter = filter_cstr ? to_lower(filter_cstr) : std::string{};
+    const bool filtering = !filter.empty();
+    auto matches = [&](const std::string& s) {
+        return !filtering || to_lower(s).find(filter) != std::string::npos;
+    };
     std::filesystem::path path{path_cstr};
 
     auto loader = ultima::model::make_gguf_loader();
@@ -135,31 +184,42 @@ int inspect(const char* path_cstr) {
     keys.reserve(md.all().size());
     for (const auto& kv : md.all()) keys.push_back(kv.first);
     std::sort(keys.begin(), keys.end());
-    std::size_t printed = 0;
+    std::size_t printed = 0, skipped = 0;
     for (const auto& k : keys) {
-        if (printed >= 30) {
-            std::printf("  ... (%zu more)\n", keys.size() - printed);
+        if (!matches(k)) { ++skipped; continue; }
+        if (!filtering && printed >= 30) {
+            std::printf("  ... (%zu more; pass a filter to see them)\n",
+                        keys.size() - printed);
             break;
         }
         const auto* v = md.find(k);
-        std::printf("  %-40s = %s\n", k.c_str(), format_value(*v).c_str());
+        std::printf("  %-40s = %s\n", k.c_str(), format_array_value(model, *v).c_str());
         ++printed;
+    }
+    if (filtering) {
+        std::printf("  (%zu matched '%s', %zu hidden)\n", printed, filter.c_str(), skipped);
     }
     std::printf("\n");
 
     const auto& tensors = model.tensor_infos();
     std::printf("Tensors (%zu total):\n", tensors.size());
-    const std::size_t show = std::min<std::size_t>(tensors.size(), 12);
-    for (std::size_t i = 0; i < show; ++i) {
-        const auto& t = tensors[i];
+    std::size_t t_printed = 0;
+    for (const auto& t : tensors) {
+        if (!matches(t.name)) continue;
+        if (!filtering && t_printed >= 12) {
+            std::printf("  ... (%zu more; pass a filter to see them)\n",
+                        tensors.size() - t_printed);
+            break;
+        }
         std::printf("  %-40s %-16s %-6s %s\n",
                     t.name.c_str(),
                     format_dims(t.dims).c_str(),
                     ultima::model::to_string(t.dtype),
                     format_bytes(t.size_bytes).c_str());
+        ++t_printed;
     }
-    if (tensors.size() > show) {
-        std::printf("  ... (%zu more)\n", tensors.size() - show);
+    if (filtering) {
+        std::printf("  (%zu matched '%s')\n", t_printed, filter.c_str());
     }
     std::printf("\n");
 
@@ -298,6 +358,95 @@ int list_archs() {
                     a.supported ? "runnable" : "not yet",
                     static_cast<int>(a.notes.size()), a.notes.data());
     }
+    return 0;
+}
+
+// ---- archinfo ---------------------------------------------------------------
+
+// Run the two load-time steps that come before any arithmetic — config
+// parsing and tensor resolution — and print what they produced. An
+// architecture under construction reaches this long before `run` works, so
+// this is how its layout gets checked against the reference.
+int archinfo(const char* path_cstr) {
+    using namespace ultima::model;
+
+    auto loader = make_gguf_loader();
+    auto model_r = loader->load(std::filesystem::path{path_cstr});
+    if (!model_r) {
+        const auto& e = model_r.error();
+        std::fprintf(stderr, "ultima archinfo: %s\n", e.message.c_str());
+        return 1;
+    }
+    const auto& gguf = **model_r;
+
+    const auto arch_v = gguf.metadata().get<std::string>("general.architecture");
+    if (!arch_v) {
+        std::fprintf(stderr, "ultima archinfo: no general.architecture\n");
+        return 1;
+    }
+    const std::string arch = *arch_v;
+    const ArchSpec* spec = find_arch(arch);
+    if (!spec) {
+        std::fprintf(stderr, "ultima archinfo: '%s' is not in the registry\n", arch.c_str());
+        return 1;
+    }
+
+    ModelDims  d{};
+    RopeConfig rp{};
+    ArchParams p{};
+    if (auto r = parse_arch_config(gguf, *spec, arch, d, rp, p); !r) {
+        std::fprintf(stderr, "ultima archinfo: config failed: %s\n", r.error().message.c_str());
+        return 1;
+    }
+
+    std::printf("Architecture: %s  (%s)\n", arch.c_str(),
+                spec->supported ? "runnable" : "not runnable yet");
+    std::printf("  layers %zu   hidden %zu   ffn %zu   vocab %zu   ctx_train %zu\n",
+                d.n_layers, d.hidden, d.ffn_hidden, d.vocab, d.n_ctx_train);
+    std::printf("  heads %zu   kv_heads %zu   head_dim %zu   q_dim %zu   kv_dim %zu\n",
+                d.n_heads, d.n_kv_heads, d.head_dim, d.q_dim, d.kv_dim);
+    std::printf("  rope: dim %zu of %zu   base %g\n", rp.rope_dim, d.head_dim, rp.freq_base);
+
+    if (p.delta.active()) {
+        const auto& dn = p.delta;
+        std::printf("  delta-net: d_conv %zu  d_inner %zu  d_state %zu  "
+                    "k_heads %zu  v_heads %zu\n",
+                    dn.d_conv, dn.d_inner, dn.d_state, dn.n_k_heads, dn.n_v_heads);
+        std::printf("             key_dim %zu  value_dim %zu  head_v_dim %zu  conv_dim %zu\n",
+                    dn.key_dim(), dn.value_dim(), dn.head_v_dim(), dn.conv_dim());
+        const std::size_t n_attn = p.n_attention_layers(d.n_layers);
+        std::printf("  layer mix: %zu recurrent, %zu attention (KV only for those)\n",
+                    d.n_layers - n_attn, n_attn);
+        std::printf("             ");
+        for (std::size_t i = 0; i < d.n_layers; ++i) {
+            std::printf("%c", p.is_recurrent_layer(i) ? 'r' : 'A');
+        }
+        std::printf("\n");
+    }
+
+    auto t = resolve_model_tensors(gguf, arch, d, p);
+    if (!t) {
+        std::fprintf(stderr, "  TENSORS FAILED: %s\n", t.error().message.c_str());
+        return 1;
+    }
+    std::size_t resolved = 3;   // token_embd, output_norm, output_head
+    for (const auto& b : t->blocks) {
+        for (const WeightRef* w : {&b.attn_norm, &b.attn_q, &b.attn_k, &b.attn_v,
+                                   &b.attn_qkv, &b.attn_out, &b.attn_gate, &b.ffn_norm,
+                                   &b.ffn_gate, &b.ffn_up, &b.ffn_down,
+                                   &b.ffn_gate_inp, &b.ffn_gate_exps, &b.ffn_up_exps,
+                                   &b.ffn_down_exps,
+                                   &b.ssm_in, &b.ssm_gate, &b.ssm_conv1d, &b.ssm_dt_bias,
+                                   &b.ssm_a, &b.ssm_beta, &b.ssm_alpha, &b.ssm_norm,
+                                   &b.ssm_out}) {
+            resolved += w->valid();
+        }
+        resolved += b.attn_q_norm.has_value() + b.attn_k_norm.has_value();
+        resolved += b.attn_q_bias.has_value() + b.attn_k_bias.has_value()
+                  + b.attn_v_bias.has_value();
+    }
+    std::printf("  tensors: all required slots resolved (%zu of %zu in file)\n",
+                resolved, gguf.tensor_infos().size());
     return 0;
 }
 
@@ -562,7 +711,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ultima --inspect: missing path\n");
             return 2;
         }
-        return inspect(argv[2]);
+        return inspect(argv[2], argc > 3 ? argv[3] : nullptr);
     }
     if (arg == "serve") {
         return serve(argc, argv);
@@ -572,6 +721,13 @@ int main(int argc, char** argv) {
     }
     if (arg == "archs") {
         return list_archs();
+    }
+    if (arg == "archinfo") {
+        if (argc < 3) {
+            std::fprintf(stderr, "ultima archinfo: missing path\n");
+            return 2;
+        }
+        return archinfo(argv[2]);
     }
     if (arg == "scan") {
         if (argc < 3) {

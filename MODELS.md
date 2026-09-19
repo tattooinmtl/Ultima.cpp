@@ -16,7 +16,7 @@ GGUFs and reports each file individually.
 | `phi3`       | runnable | Fused QKV and fused gate/up, LongRoPE frequency factors |
 | `spark2_5`   | runnable | Fused QKV, per-head sigmoid attention gate, GEGLU FFN, 3-of-4 sliding-window layers with their own RoPE dim and base |
 | `gemma4`     | not yet  | per-layer KV head counts, alternating sliding-window attention, dual RoPE bases, post-attention/post-FFN norms, final logit softcapping |
-| `qwen35`     | not yet  | hybrid SSM/Mamba layers (`ssm_*`, 3 of every 4 blocks), MRoPE sections, SSM state cache |
+| `qwen35`     | not yet  | gated delta-net linear attention (`ssm_*`, 3 of every 4 blocks) + a recurrent state cache. **Reference exists**: supported upstream in llama.cpp as Qwen3-Next/Qwen3.5 |
 | `qwen35moe`  | not yet  | the `qwen35` SSM hybrid plus MoE with shared experts |
 | `deepseek2`  | not yet  | multi-head latent attention (compressed KV) and MoE with grouped routing, shared experts, expert bias |
 | `dspark`     | never*   | diffusion LM — block denoising is not autoregressive, so it does not fit prefill/decode at all |
@@ -47,6 +47,8 @@ Unless noted, a supported dtype works in matvec, row reads and 1-D dequant.
 | Q5_K   | 256   | 176   | |
 | Q6_K   | 256   | 210   | |
 | Q8_K   | 256   | 292   | **not implemented** |
+| PQ2_0  | g128  | ~2.13 bits | **not implemented** — ternary {−1,0,+1}, PrismML fork only |
+| PTQ1_0 | g128  | ~1.75 bits | **not implemented** — dense ternary trits, PrismML fork only |
 
 IQ-series (`IQ1_*`…`IQ4_*`) and the ternary `TQ*` formats are not implemented.
 
@@ -61,8 +63,10 @@ IQ-series (`IQ1_*`…`IQ4_*`) and the ternary `TQ*` formats are not implemented.
 
 ## Architectures without a public reference
 
-`gemma4`, `qwen35`, `qwen35moe`, `dspark` and `dflash-draft` do not correspond
-to architectures Ultima has a reference implementation for. Their GGUF metadata
+`gemma4`, `dspark` and `dflash-draft` do not correspond to architectures
+Ultima has a reference implementation for. (`qwen35`/`qwen35moe` were listed
+here until 2026-09-18; they are in fact supported upstream in llama.cpp as
+Qwen3-Next/Qwen3.5, so they are knowable work.) Their GGUF metadata
 uses llama.cpp-style key names, but the semantics behind those keys cannot be
 settled by inspection alone.
 

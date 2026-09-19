@@ -80,6 +80,22 @@ struct ModelTensors {
         // Qwen3 / Qwen3-MoE per-head Q/K normalization.
         std::optional<WeightRef> attn_q_norm;   // [head_dim]
         std::optional<WeightRef> attn_k_norm;   // [head_dim]
+
+        // ---- Gated delta-net layers (qwen35) --------------------------------
+        // Populated only when ArchParams::is_recurrent_layer(i). These blocks
+        // have no attn_q/k/v and no KV at all; `attn_qkv` here is the
+        // delta-net's own mixed projection, a different width from the fused
+        // attention QKV above.
+        bool      is_recurrent = false;
+        WeightRef ssm_in;        // [key_dim*2 + value_dim, hidden]  (blk.N.attn_qkv)
+        WeightRef ssm_gate;      // [value_dim, hidden]              (blk.N.attn_gate)
+        WeightRef ssm_conv1d;    // [conv_dim, d_conv]
+        WeightRef ssm_dt_bias;   // [n_v_heads]
+        WeightRef ssm_a;         // [n_v_heads]  — log decay, already negated
+        WeightRef ssm_beta;      // [n_v_heads, hidden]
+        WeightRef ssm_alpha;     // [n_v_heads, hidden]
+        WeightRef ssm_norm;      // [head_v_dim]
+        WeightRef ssm_out;       // [hidden, value_dim]
     };
     std::vector<Block> blocks;
 };

@@ -64,7 +64,12 @@ parse_arch_config(const LoadedModel& gguf,
     reqs.push_back({"context_length",         &d.n_ctx_train, {arch + ".context_length"}});
     reqs.push_back({"embedding_length",       &d.hidden,      {arch + ".embedding_length"}});
     reqs.push_back({"block_count",            &d.n_layers,    {arch + ".block_count"}});
-    reqs.push_back({"feed_forward_length",    &d.ffn_hidden,  {arch + ".feed_forward_length"}});
+    // A pure-MoE block has no dense FFN, so its width is only in
+    // expert_feed_forward_length; requiring the dense key would reject the
+    // file over a number it never uses.
+    if (spec.ffn != FfnKind::SparseMoE) {
+        reqs.push_back({"feed_forward_length", &d.ffn_hidden, {arch + ".feed_forward_length"}});
+    }
     reqs.push_back({"attention.head_count",   &d.n_heads,     {arch + ".attention.head_count"}});
     reqs.push_back({"attention.head_count_kv",&d.n_kv_heads,  {arch + ".attention.head_count_kv",
                                                                 arch + ".attention.head_count"}});
@@ -76,6 +81,27 @@ parse_arch_config(const LoadedModel& gguf,
                         "arch_config");
         }
         *r.out = static_cast<std::size_t>(*v);
+    }
+
+    if (spec.ffn == FfnKind::SparseMoE) {
+        if (auto v = get_uint_any(md, {arch + ".feed_forward_length"})) {
+            d.ffn_hidden = static_cast<std::size_t>(*v);
+        }
+    }
+
+    // Multi-token-prediction blocks sit at the end of the block list. They
+    // are a speculative-decoding draft head, not part of the trunk, and they
+    // carry a different tensor set — so block_count overcounts the layers
+    // that actually run. Trim them rather than failing on their tensors.
+    if (auto v = get_uint_any(md, {arch + ".nextn_predict_layers"}); v && *v > 0) {
+        const auto n_mtp = static_cast<std::size_t>(*v);
+        if (n_mtp >= d.n_layers) {
+            return fail(ErrorCode::InvalidModel,
+                        fmt::format("'{}.nextn_predict_layers' is {} but the model "
+                                    "only declares {} blocks", arch, n_mtp, d.n_layers),
+                        "arch_config");
+        }
+        d.n_layers -= n_mtp;
     }
 
     // Vocab from tokenizer.
@@ -230,6 +256,89 @@ parse_arch_config(const LoadedModel& gguf,
 
     p.attn_gate = spec.attn_gate;
 
+    // ---- Gated delta-net (qwen35 hybrid) ------------------------------------
+    // Three of every four blocks swap attention for a recurrence. Every
+    // parameter below is required once the architecture declares itself
+    // hybrid: guessing a state width would produce a model that loads and
+    // then emits noise, which is the failure mode this whole path exists to
+    // avoid.
+    if (spec.hybrid_recurrent) {
+        struct SsmReq { const char* label; std::size_t* out; };
+        const SsmReq ssm_reqs[] = {
+            {"ssm.conv_kernel",    &p.delta.d_conv},
+            {"ssm.inner_size",     &p.delta.d_inner},
+            {"ssm.state_size",     &p.delta.d_state},
+            {"ssm.group_count",    &p.delta.n_k_heads},
+            {"ssm.time_step_rank", &p.delta.n_v_heads},
+        };
+        for (const auto& r : ssm_reqs) {
+            auto v = get_uint_any(md, {arch + "." + r.label});
+            if (!v || *v == 0) {
+                return fail(ErrorCode::MissingRequiredMetadata,
+                            fmt::format("'{}' is a hybrid recurrent architecture but "
+                                        "'{}.{}' is missing or zero", arch, arch, r.label),
+                            "arch_config");
+            }
+            *r.out = static_cast<std::size_t>(*v);
+        }
+        if (p.delta.d_inner % p.delta.n_v_heads != 0) {
+            return fail(ErrorCode::InvalidModel,
+                        fmt::format("ssm.inner_size {} not divisible by "
+                                    "ssm.time_step_rank {}",
+                                    p.delta.d_inner, p.delta.n_v_heads),
+                        "arch_config");
+        }
+        // The reference derives the value head width two ways — from the
+        // state size and from inner/heads. They agree on every real file;
+        // if they ever disagree the layouts below would be silently wrong.
+        if (p.delta.head_v_dim() != p.delta.d_state) {
+            return fail(ErrorCode::InvalidModel,
+                        fmt::format("delta-net head width is ambiguous: "
+                                    "inner_size/time_step_rank = {} but "
+                                    "state_size = {}",
+                                    p.delta.head_v_dim(), p.delta.d_state),
+                        "arch_config");
+        }
+        if (p.delta.n_v_heads % p.delta.n_k_heads != 0) {
+            return fail(ErrorCode::InvalidModel,
+                        fmt::format("ssm.time_step_rank {} not divisible by "
+                                    "ssm.group_count {}",
+                                    p.delta.n_v_heads, p.delta.n_k_heads),
+                        "arch_config");
+        }
+
+        // Which layers are recurrent: an explicit per-layer array wins,
+        // otherwise every layer except each `full_attention_interval`-th.
+        p.layer_is_recurrent.assign(d.n_layers, false);
+        bool from_array = false;
+        if (const auto* v = md.find(arch + ".attention.recurrent_layers")) {
+            if (const auto* view = std::get_if<MetadataArrayView>(v)) {
+                const auto flags = read_u8_array(gguf, *view);
+                if (flags.size() < d.n_layers) {
+                    return fail(ErrorCode::InvalidModel,
+                                fmt::format("'{}.attention.recurrent_layers' has {} "
+                                            "entries but the model has {} layers",
+                                            arch, flags.size(), d.n_layers),
+                                "arch_config");
+                }
+                for (std::size_t i = 0; i < d.n_layers; ++i) {
+                    p.layer_is_recurrent[i] = (flags[i] != 0);
+                }
+                from_array = true;
+            }
+        }
+        if (!from_array) {
+            std::size_t interval = 4;
+            if (auto v = get_uint_any(md, {arch + ".full_attention_interval"});
+                v && *v > 0) {
+                interval = static_cast<std::size_t>(*v);
+            }
+            for (std::size_t i = 0; i < d.n_layers; ++i) {
+                p.layer_is_recurrent[i] = ((i + 1) % interval) != 0;
+            }
+        }
+    }
+
     // Granite's scalar corrections; identity when absent.
     if (auto v = get_float_any(md, {arch + ".embedding_scale"})) p.embedding_scale = *v;
     if (auto v = get_float_any(md, {arch + ".residual_scale"}))  p.residual_scale  = *v;
@@ -252,7 +361,7 @@ parse_qwen_config(const LoadedModel& gguf,
     // when the arch is not in the registry.
     static constexpr ArchSpec k_default{
         "", true, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::Separate,
-        RopeStyle::NeoX, /*attn_gate=*/false, ""};
+        RopeStyle::NeoX, /*attn_gate=*/false, /*hybrid_recurrent=*/false, ""};
     ArchParams ignored{};
     return parse_arch_config(gguf, spec ? *spec : k_default, arch,
                              out_dims, out_rope, ignored);

@@ -66,8 +66,48 @@ struct ArchParams {
     // output projection (Spark-X2.5). The gate tensor is [n_heads, hidden].
     bool attn_gate = false;
 
+    // Gated delta-net linear attention (qwen35 / Qwen3-Next). Three of every
+    // four blocks replace attention with this recurrence, so there is no KV
+    // for them at all — they carry a fixed-size state instead, which is why
+    // the architecture is cheap at long context.
+    struct DeltaNet {
+        std::size_t d_conv    = 0;   // causal conv width       (ssm.conv_kernel)
+        std::size_t d_inner   = 0;   // value width             (ssm.inner_size)
+        std::size_t d_state   = 0;   // per-head k/v width      (ssm.state_size)
+        std::size_t n_k_heads = 0;   // key heads               (ssm.group_count)
+        std::size_t n_v_heads = 0;   // value heads             (ssm.time_step_rank)
+
+        std::size_t key_dim()    const noexcept { return d_state * n_k_heads; }
+        std::size_t value_dim()  const noexcept { return d_state * n_v_heads; }
+        std::size_t head_v_dim() const noexcept {
+            return n_v_heads ? d_inner / n_v_heads : 0;
+        }
+        // Width of the fused qkv projection feeding the causal conv.
+        std::size_t conv_dim()   const noexcept { return key_dim() * 2 + value_dim(); }
+
+        bool active() const noexcept { return d_state != 0 && n_v_heads != 0; }
+    };
+    DeltaNet delta;
+
+    // One entry per layer when the architecture is hybrid; empty otherwise.
+    // True means the block uses the delta-net mixer instead of attention.
+    std::vector<bool> layer_is_recurrent;
+
     bool is_swa_layer(std::size_t layer) const noexcept {
         return layer < layer_is_swa.size() && layer_is_swa[layer];
+    }
+
+    bool is_recurrent_layer(std::size_t layer) const noexcept {
+        return layer < layer_is_recurrent.size() && layer_is_recurrent[layer];
+    }
+
+    // Layers that actually allocate KV. For a hybrid model this is a quarter
+    // of them, which is the whole point of the architecture.
+    std::size_t n_attention_layers(std::size_t n_layers) const noexcept {
+        if (layer_is_recurrent.empty()) return n_layers;
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < n_layers; ++i) n += !is_recurrent_layer(i);
+        return n;
     }
 };
 

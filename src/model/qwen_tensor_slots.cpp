@@ -164,7 +164,31 @@ resolve_model_tensors(const LoadedModel& gguf,
         if (auto r = get("attn_norm.weight", d.hidden, 0, b.attn_norm); !r)
             return Failure{r.error()};
 
-        if (p.qkv == QkvKind::Fused) {
+        // A delta-net block has no attention at all: no Q/K/V, no output
+        // projection, and no KV cache entry. It is a different mixer sharing
+        // the same residual stream and the same FFN.
+        b.is_recurrent = p.is_recurrent_layer(i);
+        if (b.is_recurrent) {
+            const auto& dn = p.delta;
+            if (auto r = get("attn_qkv.weight",   dn.conv_dim(),  d.hidden, b.ssm_in);   !r) return Failure{r.error()};
+            if (auto r = get("attn_gate.weight",  dn.value_dim(), d.hidden, b.ssm_gate); !r) return Failure{r.error()};
+            // GGUF stores the conv kernel as [d_conv, conv_dim]; resolve()
+            // takes (rows, cols) with cols the inner/first GGUF dim.
+            if (auto r = get("ssm_conv1d.weight", dn.conv_dim(), dn.d_conv, b.ssm_conv1d); !r)
+                return Failure{r.error()};
+            if (auto r = get("ssm_dt.bias",   dn.n_v_heads, 0,        b.ssm_dt_bias); !r) return Failure{r.error()};
+            if (auto r = get("ssm_a",         dn.n_v_heads, 0,        b.ssm_a);       !r) return Failure{r.error()};
+            if (auto r = get("ssm_beta.weight",  dn.n_v_heads, d.hidden, b.ssm_beta);  !r) return Failure{r.error()};
+            if (auto r = get("ssm_alpha.weight", dn.n_v_heads, d.hidden, b.ssm_alpha); !r) return Failure{r.error()};
+            if (auto r = get("ssm_norm.weight",  dn.head_v_dim(), 0,     b.ssm_norm);  !r) return Failure{r.error()};
+            if (auto r = get("ssm_out.weight",   d.hidden, dn.value_dim(), b.ssm_out); !r) return Failure{r.error()};
+        } else if (p.qkv == QkvKind::SeparateQGate) {
+            // Q carries its own output gate at double width; K and V are
+            // ordinary.
+            if (auto r = get("attn_q.weight", 2 * d.q_dim, d.hidden, b.attn_q); !r) return Failure{r.error()};
+            if (auto r = get("attn_k.weight", d.kv_dim,    d.hidden, b.attn_k); !r) return Failure{r.error()};
+            if (auto r = get("attn_v.weight", d.kv_dim,    d.hidden, b.attn_v); !r) return Failure{r.error()};
+        } else if (p.qkv == QkvKind::Fused) {
             // One matrix producing [Q || K || V] in that order.
             const std::size_t qkv_rows = d.q_dim + 2 * d.kv_dim;
             if (auto r = get("attn_qkv.weight", qkv_rows, d.hidden, b.attn_qkv); !r)
@@ -175,14 +199,22 @@ resolve_model_tensors(const LoadedModel& gguf,
             if (auto r = get("attn_v.weight", d.kv_dim, d.hidden, b.attn_v); !r) return Failure{r.error()};
         }
 
-        if (auto r = get("attn_output.weight", d.hidden, d.q_dim, b.attn_out); !r)
-            return Failure{r.error()};
-        if (p.attn_gate) {
-            if (auto r = get("attn_gate.weight", d.n_heads, d.hidden, b.attn_gate); !r)
+        if (!b.is_recurrent) {
+            if (auto r = get("attn_output.weight", d.hidden, d.q_dim, b.attn_out); !r)
+                return Failure{r.error()};
+            if (p.attn_gate) {
+                if (auto r = get("attn_gate.weight", d.n_heads, d.hidden, b.attn_gate); !r)
+                    return Failure{r.error()};
+            }
+        }
+
+        // The norm on the way into the FFN. qwen35 names it
+        // post_attention_norm because it sits after the attention residual
+        // has been added, but that is the same position in the block.
+        if (auto r = get("ffn_norm.weight", d.hidden, 0, b.ffn_norm); !r) {
+            if (auto r2 = get("post_attention_norm.weight", d.hidden, 0, b.ffn_norm); !r2)
                 return Failure{r.error()};
         }
-        if (auto r = get("ffn_norm.weight", d.hidden, 0, b.ffn_norm); !r)
-            return Failure{r.error()};
 
         switch (p.ffn) {
         case FfnKind::DenseSwiGLU:
