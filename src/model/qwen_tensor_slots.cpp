@@ -128,9 +128,17 @@ Result<ModelTensors>
 resolve_model_tensors(const LoadedModel& gguf,
                       const std::string& arch,
                       const ModelDims&   d,
-                      const ArchParams&  p) {
+                      const ArchParams&  p,
+                      const HadamardFold* fold) {
     (void)arch;   // reserved for future per-arch renames
     ModelTensors t{};
+
+    // Marking happens by GGUF tensor name, which is how the file lists the
+    // folded set. Doing it here means every consumer sees the flag on the
+    // WeightRef and cannot forget to look it up separately.
+    auto mark = [&](WeightRef& w, const std::string& name) {
+        if (fold && fold->is_folded(name)) w.hadamard_folded = true;
+    };
 
     // Top-level tensors.
     if (auto r = resolve(gguf, "token_embd.weight", d.vocab, d.hidden); r) t.token_embd = *r;
@@ -142,6 +150,7 @@ resolve_model_tensors(const LoadedModel& gguf,
     // Output head: try output.weight first, fall back to token_embd (tied).
     if (auto opt = resolve_optional(gguf, "output.weight", d.vocab, d.hidden); opt) {
         t.output_head = *opt;
+        mark(t.output_head, "output.weight");
         t.output_head_is_tied = false;
     } else {
         t.output_head = t.token_embd;
@@ -158,6 +167,7 @@ resolve_model_tensors(const LoadedModel& gguf,
             auto r = resolve(gguf, pfx + suffix, rr, cc);
             if (!r) return Failure{r.error()};
             out = *r;
+            mark(out, pfx + suffix);
             return {};
         };
 

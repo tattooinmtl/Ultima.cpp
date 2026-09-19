@@ -1,3 +1,4 @@
+#include "ultima/kernels/hadamard.hpp"
 #include "ultima/kernels/norms.hpp"
 #include "ultima/kv_cache/kv_cache.hpp"
 #include "ultima/model/arch_registry.hpp"
@@ -10,6 +11,7 @@
 #include <fmt/format.h>
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -38,11 +40,19 @@ public:
     Result<void> init() {
         if (auto r = parse_arch_config(gguf_, spec_, arch_, dims_, rope_, params_); !r)
             return r;
-        auto tensors = resolve_model_tensors(gguf_, arch_, dims_, params_);
+        // The Hadamard fold has to be known before tensor resolution, which
+        // is what marks each weight as folded.
+        auto fold = parse_hadamard_fold(gguf_);
+        if (!fold) return Failure{fold.error()};
+        fold_ = std::move(*fold);
+
+        auto tensors = resolve_model_tensors(gguf_, arch_, dims_, params_,
+                                             fold_ ? &*fold_ : nullptr);
         if (!tensors) return Failure{tensors.error()};
         tensors_ = std::move(*tensors);
 
         scratch_.init(dims_, params_);
+        scratch_.fold = fold_ ? &*fold_ : nullptr;
         if (auto r = preload_scratch_from_tensors(scratch_, tensors_, dims_, params_); !r)
             return r;
 
@@ -127,6 +137,14 @@ private:
                               static_cast<std::size_t>(token), dims_.hidden,
                               scratch_.x.data()); !r) return r;
 
+        // A Hadamard-latent embedding table stores rotated rows, so the
+        // primal basis has to be restored right after the lookup: h = s * (H z).
+        if (fold_ && fold_->is_inverse("token_embd.weight")) {
+            kernels::hadamard_unfold_f32(scratch_.x.data(), scratch_.x.data(),
+                                         dims_.hidden, fold_->block,
+                                         fold_->signs_for(dims_.hidden));
+        }
+
         // Granite scales the embedding before the first block.
         if (params_.embedding_scale != 1.0f) {
             for (std::size_t i = 0; i < dims_.hidden; ++i)
@@ -146,10 +164,18 @@ private:
                                  scratch_.output_norm_f32.data(),
                                  scratch_.x_norm.data(),
                                  dims_.hidden, dims_.rms_eps);
+            const float* head_in = scratch_.x_norm.data();
+            if (tensors_.output_head.hadamard_folded && fold_) {
+                kernels::hadamard_fold_f32(scratch_.x_norm.data(),
+                                           scratch_.fold_buf.data(), dims_.hidden,
+                                           fold_->block,
+                                           fold_->signs_for(dims_.hidden));
+                head_in = scratch_.fold_buf.data();
+            }
             if (auto r = matvec_dispatch_threaded(pool_,
                                                   tensors_.output_head.dtype,
                                                   tensors_.output_head.data,
-                                                  scratch_.x_norm.data(),
+                                                  head_in,
                                                   out_logits,
                                                   dims_.vocab, dims_.hidden); !r) return r;
             // Granite divides the logits by a fixed scale.
@@ -169,6 +195,8 @@ private:
     // SlotHandle, so they must agree.
     static constexpr std::size_t k_state_slots = 8;
     std::unique_ptr<kv_cache::RecurrentState> rstate_;
+
+    std::optional<HadamardFold> fold_;
 
     ModelDims               dims_{};
     RopeConfig              rope_{};

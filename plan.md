@@ -150,7 +150,8 @@ Oracles, both required, both built/cloned under C:\Llama:
       implemented: no local file uses it, so it cannot be verified.
       Original note: PQ2_0 (+PTQ1_0) kernels. Block 128, one fp16 scale + 2 bits each =
       34 B, y=(q-1)*d over {-1,0,+1,+2}. Simpler than the K-quants.
-- [ ] Q6: Hadamard activation transform. The GGUF is self-describing:
+- [x] Q6: **Done 2026-09-18.** Ternary-Bonsai-2-27B generates coherently.
+      285 tests pass. Hadamard activation transform. The GGUF is self-describing:
       prism.hadamard.{transform,block_size=1024,axis,sign_mode=explicit,
       sign_values<28672>,weight_names<401>,inverse_weight_names<1>}. Applied to
       the activation before the matvec for each registered weight, which is one

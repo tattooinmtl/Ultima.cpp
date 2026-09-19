@@ -16,7 +16,7 @@ GGUFs and reports each file individually.
 | `phi3`       | runnable | Fused QKV and fused gate/up, LongRoPE frequency factors |
 | `spark2_5`   | runnable | Fused QKV, per-head sigmoid attention gate, GEGLU FFN, 3-of-4 sliding-window layers with their own RoPE dim and base |
 | `gemma4`     | not yet  | per-layer KV head counts, alternating sliding-window attention, dual RoPE bases, post-attention/post-FFN norms, final logit softcapping |
-| `qwen35`     | runnable | Qwen3.5 / Qwen3-Next hybrid: gated delta-net linear attention on 3 of every 4 blocks, full attention with a per-element output gate on the fourth. No KV for the recurrent layers |
+| `qwen35`     | runnable | Qwen3.5 / Qwen3-Next hybrid: gated delta-net linear attention on 3 of every 4 blocks, full attention with a per-element output gate on the fourth. No KV for the recurrent layers. Covers the ternary Bonsai builds too |
 | `qwen35moe`  | not yet  | the `qwen35` delta-net hybrid plus MoE with shared experts (the one local file is blocked on shared experts, not on the hybrid) |
 | `deepseek2`  | not yet  | multi-head latent attention (compressed KV) and MoE with grouped routing, shared experts, expert bias |
 | `dspark`     | never*   | diffusion LM — block denoising is not autoregressive, so it does not fit prefill/decode at all |
@@ -47,10 +47,34 @@ Unless noted, a supported dtype works in matvec, row reads and 1-D dequant.
 | Q5_K   | 256   | 176   | |
 | Q6_K   | 256   | 210   | |
 | Q8_K   | 256   | 292   | **not implemented** |
-| PQ2_0  | g128  | ~2.13 bits | **not implemented** — ternary {−1,0,+1}, PrismML fork only |
-| PTQ1_0 | g128  | ~1.75 bits | **not implemented** — dense ternary trits, PrismML fork only |
+| PQ2_0  | 128   | 34    | ternary {−1,0,+1,+2} at 2.125 bpw. Prism-private type id 142; stock llama.cpp rejects the file |
+| PTQ1_0 | 128   | 28    | **not implemented** — base-3 trits, 1.75 bpw. No local file uses it, so nothing to verify against |
 
 IQ-series (`IQ1_*`…`IQ4_*`) and the ternary `TQ*` formats are not implemented.
+
+## Hadamard-folded weights
+
+The Ternary-Bonsai builds store every large projection already multiplied by
+an inverse blockwise Hadamard rotation, so the matmul is only correct if the
+*activation* is rotated to match. The product is unchanged mathematically;
+the rotation spreads each weight's information across a 1024-wide block, so
+2-bit error lands as small noise everywhere instead of large error on a few
+outlier channels.
+
+The GGUF is self-describing about this — `prism.hadamard.{version, transform,
+block_size, axis, sign_mode, sign_widths, sign_values, weight_names,
+inverse_weight_names, gdn_v_grouped}` — and Ultima refuses to load a file
+whose transform, axis or sign mode it does not implement exactly. Getting the
+fold wrong does not fail; it produces fluent nonsense, which is why every
+field is checked rather than assumed.
+
+Ultima applies it as an in-place fast Walsh-Hadamard transform, O(n log n),
+rather than materializing the 1024x1024 matrix the reference builds.
+
+- forward, before a folded matmul: `H(signs * x)`, blockwise
+- inverse, after the embedding row lookup: `signs * H(z)`
+- `ssm_out` additionally needs its activation reordered from tiled head
+  layout to the grouped layout the fold was computed in
 
 ## Tokenizers
 

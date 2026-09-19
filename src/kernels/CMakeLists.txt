@@ -15,6 +15,7 @@ add_library(ultima_kernels STATIC
     dequant_q5k.cpp
     dequant_q4_1.cpp
     delta_net.cpp
+    hadamard.cpp
     dequant_pq2_0.cpp
     matvec_pq2_0_f32.cpp
     matvec_bf16_f32.cpp

@@ -79,6 +79,13 @@ struct BlockScratch {
     std::vector<float> ssm_a;        // n_layers * n_v_heads
     std::vector<float> ssm_norm;     // n_layers * head_v_dim
 
+    // Hadamard fold, when the file declares one. Non-owning: the model
+    // outlives the scratch. fold_buf holds one rotated activation; it is
+    // consumed by the matvec immediately after, so one is enough.
+    const HadamardFold* fold = nullptr;
+    std::vector<float>  fold_buf;
+    std::vector<float>  fold_perm;   // gdn v reorder, ssm_out only
+
     void init(const ModelDims& d, const ArchParams& p);
 };
 

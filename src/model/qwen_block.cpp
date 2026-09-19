@@ -1,6 +1,7 @@
 #include "ultima/model/qwen_block.hpp"
 
 #include "ultima/kernels/delta_net.hpp"
+#include "ultima/kernels/hadamard.hpp"
 #include "ultima/kernels/elementwise.hpp"
 #include "ultima/kernels/norms.hpp"
 #include "ultima/kernels/rope.hpp"
@@ -38,6 +39,21 @@ inline void trace(const char* name, std::size_t layer,
     for (std::size_t i = 0; i < n; ++i) sum += x[i];
     std::fprintf(stderr, "ultima_trace: %22s-%zu = {%zu} sum = %.6f\n",
                  name, layer, n, sum);
+}
+
+// Returns the activation to feed a matvec. For a weight stored with the
+// inverse rotation folded in, that is the rotated activation; for every
+// other weight it is `x` untouched.
+//
+// Recomputed per call rather than memoized across the projections that
+// share an activation: the transform is O(width log block) against a
+// matvec's O(rows * width), which at these shapes is well under a percent.
+const float* folded_input(BlockScratch& s, const WeightRef& w,
+                          const float* x, std::size_t width) {
+    if (!w.hadamard_folded || !s.fold) return x;
+    kernels::hadamard_fold_f32(x, s.fold_buf.data(), width,
+                               s.fold->block, s.fold->signs_for(width));
+    return s.fold_buf.data();
 }
 
 // Add an optional bias vector to `y` in place; no-op if `bias` is null.
@@ -146,14 +162,17 @@ Result<void>
 ffn_dense(BlockScratch& s, const ModelTensors::Block& b,
           const ModelDims& d, const ArchParams& p, runtime::ThreadPool& pool) {
     if (auto r = matvec_dispatch_threaded(pool, b.ffn_gate.dtype, b.ffn_gate.data,
-                                          s.x_norm.data(), s.gate.data(),
+                                          folded_input(s, b.ffn_gate, s.x_norm.data(), d.hidden),
+                                          s.gate.data(),
                                           d.ffn_hidden, d.hidden); !r) return r;
     if (auto r = matvec_dispatch_threaded(pool, b.ffn_up.dtype, b.ffn_up.data,
-                                          s.x_norm.data(), s.up.data(),
+                                          folded_input(s, b.ffn_up, s.x_norm.data(), d.hidden),
+                                          s.up.data(),
                                           d.ffn_hidden, d.hidden); !r) return r;
     gated_act(p.ffn_act, s.gate.data(), s.up.data(), s.gate.data(), d.ffn_hidden);
     return matvec_dispatch_threaded(pool, b.ffn_down.dtype, b.ffn_down.data,
-                                    s.gate.data(), s.x.data(),
+                                    folded_input(s, b.ffn_down, s.gate.data(), d.ffn_hidden),
+                                    s.x.data(),
                                     d.hidden, d.ffn_hidden);
 }
 
@@ -247,10 +266,12 @@ delta_net_forward(BlockScratch& s, const ModelTensors::Block& b,
 
     // 1. The fused q||k||v projection, and the output gate branch.
     if (auto r = matvec_dispatch_threaded(pool, b.ssm_in.dtype, b.ssm_in.data,
-                                          s.x_norm.data(), s.dn_mixed.data(),
+                                          folded_input(s, b.ssm_in, s.x_norm.data(), d.hidden),
+                                          s.dn_mixed.data(),
                                           dn.conv_dim(), d.hidden); !r) return r;
     if (auto r = matvec_dispatch_threaded(pool, b.ssm_gate.dtype, b.ssm_gate.data,
-                                          s.x_norm.data(), s.dn_z.data(),
+                                          folded_input(s, b.ssm_gate, s.x_norm.data(), d.hidden),
+                                          s.dn_z.data(),
                                           dn.value_dim(), d.hidden); !r) return r;
 
     trace("linear_attn_qkv_mixed", layer, s.dn_mixed.data(), dn.conv_dim());
@@ -332,8 +353,20 @@ delta_net_forward(BlockScratch& s, const ModelTensors::Block& b,
     trace("final_output", layer, s.dn_out.data(), dn.value_dim());
 
     // 6. Output projection back into the residual width.
+    //
+    // The fold for ssm_out was computed with the feature axis in grouped
+    // head order [head_dim, rep, n_k_heads], but the recurrence emits tiled
+    // order [head_dim, n_k_heads, rep]. Reorder before rotating, or the
+    // signs line up with the wrong channels.
+    const float* out_act = s.dn_out.data();
+    if (b.ssm_out.hadamard_folded && s.fold && s.fold->gdn_v_grouped) {
+        hadamard_permute_gdn_v(s.dn_out.data(), s.fold_perm.data(),
+                               v_dim, n_k, n_v / n_k);
+        out_act = s.fold_perm.data();
+    }
     return matvec_dispatch_threaded(pool, b.ssm_out.dtype, b.ssm_out.data,
-                                    s.dn_out.data(), s.x.data(),
+                                    folded_input(s, b.ssm_out, out_act, dn.value_dim()),
+                                    s.x.data(),
                                     d.hidden, dn.value_dim());
 }
 
@@ -401,6 +434,15 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p) {
         expert_out.assign(d.hidden, 0.0f);
         moe_accum.assign(d.hidden, 0.0f);
         break;
+    }
+
+    // One buffer wide enough for any folded activation in this model.
+    {
+        std::size_t w = std::max({d.hidden, d.q_dim, d.ffn_hidden});
+        if (p.delta.active()) w = std::max(w, p.delta.value_dim());
+        if (p.ffn == FfnKind::SparseMoE) w = std::max(w, p.expert_ffn);
+        fold_buf.assign(w, 0.0f);
+        if (p.delta.active()) fold_perm.assign(p.delta.value_dim(), 0.0f);
     }
 
     attn_norm.assign(d.n_layers * d.hidden, 0.0f);
@@ -536,7 +578,8 @@ block_forward(BlockScratch& s,
         // 2*head_dim run is [query | gate]. Split them apart here; the gate
         // is applied to the attention output further down.
         if (auto r = matvec_dispatch_threaded(pool, block.attn_q.dtype, block.attn_q.data,
-                                              s.x_norm.data(), s.qg_full.data(),
+                                              folded_input(s, block.attn_q, s.x_norm.data(), dims.hidden),
+                                              s.qg_full.data(),
                                               2 * dims.q_dim, dims.hidden); !r) return r;
         for (std::size_t h = 0; h < dims.n_heads; ++h) {
             const float* src = s.qg_full.data() + h * 2 * dims.head_dim;
@@ -546,10 +589,12 @@ block_forward(BlockScratch& s,
                         dims.head_dim * sizeof(float));
         }
         if (auto r = matvec_dispatch_threaded(pool, block.attn_k.dtype, block.attn_k.data,
-                                              s.x_norm.data(), s.k_full.data(),
+                                              folded_input(s, block.attn_k, s.x_norm.data(), dims.hidden),
+                                              s.k_full.data(),
                                               dims.kv_dim, dims.hidden); !r) return r;
         if (auto r = matvec_dispatch_threaded(pool, block.attn_v.dtype, block.attn_v.data,
-                                              s.x_norm.data(), s.v_full.data(),
+                                              folded_input(s, block.attn_v, s.x_norm.data(), dims.hidden),
+                                              s.v_full.data(),
                                               dims.kv_dim, dims.hidden); !r) return r;
         trace("Qcur_reshaped", layer, s.q_full.data(), dims.q_dim);
         trace("gate_reshaped", layer, s.elem_gate.data(), dims.q_dim);
@@ -670,7 +715,8 @@ block_forward(BlockScratch& s,
 
     // 7. Output projection + residual add.
     if (auto r = matvec_dispatch_threaded(pool, block.attn_out.dtype, block.attn_out.data,
-                                          s.attn_out.data(), s.x.data(),
+                                          folded_input(s, block.attn_out, s.attn_out.data(), dims.q_dim),
+                                          s.x.data(),
                                           dims.hidden, dims.q_dim); !r) return r;
     scale_in_place(s.x.data(), params.residual_scale, dims.hidden);
     kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), dims.hidden);

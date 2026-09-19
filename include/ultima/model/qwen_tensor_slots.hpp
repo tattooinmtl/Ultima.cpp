@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ultima/core/error.hpp"
+#include "ultima/model/hadamard.hpp"
 #include "ultima/model/imodel.hpp"
 #include "ultima/model/loaded_model.hpp"
 #include "ultima/model/tensor_info.hpp"
@@ -24,6 +25,10 @@ struct WeightRef {
     // For a stack of per-expert matrices: bytes between consecutive experts.
     // Zero for ordinary 2D weights.
     std::size_t expert_stride = 0;
+
+    // This weight was stored with the inverse Hadamard rotation folded in,
+    // so its activation must be rotated to match before the matvec.
+    bool hadamard_folded = false;
 
     bool valid() const noexcept { return data != nullptr; }
 
@@ -106,6 +111,7 @@ core::Result<ModelTensors>
 resolve_model_tensors(const LoadedModel& gguf,
                       const std::string& arch,
                       const ModelDims&   dims,
-                      const ArchParams&  params);
+                      const ArchParams&  params,
+                      const HadamardFold* fold = nullptr);
 
 } // namespace ultima::model
