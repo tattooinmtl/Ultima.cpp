@@ -71,4 +71,18 @@ void swiglu_f32(const float* gate, const float* up, float* y, std::size_t n) noe
     swiglu_f32_scalar(gate, up, y, n);
 }
 
+// ----- geglu -----------------------------------------------------------------
+void geglu_f32_scalar(const float* gate, const float* up, float* y, std::size_t n) noexcept {
+    constexpr float k_inv_sqrt2 = 0.70710678118654752f;   // 1/sqrt(2)
+    for (std::size_t i = 0; i < n; ++i) {
+        const float g = gate[i];
+        const float a = 0.5f * g * (1.0f + std::erf(g * k_inv_sqrt2));
+        y[i] = a * up[i];
+    }
+}
+
+void geglu_f32(const float* gate, const float* up, float* y, std::size_t n) noexcept {
+    geglu_f32_scalar(gate, up, y, n);
+}
+
 } // namespace ultima::kernels

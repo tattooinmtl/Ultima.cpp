@@ -1,6 +1,7 @@
 #include "ultima/runtime/thread_pool.hpp"
 
 #include <atomic>
+#include <memory>
 #include <utility>
 
 namespace ultima::runtime {
@@ -43,32 +44,52 @@ void ThreadPool::parallel_for(std::size_t n,
                               const std::function<void(std::size_t, std::size_t)>& work_fn) {
     if (n == 0) return;
 
+    // Caller participates: workers get chunks 1..chunks-1, the calling thread
+    // runs chunk 0 inline. This cuts the wake/wait latency per dispatch and
+    // adds one more worker's worth of compute.
     const std::size_t nw = workers_.size();
-    const std::size_t chunks = (n < nw) ? n : nw;
+    const std::size_t chunks = (n < nw + 1) ? n : nw + 1;
     const std::size_t chunk_size = (n + chunks - 1) / chunks;
 
-    std::atomic<std::size_t> remaining{chunks};
-    std::mutex done_mtx;
-    std::condition_variable done_cv;
+    if (chunks <= 1) {
+        work_fn(0, n);
+        return;
+    }
+
+    // Completion state is heap-allocated and shared with the task closures:
+    // the last worker signals done_cv AFTER the decrement that releases the
+    // caller, so stack locals here could be destroyed while that notify is
+    // still in flight (use-after-destroy race -> intermittent 500s, hangs,
+    // and crashes under load).
+    struct DoneState {
+        std::atomic<std::size_t> remaining{0};
+        std::mutex               mtx;
+        std::condition_variable  cv;
+    };
+    const auto done = std::make_shared<DoneState>();
+    done->remaining.store(chunks - 1, std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> lk{mtx_};
-        for (std::size_t c = 0; c < chunks; ++c) {
+        for (std::size_t c = 1; c < chunks; ++c) {
             const std::size_t begin = c * chunk_size;
             const std::size_t end   = (begin + chunk_size > n) ? n : begin + chunk_size;
-            tasks_.emplace([begin, end, &work_fn, &remaining, &done_mtx, &done_cv]() {
+            tasks_.emplace([begin, end, &work_fn, done]() {
                 work_fn(begin, end);
-                if (remaining.fetch_sub(1) == 1) {
-                    std::lock_guard<std::mutex> dl{done_mtx};
-                    done_cv.notify_one();
+                if (done->remaining.fetch_sub(1) == 1) {
+                    std::lock_guard<std::mutex> dl{done->mtx};
+                    done->cv.notify_one();
                 }
             });
         }
     }
     cv_task_.notify_all();
 
-    std::unique_lock<std::mutex> dl{done_mtx};
-    done_cv.wait(dl, [&remaining] { return remaining.load() == 0; });
+    // Chunk 0 runs on the caller.
+    work_fn(0, chunk_size > n ? n : chunk_size);
+
+    std::unique_lock<std::mutex> dl{done->mtx};
+    done->cv.wait(dl, [&done] { return done->remaining.load() == 0; });
 }
 
 } // namespace ultima::runtime

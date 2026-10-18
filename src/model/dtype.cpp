@@ -18,6 +18,9 @@ const char* to_string(DataType t) noexcept {
     case DataType::Q5_K: return "Q5_K";
     case DataType::Q8_K: return "Q8_K";
     case DataType::BF16: return "BF16";
+    case DataType::Q2_0: return "Q2_0";
+    case DataType::PQ2_0:  return "PQ2_0";
+    case DataType::PTQ1_0: return "PTQ1_0";
     case DataType::Unknown: return "Unknown";
     }
     return "?";
@@ -27,9 +30,15 @@ bool is_active(DataType t) noexcept {
     switch (t) {
     case DataType::F32:
     case DataType::F16:
+    case DataType::BF16:
+    case DataType::Q4_1:
+    case DataType::Q5_0:
     case DataType::Q8_0:
     case DataType::Q4_K:
+    case DataType::Q5_K:
     case DataType::Q6_K:
+    case DataType::PQ2_0:
+    case DataType::Q2_0:
         return true;
     default:
         return false;
@@ -55,6 +64,11 @@ std::uint32_t block_size(DataType t) noexcept {
     case DataType::Q6_K:
     case DataType::Q8_K:
         return 256;
+    case DataType::PQ2_0:
+    case DataType::PTQ1_0:
+        return 128;
+    case DataType::Q2_0:
+        return 64;
     default:
         return 0;
     }
@@ -78,6 +92,13 @@ std::uint32_t bytes_per_block(DataType t) noexcept {
     case DataType::Q5_K: return 176;
     case DataType::Q6_K: return 210;
     case DataType::Q8_K: return 292;
+
+    // fp16 scale + 128 two-bit codes = 2 + 32 = 34 bytes, 2.125 bpw.
+    case DataType::PQ2_0:  return 34;
+    // The same format at group 64: 2 + 16 = 18 bytes, 2.25 bpw.
+    case DataType::Q2_0:   return 18;
+    // 24 B of base-3 trits (5 per byte) + 2 B high trits + fp16 scale.
+    case DataType::PTQ1_0: return 28;
 
     default: return 0;
     }

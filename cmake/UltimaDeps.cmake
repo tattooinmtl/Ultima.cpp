@@ -38,3 +38,36 @@ FetchContent_Declare(expected_lite
     EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(expected_lite)
+
+# ---- cpp-httplib — header-only HTTP server ---------------------------------
+# Decision 14: cpp-httplib chosen over Crow/Drogon/Beast. We consume the
+# single-header directly. Disable optional TLS/zlib/brotli integrations so
+# a bare Windows / Linux install without OpenSSL/zlib/brotli builds clean.
+set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE INTERNAL "")
+set(HTTPLIB_REQUIRE_ZLIB    OFF CACHE INTERNAL "")
+set(HTTPLIB_REQUIRE_BROTLI  OFF CACHE INTERNAL "")
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE INTERNAL "")
+set(HTTPLIB_USE_ZLIB_IF_AVAILABLE    OFF CACHE INTERNAL "")
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE  OFF CACHE INTERNAL "")
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG        v0.15.3
+    GIT_SHALLOW    ON
+    SYSTEM
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(httplib)
+
+# ---- nlohmann/json — JSON parser + serializer ------------------------------
+# OpenAI-compatible request/response bodies need a JSON layer. Single-header,
+# MIT, standard choice for C++ servers.
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+set(JSON_Install    OFF CACHE INTERNAL "")
+FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    ON
+    SYSTEM
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(nlohmann_json)

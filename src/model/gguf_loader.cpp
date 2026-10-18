@@ -130,6 +130,12 @@ DataType map_dtype(std::uint32_t raw) noexcept {
     case 14: return DataType::Q6_K;
     case 15: return DataType::Q8_K;
     case 30: return DataType::BF16;
+    case 42: return DataType::Q2_0;   // upstream 2-bit, group 64
+    // Prism-private ternary ids, outside the public GGUF range. Stock
+    // llama.cpp fails tensor-info parsing on these rather than mapping
+    // them, which is why such a file cannot be run by it at all.
+    case 142: return DataType::PQ2_0;
+    case 143: return DataType::PTQ1_0;
     default: return DataType::Unknown;
     }
 }
@@ -151,6 +157,7 @@ public:
     }
 
     std::uint64_t file_size_bytes() const override { return file_.size(); }
+    const std::uint8_t* file_data() const override { return file_.data(); }
     std::uint64_t alignment()       const override { return alignment_; }
     std::uint32_t gguf_version()    const override { return gguf_version_; }
 
@@ -257,7 +264,8 @@ Result<void> GgufLoader::read_tensor_directory_(GgufReader& r, std::uint64_t ten
         }
         auto raw_type = r.read_scalar<std::uint32_t>();
         if (!raw_type) return Failure{raw_type.error()};
-        t.dtype = map_dtype(*raw_type);
+        t.dtype     = map_dtype(*raw_type);
+        t.raw_dtype = *raw_type;
 
         auto off = r.read_scalar<std::uint64_t>();
         if (!off) return Failure{off.error()};

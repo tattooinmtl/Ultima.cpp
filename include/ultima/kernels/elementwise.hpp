@@ -26,4 +26,20 @@ void silu_f32_scalar(const float* x, float* y, std::size_t n) noexcept;
 void swiglu_f32       (const float* gate, const float* up, float* y, std::size_t n) noexcept;
 void swiglu_f32_scalar(const float* gate, const float* up, float* y, std::size_t n) noexcept;
 
+// GEGLU: y[i] = gelu(gate[i]) * up[i]. Same shape as SwiGLU with GELU in place
+// of SiLU — Spark-X2.5 uses this.
+//
+// Exact GELU:  0.5 * x * (1 + erf(x / sqrt(2)))
+//
+// Deliberately the erf form, not the cheaper tanh approximation. Spark-X2.5
+// declares hidden_act "gelu" and its reference implementation calls MLX's
+// nn.gelu, which is exact — so this is what the weights were trained against.
+// llama.cpp instead evaluates a tanh approximation through an fp16 lookup
+// table, so Ultima and llama.cpp can pick different tokens where the top two
+// logits are near-tied. That is expected, and Ultima is the more faithful of
+// the two here.
+// In-place safe when y == gate or y == up.
+void geglu_f32       (const float* gate, const float* up, float* y, std::size_t n) noexcept;
+void geglu_f32_scalar(const float* gate, const float* up, float* y, std::size_t n) noexcept;
+
 } // namespace ultima::kernels

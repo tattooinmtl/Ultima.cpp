@@ -10,7 +10,11 @@ add_executable(ultima_test
     unit/test_tensor.cpp
     unit/test_thread_pool.cpp
     unit/test_cpu_features.cpp
+    unit/test_matmul_batched.cpp
     unit/test_matvec.cpp
+    unit/test_delta_net.cpp
+    unit/test_hadamard.cpp
+    unit/test_recurrent_state.cpp
     unit/test_elementwise.cpp
     unit/test_rmsnorm.cpp
     unit/test_softmax.cpp
@@ -19,7 +23,22 @@ add_executable(ultima_test
     unit/test_matvec_q4k.cpp
     unit/test_q8_0.cpp
     unit/test_q6k.cpp
+    unit/test_pq2_0.cpp
+    unit/test_q5_0.cpp
+    unit/test_q5k.cpp
+    unit/test_q4_1.cpp
     unit/test_kernels_correctness.cpp
+    unit/test_tokenizer.cpp
+    unit/test_tokenizer_spm.cpp
+    unit/test_kv_cache.cpp
+    unit/test_sampler.cpp
+    unit/test_qwen_config.cpp
+    unit/test_kv_cache_forward.cpp
+    unit/test_workspace.cpp
+    unit/test_tools.cpp
+    unit/test_session.cpp
+    unit/test_permissions.cpp
+    unit/test_skills.cpp
 )
 
 target_link_libraries(ultima_test
@@ -29,6 +48,10 @@ target_link_libraries(ultima_test
         ultima_tensor
         ultima_runtime
         ultima_kernels
+        ultima_tokenizer
+        ultima_kv_cache
+        ultima_sampler
+        ultima_server
         ultima_warnings
         doctest::doctest
 )

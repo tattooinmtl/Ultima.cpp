@@ -1,53 +1,274 @@
-# Changelog
+# Ultima project changelog
 
-All notable changes to Ultima.cpp are recorded here.
-Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
+Append-only work log. One line per completed task. Format:
 
-## [Unreleased]
+```
+YYYY-MM-DD HH:MM  <task_id>  <short description>  <files>
+```
 
-### Added
-- Initial architecture scaffold (M0):
-  - CMake build system with `windows-msvc-*` presets
-  - Compiler flags module, warnings-as-errors, no RTTI
-  - Interface header layout under `include/ultima/`
-  - Dependency policy: doctest, fmt, nlohmann/json, cpp-httplib, xxhash, expected-lite (all vendored via FetchContent, pinned)
-  - `ultima-cli` executable stub that prints version
-  - `doctest`-based test harness with a sanity test
-  - CI taboo-check script (naming rule enforcement)
-  - Directory structure: src/, include/, apps/, tests/, benchmarks/, examples/, third_party/, docs/, scripts/, launcher/, webui/
-- Design roadmap (`roadmap01.md`) documenting decisions 01, 02, 03, 03b
-- `start.bat` — one-click Windows launcher stopgap that auto-detects VS 2022 via `vswhere`, builds if needed, then runs `ultima --version` / `--help`. Superseded by the Go/Wails launcher (Decision 03) once implemented.
-- **M2: GGUF loader + `--inspect` command** (per Decision 04)
-  - `ultima --inspect <path.gguf>` parses GGUF v3 files: header, metadata KV pairs, tensor directory. Prints file summary, first ~30 metadata keys, first 12 tensors, and totals.
-  - `IModelLoader` / `LoadedModel` / `TensorView` / `MetadataStore` interfaces under `include/ultima/model/`.
-  - Concrete `GgufLoader` implementation with whole-file mmap on Windows (`CreateFileMappingW`), bounds-checked byte reader, selective metadata materialization (arrays other than strings stored as file-offset views, not copied).
-  - `DataType` enum covering F32, F16, Q8_0, Q4_K, Q6_K as active; Q4_0/1, Q5_0/1, Q2_K/Q3_K/Q5_K/Q8_K/BF16 as enumerated-but-skipped.
-  - Naming taboo respected via fragmented string literals in `gguf_keys.hpp`.
-  - Dependencies added: `fmt` 11.1.1, `expected-lite` v0.9.0 (both vendored, pinned, via FetchContent).
-  - 7 unit tests covering: valid load, bad magic, unsupported version, truncated file, split-file naming rejected, missing required key, inspect summary.
-  - All tests pass (11/11), no warnings under `/W4 /WX`, taboo gate clean.
-- **M1 chunk 1: tensor engine foundations** (per Decision 05)
-  - `include/ultima/tensor/aligned_alloc.hpp` + `.cpp` — 64-byte-aligned allocator (Windows `_aligned_malloc`, POSIX `posix_memalign`), typed `aligned_alloc_n<T>` helper, `AlignedDeleter` for `unique_ptr`.
-  - `include/ultima/tensor/tensor.hpp` + `.cpp` — `Tensor` class with two storage modes: Owned (mutable, aligned heap) and View (immutable wrapper for mmap'd weights). Move-only, RAII.
-  - `include/ultima/runtime/thread_pool.hpp` + `.cpp` — fixed-size worker pool with blocking `parallel_for(n, work_fn)`. No OpenMP/TBB dependency.
-  - `include/ultima/kernels/cpu_features.hpp` + `.cpp` — `__cpuid`-based feature detection (AVX2, FMA, AVX-512F, SSE2, brand string), cached, thread-safe. `require_v01_baseline_or_die()` for startup gating.
-  - `include/ultima/kernels/matvec.hpp` — kernel declarations
-  - `src/kernels/matvec_f32_f32.cpp` — first kernel: scalar oracle + AVX2+FMA path (8-lane FMA with horizontal reduction, scalar tail) + public dispatcher. `/arch:AVX2` scoped to `src/kernels/` only.
-  - New static libs: `ultima_tensor`, `ultima_runtime`, `ultima_kernels`
-  - 19 new tests: alignment guarantees, calloc zeroing, view immutability, move semantics, parallel-for correctness, no-op safety, CPU feature detection, dispatcher/scalar/AVX2 equivalence with random inputs (max abs err <1e-4).
-  - All 30 tests pass total. Warnings-clean.
-- **M1 chunk 2: element-wise, RMSNorm, softmax** (continues Decision 05)
-  - `include/ultima/kernels/elementwise.hpp` — `add_f32`, `mul_f32`, `silu_f32`, `swiglu_f32` (each with scalar oracle + best-available public variant).
-  - `include/ultima/kernels/norms.hpp` — `rmsnorm_f32`(scalar + AVX2). Two-pass: sum-of-squares reduction with FMA, then broadcast multiply.
-  - `include/ultima/kernels/softmax.hpp` — `softmax_f32` numerically stable (max-shift, exp, normalize).
-  - `src/kernels/elementwise.cpp` — AVX2 8-lane loops for add/mul (in-place safe). silu/swiglu use scalar `std::exp` (AVX2 polynomial deferred to v0.2).
-  - `src/kernels/rmsnorm.cpp` — AVX2 sum-of-squares + broadcast, scalar tail for `n % 8`.
-  - `src/kernels/softmax.cpp` — scalar 3-pass (max, exp, normalize). Vector expf deferred.
-  - 16 new tests (46 total): random unaligned equivalence, in-place safety (`y == x`), known small cases (silu(0)=0, uniform softmax=1/N), numerical stability (softmax of [100,101,102] does not overflow), SwiGLU = silu(gate) * up cross-check, RMSNorm known formula for `[1,2,3,4]`, RMSNorm on Qwen-shape `n=896`.
-  - All 46 tests pass. No warnings. Taboo gate clean.
-- **M1 chunk 3: RoPE + Q4_K dequant + Q4_K matvec** (continues Decision 05)
-  - `include/ultima/kernels/rope.hpp` + `src/kernels/rope.cpp` — half-split RoPE rotation (Qwen2/GPT-NeoX convention). Per-pair (i, i + rope_dim/2). Handles head_dim > rope_dim (trailing dims pass through). Scalar impl; AVX2 gated on precomputed sin/cos tables which arrive with M4 wiring.
-  - `include/ultima/kernels/dequant_q4k.hpp` + `src/kernels/dequant_q4k.cpp` — Q4_K super-block dequant (144 bytes → 256 floats). Layout heavily documented in the header. fp16→float scalar conversion. 6-bit scale/min unpacking with the K-quant packing rule (bytes 0..3 hold scales[0..3]+high2 of scales[4..7], bytes 4..7 hold mins[0..3]+high2 of mins[4..7], bytes 8..11 hold low nibbles of scales[4..7] and mins[4..7]).
-  - `src/kernels/matvec_q4k_f32.cpp` — fused Q4_K × F32 matvec. Per-row loop dequants one super-block into a 256-float stack scratch, dots against the corresponding x slice, accumulates. No M*K F32 scratch buffer — the key perf win.
-  - 14 new tests (58 total): RoPE position-0 identity, single-frequency known values, pass-through beyond rope_dim, norm-preservation across rotations, multi-head independence. Q4_K dequant with (d,dmin,scale_q,min_q) fixtures: identity pattern, uniform scale linearity, min-term subtraction, multi-block independence. matvec_q4k: dot product against manual reference, two-row two-block, fused-vs-dequant-then-matvec equivalence check.
-  - All 58 tests pass. Build clean. Taboo gate clean.
+`task_id` is a short mnemonic (e.g. `landing-page`, `fix-q5_0`, `add-carousel`) — reuse across turns that continue the same task.
+
+The model is expected to append here after every completed task, in the same request that finishes the work. This file is the project's durable memory of what has been tried, what worked, and what didn't.
+
+---
+
+## Entries
+
+<!-- newest at the top -->
+
+2026-09-18 coder-ide-p6  Phase 6 done - skills access. The knowledge base existed all along and was never wired.
+    FOUND: examples/knowledge holds 88 files (33 pattern skills, 14 languages, 11 frameworks,
+      6 databases, 9 tools) and C:/.skills holds 283 more - none of it reachable. AGENTS.md has
+      been instructing the model to call use_skill(name) for weeks; that tool did not exist.
+    NEW src/server/skills.{hpp,cpp} - SKILL.md discovery across three roots in priority order
+      (workspace .skills, the shipped tree, the cross-agent library), first match wins so a
+      project can shadow a shipped skill. Frontmatter parsing, fold-matching on names so
+      "html5 canvas" finds "html5-canvas", and ranked search over name/description/tags.
+    NEW tool use_skill(name) - seventh tool, and the count is deliberate. With 315 skills an
+      index in the prompt is impossible, so discovery happens through the error path: a wrong
+      name returns the closest matches with their descriptions. That pattern has now earned its
+      place three times this session.
+      Classified Risk::Read, so it is never gated by permissions.
+    Skill body cap is 6 KB, cut at a section boundary. Measured sizes: median 8.7 KB, p90
+      16.8 KB, largest 88 KB. On CPU every kilobyte is prefill time; 6 KB is about 1500 tokens.
+    NEW ServerConfig::max_turn_seconds (default 600) - a hard ceiling on one agent turn.
+    Verified live: the 7B called use_skill with "html5 canvas" (spaces, not hyphens) and got the
+      skill; "threejs" returned threejs-3d, threejs-3d-model-editor and threejs-3d-modeler with
+      descriptions, pulled from the cross-agent library. 244 unit tests pass.
+    OPEN, not fixed: a client that hangs up mid-turn does not reliably stop the generation,
+      because a small write into a socket whose peer has gone succeeds locally until TCP notices.
+      is_writable() did not catch it either. The wall-clock cap is the backstop; a real fix wants
+      generation on its own thread with a cancellation token.
+
+
+2026-09-18 coder-ide-p5  Phase 5 done - agent permissions. The live test caught a gate bypass.
+    NEW PERMISSIONS.md - the user-facing contract.
+    NEW src/server/permissions.{hpp,cpp} - three modes and seven risk classes.
+      * auto (default): ordinary writes pass; the always-ask set asks.
+      * ask: every mutation asks.
+      * yolo: nothing asks, and the UI says so before switching.
+      * Always-ask set: destructive, escaping the project, plan edits, installs,
+        command execution. Reads (read_file, list_files) are never gated in any mode -
+        gating reads trains the user to approve without looking.
+      * Every prompt carries the tool, the subject and a plain-language reason.
+      * "Always allow this kind" remembers one risk class for the session only, never to disk.
+        Denials are not remembered. Changing mode clears the blanket approvals.
+    NEW POST /api/permission (answer a parked prompt), GET/POST /api/permissions (mode).
+      SSE gains permission_request / permission_result. The generating turn parks on a condvar
+      until the answer lands; 120s with no answer is a denial, because silence is not consent.
+    ui/testpad - prompt card with Allow / Always / Deny in the terminal panel, and a mode
+      selector in the Coder tab that confirms before switching to yolo.
+    CLI: ultima serve --permissions auto|ask|yolo. Unknown text falls back to auto, never yolo.
+    THE BUG THE LIVE TEST CAUGHT: the 7B called "delete_project". The dispatcher resolves that
+      to delete_file by its leading verb, but classify() compared the RAW name, saw an ordinary
+      write, and auto mode deleted the file with NO prompt - the exact failure this layer exists
+      to prevent. classify() now canonicalizes first. Two more instances of the same class of
+      mismatch surfaced in the same session: the permission layer normalized a leading slash
+      before the dispatcher did (so ordinary writes prompted), and it accepted "file_path" when
+      the dispatcher did not (so an approved delete then failed). The gate and the dispatcher
+      must agree about every argument or the gate is decoration.
+    Verified live against Qwen2.5-Coder-7B: auto lets an ordinary write through silently; a
+      delete prompts and the file is still on disk while the prompt is open; deny returns
+      "Permission denied by the user." to the model and the file survives; allow completes it;
+      yolo deletes with no prompt at all. 230 unit tests pass.
+
+
+2026-09-17 coder-ide-p4  Phase 4 done - phased planning. Also found the cause of the silent empty turns from Phase 2.
+    NEW src/server/session.{hpp,cpp} - the workflow state lives in the workspace, not in memory:
+      .ultima/plan.md (phase list, hand-editable), .ultima/todos.json (subtasks), .ultima/CHANGELOG.md
+      (append-only). The plan is a file rather than a new tool because six tools is already as many
+      as a small model reliably picks from.
+      * parse_plan is deliberately tolerant - the user is invited to edit the file. Accepts "- [ ]",
+        "* [X]", "1. [ ]" and, from a live run, "-[x]Phase4 :" with no spaces. Phases renumber by
+        position so reordering by hand needs no renumbering.
+      * render_plan_for_prompt names ONLY the active phase. Listing the whole plan invites a small
+        model to skip ahead and do three phases badly in one turn.
+    /api/agent/chat gained mode: "plan" | "work" | "auto". Planning mode injects the plan-first
+      instructions, refuses any tool call that is not writing the plan, and stops the moment the
+      plan lands (stop:"plan_written") rather than burning a second round on prose.
+    NEW GET /api/plan and POST /api/plan/phase. Checking a phase off appends to the project changelog.
+    ui/testpad - Plan panel in the Coder tab: phases with nested subtasks, active phase highlighted,
+      click a box to toggle it, progress count. A "Plan" button beside "Run".
+    FOUND THE PHASE-2 MYSTERY: rounds that produced neither prose nor a tool call were silently
+      doing nothing. They now emit a `warning` event with the raw head of the generation, which
+      immediately showed Qwen2.5-Coder-7B opening a call with a correct "name" and then drifting
+      into typographic quotes for every key after it. Unparseable JSON, whole call dropped.
+      parse_tool_calls now retries with the quotes normalized - only after a strict parse has
+      already failed, so a file whose content legitimately contains curly quotes is not rewritten.
+    A plan written this turn is forced all-unchecked: the model checked off Phase 4 as it wrote the
+      list, which would have made the runtime skip that phase entirely.
+    Verified live: "Build a landing page for a coffee shop" in plan mode produced four phases and
+      NO project code - the workspace held only .ultima/plan.md and the pre-existing README. The
+      panel renders it, toggling phase 1 advanced the active phase to 2 and logged the completion.
+      210 unit tests pass.
+
+
+2026-09-17 coder-ide-p3  Phase 3 done - the Coder tab is a real editor. Verified in a browser.
+    ui/testpad/index.html - the Coder tab was placeholder markup; it is now an IDE over the
+      /api/fs/* endpoints. Still one self-contained file with no external references.
+      * File tree from /api/fs/tree?recursive=1, with new / rename / delete.
+      * Editor tabs: one per open file, dirty dot, close button, middle-click close, and a
+        confirm before discarding unsaved changes.
+      * Editor: a textarea with transparent text laid over a syntax-highlighted <pre>, plus a
+        line-number gutter that slides with the scroll. Tab inserts two spaces; Ctrl+S saves.
+        The two layers must share font metrics and padding exactly or the caret drifts off the
+        glyphs - both CSS rules say so.
+      * Highlighter: one combined regex per language (js/ts, python, css, html, json, markdown),
+        precedence ordered so a keyword inside a string is not recolored. A backtick cannot appear
+        inside a String.raw template, so those patterns use \x60.
+      * Status bar: path, language, line and char counts, saved/unsaved.
+      * Terminal panel + an agent box that drives POST /api/agent/chat from Phase 2 and lands its
+        `file` events as tabs. A file the model rewrites reloads in place, unless that tab has
+        unsaved edits - clobbering the user's typing would be worse than a stale tab. New tabs do
+        not steal focus within 5s of the user touching the editor.
+    NEW scripts/test_testpad_highlight.mjs - extracts the Coder module from the HTML and checks
+      every language round-trips losslessly, including an unterminated string, a trailing
+      backslash, and a 4000-line file (11ms). Not in CTest: the C++ build must not depend on node.
+    Verified in a browser end to end: opened src/app.js and index.html from the tree, typed into
+      index.html, watched the dirty dot and char count update, Ctrl+S, confirmed the bytes on disk;
+      then asked the agent box for a file and watched notes.md appear in the tree and open as a
+      focused tab showing highlighted markdown.
+    Two layout bugs found by measuring rather than squinting: the empty state rendered inside the
+      52px gutter column (needs grid-column:1/-1), and .coder-main never stretched because it is a
+      flex child without flex:1, so the grid sized to content and left 244px of dead space.
+    The 1.5B emitted write_projectFile with "./notes.md" - the Phase 2 verb fallback and path
+      normalization both caught it, in a live run, again.
+
+
+2026-09-16 coder-ide-p2  Phase 2 done - file tool layer + agent loop. Three robustness fixes came from live runs.
+    NEW src/server/tools.{hpp,cpp} - six tools (list_files, read_file, write_project_file, edit_file,
+      rename_file, delete_file), their JSON schemas, the Qwen <tool_call> system prompt, a lenient
+      parser and the dispatcher.
+    NEW POST /api/agent/chat - the turn is a loop: generate, execute any tool calls, feed the results
+      back as `tool` messages, generate again. Ends on a reply with no calls, or the round budget.
+      SSE events: delta | tool_call | tool_result | file | done | error.
+    Parser accepts the three shapes small models drift between: the trained <tool_call> wrapper, a
+      fenced json block, and a bare object (only as the whole reply, so prose quoting JSON is not
+      misread). Brace matching is string-aware so JS braces inside `content` do not end the object.
+      A call truncated by the token cap still parses.
+    visible_prose_prefix() keeps <tool_call> markup out of the streamed deltas, including holding
+      back a partial opening tag.
+    Driven by live runs against Qwen2.5-Coder-7B, not guessed:
+      - it called "write_project-file" (hyphen)     -> name canonicalization + aliases
+      - it passed "/hello.js" (leading slash)       -> path normalization above resolve()
+      - it invented "read_project"                  -> leading-verb fallback
+      - bare "missing argument X" made it give up   -> errors now name the retry
+    Verified: the 7B creates a file on disk through the endpoint, reproducibly; the file event fires
+      with a tab label. 190 tests pass.
+    Known limitation, not papered over: on a two-step ask the 7B often stops after one failed call
+      instead of recovering. Machinery is fine; that is model capability, and Phase 4 is the answer.
+    Process note: tested a stale binary for one cycle - a running server held ultima.exe open so the
+      relink was skipped silently while the .lib updated. Stop the server before rebuilding.
+
+
+2026-09-16 coder-ide-p1  Decision 18 written; Phase 1 done - workspace file API. Also fixed pre-existing UB in the server.
+    roadmap01.md Decision 18 - Coder IDE: workspace file API, six model tools, in-tree tabbed
+      editor, phased planning. Studied C:/GameForgerAI (gameSimController.js + GameSimCreator.jsx)
+      as the reference; its one-tab-per-file UI carries over, its whole-file regeneration does not,
+      because it cannot express rename or partial edit. No Monaco: the testpad is bundled into the
+      binary with zero external references.
+    plan.md - five phases, one phase = one task, subtasks go to .ultima/todos.json.
+    NEW src/server/workspace.{hpp,cpp} - the whole feature funnels through one resolve(), which
+      refuses .., absolute paths, drive letters, UNC, control characters and Windows device names,
+      then re-checks containment after symlink resolution. Never clamps a bad path into a good one.
+      edit() is exact-string and all-or-nothing: a failing edit list leaves the file untouched.
+    NEW /api/fs/{tree,file,rename,mkdir} over GET/PUT/PATCH/DELETE, plus a --workspace flag on serve.
+    FIX pre-existing UB: check_auth was a constructor-local lambda captured by reference into every
+      route handler, so every request read a destroyed object. Latent until the new fs helpers
+      changed the stack layout, then it segfaulted on the first request. All request helpers are
+      free functions now.
+    tests/unit/test_workspace.cpp - 22 cases with the escape vectors pinned. 160 tests pass.
+    Verified live: all seven endpoints work; ../, %2F-encoded, backslash, drive-letter, UNC,
+      /etc/passwd and NUL variants all refused 400 with a named reason; nothing written outside root.
+
+
+2026-09-16 coder-ide-p1  Decision 18 written; Phase 1 done — workspace file API. Also fixed pre-existing UB in the server.
+    roadmap01.md Decision 18 — Coder IDE: workspace file API, six model tools, in-tree tabbed editor,
+      phased planning. Studied C:/GameForgerAI (gameSimController.js + GameSimCreator.jsx) as the
+      reference; its one-tab-per-file UI carries over, its whole-file regeneration does not, because
+      it cannot express rename or partial edit. No Monaco: testpad is bundled into the binary with
+      zero external refs.
+    plan.md — five phases, one phase = one task.
+    NEW src/server/workspace.{hpp,cpp} — the whole feature funnels through one resolve(), which
+      refuses .., absolute paths, drive letters, UNC, control chars and Windows device names, then
+      re-checks containment after symlink resolution. Never clamps a bad path into a good one.
+      edit() is exact-string and all-or-nothing: a failing edit list leaves the file untouched.
+    NEW /api/fs/{tree,file,rename,mkdir} — GET/PUT/PATCH/DELETE. --workspace flag on .
+    FIX pre-existing UB: check_auth was a constructor-local lambda captured by reference into every
+      route handler, so every request read a destroyed object. Latent until the new fs helpers
+      changed the stack layout, then it segfaulted on the first request. All request helpers are
+      free functions now.
+    tests/unit/test_workspace.cpp — 22 cases, escape vectors pinned. 160 tests pass.
+
+
+2026-09-16 spark2_5  spark2_5 WORKING. Root cause was GEGLU vs SwiGLU. Also fixed a pretokenizer bug affecting every model.
+    User supplied the reference: llama.cpp b10988 binaries at C:/Llama/llama-b10988, and upstream PR
+    ggml-org/llama.cpp#27868 (merged 2026-09-06), fetched with `gh pr diff`.
+    Root cause: the feed-forward is LLM_FFN_GELU, not SILU. Everything else the 8-way ablation had
+      questioned was already right - NeoX rope, contiguous [Q|K|V], per-head sigmoid gate on the
+      post-attn-norm input applied before wo, sliding_window_pattern true = sliding.
+      Added kernels::geglu_f32 (tanh approximation) + FfnAct in ArchSpec/ArchParams.
+    Separately found and fixed a real pretokenizer bug affecting EVERY gpt2-vocab model: the
+      hand-rolled splitter grouped by character category, so "(n" always split. The Llama3/Qwen2
+      family allows one non-letter to prefix a letter run, and caps digit runs (1 for qwen2/spark2_5,
+      3 for llama3/dbrx). Rewrote pretokenize() with the three families selected by tokenizer.ggml.pre,
+      plus real UTF-8 decoding. qwen2 and granite now match llama-tokenize token-for-token; they did
+      not before.
+    Verified: 8 of 9 prompts byte-identical to the reference on Spark-1.7B; the one divergence is a
+      near-tied logit, explained by ggml evaluating GELU through an fp16 lookup table (less precise
+      than our direct tanh). Spark-4B also byte-identical, including a prompt where BOTH degenerate
+      to "nnnn" - that is the model, not us. All 7 previously-working models unchanged.
+    Now 9 of 21 files in C:/models runnable. 137 tests pass.
+
+
+2026-09-16 swa-infra  Sliding-window attention + gated attention + per-layer RoPE. spark2_5 attempted, NOT working.
+    Infrastructure (all verified inert on the 7 working models, no regression):
+      gqa_attention gained pos_begin, so SWA layers mask older keys instead of needing a second
+        ring-buffered cache geometry.
+      ArchParams gained sliding_window + layer_is_swa + attn_gate; RopeConfig gained freq_base_swa
+        and rope_dim_swa, selected per layer in block_forward.
+      loaded_model gained read_u8_array for per-layer bool flag vectors.
+      ArchSpec gained attn_gate; tensor slots resolve attn_gate.weight [n_heads, hidden].
+      CLI: `ultima run --show-tokens`.
+    spark2_5: NOT runnable. Every structural piece is implemented and all shapes/metadata resolve,
+      but it decodes to degenerate token echo. Ablated 8 combinations (SWA on/off/inverted x gate
+      on/off x NeoX/Norm rope x contiguous/interleaved QKV) — none coherent. Tokenizer ruled out
+      by comparing against qwen2 on the same prompt: both split sensibly. Left registered as
+      not-runnable with that reason rather than shipped as working.
+    Finding: spark2_5 / gemma4 / qwen35 / dspark / dflash-draft have no reference implementation
+      available here, so their unconstrained semantics are guesswork. deepseek2 (GLM-4.7-Flash) is
+      the one remaining arch that is well specified — standard DeepSeek-V2 MLA.
+
+
+2026-09-16 fix-q5_0  Q5_0 matvec: AVX2 + threaded. 0.5B model went 2.3 -> 51.5 tok/s (22x)
+    src/kernels/matvec_q5_0_f32.cpp  — fused AVX2 unpack; the offset-binary -16 is folded into the
+        bit pattern (OR 0xF0 where the fifth bit is clear) so the byte reads as a signed int8 directly,
+        no separate subtract and no f32 scratch. Existing scalar loop kept as matvec_q5_0_f32_scalar.
+    src/kernels/matvec_threaded.cpp  — matvec_q5_0_f32_threaded.
+    src/model/weight_dispatch.cpp    — Q5_0 no longer falls through to the serial scalar path with
+        `(void)pool`; that was the actual defect. It ran single-threaded scalar while every other
+        quant used the pool + FMA, which is why the 0.5B was 8x slower than the 1.5B.
+    tests/unit/test_q5_0.cpp         — new; there were no Q5_0 tests at all, which is how the
+        placeholder survived. Reference encoder written from the format spec, AVX2 vs scalar oracle.
+    Verified: output byte-identical before/after on qwen2.5-coder-0.5b. 1.5B/7B/unsloth/phi3 unchanged.
+
+
+2026-09-16 multi-arch  Multi-architecture model support: Q5_K/Q4_1/BF16 kernels, arch registry, granite + phi3 + qwen3moe, SentencePiece tokenizer
+    Kernels:   include/ultima/kernels/{dequant_q5k,dequant_q4_1}.hpp, src/kernels/{dequant_q5k,dequant_q4_1,matvec_q5k_f32,matvec_q4_1_f32}.cpp
+               rope.{hpp,cpp} gained rope_f32_ext (Norm vs NeoX pairing, LongRoPE freq_factors, attn_factor)
+    Registry:  include/ultima/model/arch_registry.hpp, src/model/arch_registry.cpp — 14 architectures, each either
+               runnable (with its structural params) or carrying the specific engine work it still needs.
+               Replaces the hardcoded qwen2/qwen3 check in load_model.
+    Model:     imodel.hpp gained ModelDims::{q_dim,kv_dim} (Qwen3-MoE has q_dim != hidden) and ArchParams.
+               qwen_config.cpp generalized to parse_arch_config; qwen_tensor_slots resolves fused QKV,
+               fused gate/up, and 3D MoE expert stacks; qwen_block gained fused-QKV split, fused/MoE FFN,
+               per-arch RoPE and Granite's embedding/residual/logit/attention scales.
+               Hoisted the per-layer residual heap allocation into BlockScratch.
+    Tokenizer: SentencePiece ("llama"/"spm") support alongside GPT-2 BPE — score-ranked merges over
+               U+2581-marked text with <0xNN> byte fallback. Needed for phi3. LoadedModel gained
+               file_data() plus read_f32_array/read_i32_array so numeric metadata arrays resolve.
+    CLI:       new `ultima run` (one-shot completion), `ultima archs`, `ultima scan <dir>`.
+    Verified:  generation on all 7 runnable models in C:/models. Granite's Norm RoPE confirmed by
+               A/B: NeoX degenerates into newline repetition, Norm writes a correct class.
+    Docs:      MODELS.md rewritten as the real support matrix (arch, quant, tokenizer, limitations).
+

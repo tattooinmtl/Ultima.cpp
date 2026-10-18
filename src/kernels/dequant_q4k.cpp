@@ -70,21 +70,25 @@ void dequant_q4k_block(const std::uint8_t* block, float* out) noexcept {
     const std::uint8_t* sm = block + 4;    // 12 bytes of scales+mins
     const std::uint8_t* qs = block + 16;   // 128 bytes of 4-bit values
 
-    for (unsigned s = 0; s < 8; ++s) {
-        unsigned scale_q = 0, min_q = 0;
-        unpack_scale_min_6bit(sm, s, scale_q, min_q);
+    // ggml layout: sub-block pair (2j, 2j+1) shares 32 consecutive qs bytes.
+    // The first 32 outputs use the LOW nibbles with scale[2j], the next 32
+    // use the HIGH nibbles of the same bytes with scale[2j+1].
+    const std::uint8_t* q = qs;
+    for (unsigned j = 0; j < 4; ++j) {
+        unsigned scale_q0 = 0, min_q0 = 0, scale_q1 = 0, min_q1 = 0;
+        unpack_scale_min_6bit(sm, 2 * j,     scale_q0, min_q0);
+        unpack_scale_min_6bit(sm, 2 * j + 1, scale_q1, min_q1);
 
-        const float scale = d    * static_cast<float>(scale_q);
-        const float min_v = dmin * static_cast<float>(min_q);
+        const float d1 = d    * static_cast<float>(scale_q0);
+        const float m1 = dmin * static_cast<float>(min_q0);
+        const float d2 = d    * static_cast<float>(scale_q1);
+        const float m2 = dmin * static_cast<float>(min_q1);
 
-        const std::uint8_t* sub_qs = qs + s * 16;   // 16 bytes = 32 nibbles
-        float* sub_out = out + s * 32;
-        for (unsigned i = 0; i < 16; ++i) {
-            const unsigned lo = sub_qs[i] & 0x0Fu;
-            const unsigned hi = (sub_qs[i] >> 4) & 0x0Fu;
-            sub_out[2 * i    ] = scale * static_cast<float>(lo) - min_v;
-            sub_out[2 * i + 1] = scale * static_cast<float>(hi) - min_v;
-        }
+        float* out1 = out + j * 64;
+        float* out2 = out + j * 64 + 32;
+        for (unsigned l = 0; l < 32; ++l) out1[l] = d1 * static_cast<float>(q[l] & 0x0Fu) - m1;
+        for (unsigned l = 0; l < 32; ++l) out2[l] = d2 * static_cast<float>(q[l] >> 4)    - m2;
+        q += 32;
     }
 }
 

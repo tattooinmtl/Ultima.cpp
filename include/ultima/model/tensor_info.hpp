@@ -12,6 +12,10 @@ struct TensorInfo {
     std::string                name;
     std::vector<std::uint64_t> dims;         // n_dims <= 4 in practice
     DataType                   dtype;
+    // The GGUF type id as written in the file. Kept even when `dtype` is
+    // Unknown, because otherwise an unsupported tensor gives no way to find
+    // out what it actually is.
+    std::uint32_t              raw_dtype = 0;
     std::uint64_t              offset;       // absolute byte offset in file
     std::uint64_t              size_bytes;   // computed from dtype + dims
 };

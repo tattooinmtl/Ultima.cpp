@@ -1,0 +1,1253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ultima</title>
+<style>
+  :root {
+    --bg:#0e0f13; --panel:#161821; --panel-2:#12141c; --border:#252836;
+    --fg:#e6e8ee; --muted:#8b90a1;
+    --accent:#66d9ef; --user:#a1e6ff; --assistant:#e6e8ee;
+    --ok:#7bd88f; --warn:#e6a44a; --err:#ff6b6b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:var(--sans); overflow:hidden; }
+
+  /* ---- Frame ---- */
+  .frame { display:grid; grid-template-rows: 34px 40px 1fr; height:100%; }
+
+  /* ---- Top menu ---- */
+  .menu { display:flex; align-items:center; gap:2px; padding:0 8px; background:var(--panel);
+          border-bottom:1px solid var(--border); font-size:12px; user-select:none; }
+  .menu .m-item { padding:6px 10px; border-radius:4px; cursor:default; position:relative; }
+  .menu .m-item:hover, .menu .m-item.open { background:var(--border); }
+  .menu .m-item .m-drop {
+    display:none; position:absolute; top:100%; left:0; min-width:220px; background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:4px 0; z-index:100;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  .menu .m-item.open .m-drop { display:block; }
+  .menu .m-drop label { display:flex; align-items:center; gap:8px; padding:6px 12px; cursor:pointer; font-size:12px; }
+  .menu .m-drop label:hover { background:var(--border); }
+  .menu .m-drop label input[type=checkbox] { accent-color: var(--accent); }
+  .menu .m-drop .sep { height:1px; background:var(--border); margin:4px 0; }
+  .menu .m-drop .m-btn { display:block; padding:6px 12px; font-size:12px; cursor:pointer; }
+  .menu .m-drop .m-btn:hover { background:var(--border); }
+  .menu .spacer { flex:1; }
+  .menu .info { font-family:var(--mono); font-size:11px; color:var(--muted); padding:0 10px; }
+  .menu .info b { color:var(--fg); }
+  .menu .info .ok { color:var(--ok); }
+  .menu .info .err { color:var(--err); }
+
+  /* ---- Tab bar ---- */
+  .tabs { display:flex; align-items:center; gap:0; padding:0 8px; background:var(--panel-2);
+          border-bottom:1px solid var(--border); }
+  .tabs .tab { padding:8px 14px; cursor:pointer; font-size:13px; color:var(--muted);
+               border-bottom:2px solid transparent; margin-right:2px; user-select:none; }
+  .tabs .tab:hover { color:var(--fg); }
+  .tabs .tab.active { color:var(--fg); border-bottom-color:var(--accent); background:var(--panel); }
+  .tabs .tab .badge { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:8px;
+                       background:var(--accent); color:#0e0f13; font-size:10px; font-weight:600; }
+  .tabs .spacer { flex:1; }
+  .tabs .carousel-btn { font-size:12px; padding:6px 12px; background:var(--border); border:0;
+                         color:var(--fg); border-radius:4px; cursor:pointer; margin-left:8px; }
+  .tabs .carousel-btn:hover { background:#2f334a; }
+  .tabs .carousel-btn.active { background:var(--accent); color:#0e0f13; }
+
+  /* ---- Content area ---- */
+  .content { position:relative; overflow:hidden; }
+  .tab-view { position:absolute; inset:0; display:none; }
+  .tab-view.active { display:grid; }
+
+  /* Tab layouts */
+  .tab-assistant { grid-template-columns: 1fr 320px; }
+  .tab-coder     { grid-template-columns: 220px 1fr; }
+  .tab-brain     { grid-template-columns: 260px 1fr; }
+  .tab-inspector { grid-template-columns: 1fr; }
+
+  .pane { border-right:1px solid var(--border); display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+  .pane:last-child { border-right:0; }
+  .pane-hidden { display:none !important; }
+
+  /* ---- Assistant pane (chat) ---- */
+  .chat { display:flex; flex-direction:column; height:100%; min-height:0; }
+  .chat #log  { flex:1; overflow-y:auto; padding:16px; }
+  .msg  { margin-bottom:14px; padding:10px 12px; border-radius:8px;
+          background:var(--panel); border:1px solid var(--border); }
+  .msg .role { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; margin-bottom:4px; }
+  .msg.user      .role { color:var(--user); }
+  .msg.assistant .role { color:var(--accent); }
+  .msg .content { white-space:pre-wrap; font-family:var(--mono); font-size:13px; line-height:1.5; }
+  .msg .stats   { color:var(--muted); font-size:11px; margin-top:6px; font-family:var(--mono); }
+  #compose { border-top:1px solid var(--border); padding:12px; background:var(--panel); display:flex; gap:8px; }
+  #compose textarea { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--border);
+                       border-radius:6px; padding:8px 10px; font-family:var(--mono); font-size:13px;
+                       resize:vertical; min-height:64px; }
+  #compose button { background:var(--accent); color:#0e0f13; border:0; border-radius:6px;
+                     padding:0 18px; font-weight:600; cursor:pointer; }
+  #compose button:disabled { opacity:.4; cursor:default; }
+
+  /* ---- Side pane (sampler / brain / inspector controls) ---- */
+  .side { background:var(--panel); padding:14px; overflow-y:auto; }
+  .side h2 { font-size:11px; text-transform:uppercase; color:var(--muted); letter-spacing:.08em; margin:14px 0 6px; }
+  .side h2:first-child { margin-top:0; }
+  .side label { display:block; font-size:11px; margin:6px 0 2px; color:var(--muted); }
+  .side input[type=number], .side input[type=text], .side textarea.sys {
+    width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--border);
+    border-radius:4px; padding:5px 7px; font-family:var(--mono); font-size:12px;
+  }
+  .side textarea.sys { resize:vertical; min-height:60px; }
+  .row2 { display:grid; grid-template-columns: 1fr 1fr; gap:6px; }
+  .sec-btn { width:100%; margin-top:8px; background:var(--border); color:var(--fg); border:0; padding:6px; border-radius:4px; cursor:pointer; font-size:12px; }
+  .sec-btn:hover { background:#2f334a; }
+  .err { color:var(--err); font-family:var(--mono); font-size:12px; margin-top:6px; min-height:16px; }
+
+  /* ---- Coder tab ---- */
+  /* ---- Coder tab: file tree ---- */
+  .coder-tree { background:var(--panel); overflow-y:auto; font-family:var(--mono); font-size:12px; }
+  .tree-bar { display:flex; align-items:center; gap:4px; padding:6px 8px; border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--panel); }
+  .tree-bar button { background:var(--panel-2); color:var(--muted); border:1px solid var(--border); border-radius:4px; cursor:pointer; font-size:12px; line-height:1; padding:3px 7px; }
+  .tree-bar button:hover { color:var(--fg); border-color:var(--accent); }
+  .tree-root { margin-left:auto; color:var(--muted); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:110px; direction:rtl; }
+  .coder-tree .item { padding:3px 10px; cursor:pointer; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  .coder-tree .item:hover { background:var(--border); color:var(--fg); }
+  .coder-tree .item.active { background:var(--border); color:var(--accent); }
+  .coder-tree .item .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+  .coder-tree .item .act { opacity:0; font-size:10px; padding:0 3px; }
+  .coder-tree .item:hover .act { opacity:.65; }
+  .coder-tree .item .act:hover { opacity:1; color:var(--accent); }
+  .tree-empty { padding:10px 12px; color:var(--muted); font-size:11px; line-height:1.5; }
+
+  /* ---- Coder tab: editor tabs ---- */
+  .coder-file-tabs { display:flex; overflow-x:auto; background:var(--panel-2); border-bottom:1px solid var(--border); min-height:29px; }
+  .coder-file-tabs .ft { padding:6px 8px 6px 12px; font-size:12px; cursor:pointer; color:var(--muted); border-right:1px solid var(--border); white-space:nowrap; display:flex; align-items:center; gap:6px; }
+  .coder-file-tabs .ft.active { color:var(--fg); background:var(--panel); }
+  .coder-file-tabs .ft .x { opacity:.4; font-size:11px; }
+  .coder-file-tabs .ft .x:hover { opacity:1; color:var(--accent); }
+  .coder-file-tabs .ft.dirty .nm::after { content:' •'; color:var(--accent); }
+  .ft-none { padding:6px 12px; font-size:12px; color:var(--muted); }
+
+  /* ---- Coder tab: the editor -------------------------------------------
+     A textarea with transparent text laid exactly over a highlighted <pre>.
+     The <pre> holds the same text, so it sizes the scroll area and the two
+     stay aligned as long as their font metrics and padding match exactly.
+     Any change to one of these rules must be mirrored in the other. */
+  .ed-wrap { display:grid; grid-template-columns:52px 1fr; min-height:0; background:var(--panel); }
+  .ed-gutter-clip { overflow:hidden; background:var(--panel-2); border-right:1px solid var(--border); }
+  .ed-gutter { padding:10px 8px 10px 0; text-align:right; color:var(--muted); opacity:.6;
+               font-family:var(--mono); font-size:13px; line-height:1.55; white-space:pre; user-select:none; }
+  .ed-scroll { position:relative; overflow:auto; min-height:0; }
+  .ed-inner { position:relative; min-height:100%; width:max-content; min-width:100%; }
+  .ed-hl, .ed-ta { margin:0; padding:10px 14px; border:0;
+                   font-family:var(--mono); font-size:13px; line-height:1.55;
+                   white-space:pre; tab-size:2; }
+  .ed-hl { position:relative; z-index:0; color:var(--fg); }
+  .ed-ta { position:absolute; inset:0; z-index:1; width:100%; height:100%;
+           background:transparent; color:transparent; caret-color:var(--accent);
+           resize:none; outline:none; overflow:hidden; }
+  .ed-ta::selection { background:rgba(120,170,255,.28); }
+  /* Spans both grid columns — otherwise the empty state renders inside the
+     52px gutter column and wraps one word per line. */
+  .ed-empty { grid-column:1 / -1; padding:16px; color:var(--muted); font-size:12px; line-height:1.6; }
+
+  /* Rows: file tabs, editor, status bar, terminal. `flex:1` matters — the
+     parent .pane is a flex column, so without it the grid sizes to its
+     content and leaves dead space below the terminal. */
+  .coder-main { display:grid; grid-template-rows:auto 1fr auto auto 190px; flex:1; min-height:0; }
+
+  /* Token colors. Deliberately few: a local model writing a landing page
+     needs the file to be readable, not a twelve-color theme. */
+  .t-cmt { color:#6b7a8d; font-style:italic; }
+  .t-str { color:#9ecf7a; }
+  .t-num { color:#e2b86b; }
+  .t-kw  { color:#7aa2f7; }
+  .t-tag { color:#f07178; }
+  .t-atr { color:#e2b86b; }
+  .t-hd  { color:#7aa2f7; font-weight:600; }
+
+  /* ---- Coder tab: plan panel ---- */
+  .plan-panel { background:var(--panel); border-top:1px solid var(--border);
+                overflow-y:auto; font-size:12px; padding:8px 10px; }
+  .plan-hdr { display:flex; align-items:center; gap:8px; color:var(--muted);
+              font-size:11px; text-transform:uppercase; letter-spacing:.06em; margin-bottom:6px; }
+  .plan-hdr .ttl { color:var(--fg); text-transform:none; letter-spacing:0; font-size:12px; font-weight:600; }
+  .plan-hdr .prog { margin-left:auto; }
+  .plan-empty { color:var(--muted); line-height:1.6; }
+  .plan-empty b { color:var(--fg); font-weight:600; }
+  .ph { display:flex; align-items:flex-start; gap:7px; padding:3px 2px; border-radius:3px; }
+  .ph:hover { background:var(--panel-2); }
+  .ph .box { cursor:pointer; user-select:none; width:12px; flex:none; color:var(--muted); }
+  .ph.done .box { color:#9ecf7a; }
+  .ph.done .tx { color:var(--muted); text-decoration:line-through; }
+  .ph.active { background:rgba(122,162,247,.10); }
+  .ph.active .tx { color:var(--fg); }
+  .ph.active .n { color:var(--accent); }
+  .ph .n { color:var(--muted); flex:none; }
+  .ph .tx { color:var(--muted); }
+  .ph-todos { margin:0 0 4px 30px; }
+  .ph-todos .td { display:flex; gap:6px; color:var(--muted); padding:1px 0; font-size:11px; }
+  .ph-todos .td.done { text-decoration:line-through; opacity:.6; }
+
+  /* ---- Coder tab: terminal + agent box ---- */
+  .coder-terminal { background:#08090c; color:#c8e3ff; overflow:hidden; font-family:var(--mono); font-size:12px;
+                    border-top:1px solid var(--border); display:grid; grid-template-rows:1fr auto; min-height:0; }
+  #term-log { overflow-y:auto; padding:8px 12px; white-space:pre-wrap; }
+  #term-log .t-run  { color:#7aa2f7; }
+  #term-log .t-ok   { color:#9ecf7a; }
+  #term-log .t-bad  { color:#f07178; }
+  #term-log .t-dim  { color:#6b7a8d; }
+  .term-compose { display:flex; gap:6px; padding:6px 8px; border-top:1px solid var(--border); background:#0b0d11; }
+  .term-compose input { flex:1; background:var(--panel); color:var(--fg); border:1px solid var(--border);
+                        border-radius:4px; padding:5px 8px; font-family:var(--mono); font-size:12px; outline:none; }
+  .term-compose input:focus { border-color:var(--accent); }
+  .term-compose button#agent-plan { background:var(--panel-2); color:var(--fg); border:1px solid var(--border); }
+  .term-compose button#agent-plan:hover { border-color:var(--accent); color:var(--accent); }
+  .term-compose button { background:var(--accent); color:#06080c; border:0; border-radius:4px;
+                         padding:5px 14px; cursor:pointer; font-size:12px; font-weight:600; }
+  .term-compose button:disabled { opacity:.5; cursor:default; }
+  /* ---- Permission prompt (PERMISSIONS.md) ---- */
+  .perm { margin:6px 0; padding:8px 10px; border:1px solid var(--warn);
+          border-left-width:3px; border-radius:4px; background:rgba(230,164,74,.08); }
+  .perm .hd { color:var(--warn); font-size:11px; text-transform:uppercase;
+              letter-spacing:.06em; margin-bottom:4px; }
+  .perm .cl { color:#c8e3ff; word-break:break-all; }
+  .perm .wy { color:var(--muted); margin:3px 0 7px; }
+  .perm .bs { display:flex; gap:6px; }
+  .perm button { border:1px solid var(--border); border-radius:4px; cursor:pointer;
+                 font-size:11px; padding:3px 10px; background:var(--panel-2); color:var(--fg); }
+  .perm button.ok  { background:var(--ok);   color:#06080c; border-color:var(--ok); font-weight:600; }
+  .perm button.no  { background:var(--err);  color:#06080c; border-color:var(--err); font-weight:600; }
+  .perm button:hover { filter:brightness(1.12); }
+  .perm.settled { border-color:var(--border); background:transparent; opacity:.65; }
+  .perm.settled .bs { display:none; }
+  .perm-mode { display:flex; align-items:center; gap:4px; margin-left:auto; }
+  .perm-mode select { background:var(--panel); color:var(--fg); border:1px solid var(--border);
+                      border-radius:4px; font-size:11px; padding:2px 4px; font-family:var(--mono); }
+  .perm-mode select.yolo { border-color:var(--err); color:var(--err); }
+
+  .ed-status { display:flex; gap:14px; padding:3px 12px; font-size:11px; color:var(--muted);
+               background:var(--panel-2); border-top:1px solid var(--border); }
+
+  /* ---- Brain tab ---- */
+  .brain-list { background:var(--panel); padding:8px 0; overflow-y:auto; font-family:var(--mono); font-size:12px; }
+  .brain-list .b-hdr { padding:6px 12px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .brain-list .item { padding:4px 12px; cursor:pointer; }
+  .brain-list .item:hover { background:var(--border); }
+  .brain-main { padding:16px; overflow-y:auto; font-family:var(--mono); font-size:12px; color:var(--muted); }
+
+  /* ---- Inspector tab ---- */
+  .inspector { padding:16px; overflow-y:auto; }
+  .inspector h3 { color:var(--fg); font-size:13px; margin:16px 0 6px; }
+  .inspector h3:first-child { margin-top:0; }
+  .inspector .card { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:12px; margin-bottom:12px; }
+  .inspector pre { margin:0; font-family:var(--mono); font-size:11px; color:var(--muted); white-space:pre-wrap; }
+
+  /* ---- Carousel mode ---- */
+  .carousel-overlay { position:absolute; inset:0; background:var(--bg); z-index:50;
+                       display:none; align-items:center; justify-content:center; gap:24px; padding:24px; }
+  .carousel-overlay.active { display:flex; }
+  .carousel-nav { background:var(--panel); border:1px solid var(--border); color:var(--fg);
+                   width:44px; height:44px; border-radius:50%; font-size:20px; cursor:pointer;
+                   display:flex; align-items:center; justify-content:center; }
+  .carousel-nav:disabled { opacity:.3; cursor:default; }
+  .carousel-cards { flex:1; display:flex; gap:16px; overflow:hidden; align-items:center; justify-content:center; }
+  .carousel-card {
+    flex:0 0 30%; height:70vh; background:var(--panel); border:2px solid var(--border);
+    border-radius:8px; padding:16px; display:flex; flex-direction:column; cursor:pointer;
+    transition: transform .18s, border-color .18s;
+  }
+  .carousel-card.focused { border-color:var(--accent); transform: scale(1.05); }
+  .carousel-card h4 { margin:0 0 8px; font-size:16px; color:var(--accent); }
+  .carousel-card .desc { color:var(--muted); font-size:12px; }
+  .carousel-hint { position:absolute; bottom:16px; left:0; right:0; text-align:center;
+                    font-family:var(--mono); font-size:11px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="frame">
+
+  <!-- ---- Top menu ---- -->
+  <div class="menu" id="menu">
+    <div class="m-item" data-menu="file">File
+      <div class="m-drop">
+        <div class="m-btn" onclick="alert('New project — v0.2')">New project</div>
+        <div class="m-btn" onclick="alert('Open workspace — v0.2')">Open workspace…</div>
+        <div class="sep"></div>
+        <div class="m-btn" onclick="location.reload()">Refresh</div>
+      </div>
+    </div>
+    <div class="m-item" data-menu="edit">Edit
+      <div class="m-drop">
+        <div class="m-btn" onclick="alert('Undo — v0.2')">Undo</div>
+        <div class="m-btn" onclick="alert('Redo — v0.2')">Redo</div>
+      </div>
+    </div>
+    <div class="m-item" data-menu="layout">Layout
+      <div class="m-drop" id="layout-menu">
+        <!-- populated dynamically per active tab -->
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="info" id="hdr-model">model: <b>…</b></div>
+    <div class="info" id="hdr-slots">slots: <b>…</b></div>
+  </div>
+
+  <!-- ---- Tab bar ---- -->
+  <div class="tabs" id="tabs">
+    <div class="tab active" data-tab="assistant">Assistant</div>
+    <div class="tab" data-tab="coder">Coder</div>
+    <div class="tab" data-tab="brain">Brain</div>
+    <div class="tab" data-tab="inspector">Inspector</div>
+    <div class="spacer"></div>
+    <button class="carousel-btn" id="carousel-toggle">⇄ Carousel</button>
+  </div>
+
+  <!-- ---- Content ---- -->
+  <div class="content" id="content">
+
+    <!-- Assistant tab -->
+    <div class="tab-view tab-assistant active" data-tab-view="assistant">
+      <section class="pane chat" data-panel="chat">
+        <div id="log"></div>
+        <div id="compose">
+          <textarea id="input" placeholder="Message (Ctrl+Enter to send)"></textarea>
+          <button id="send">Send</button>
+        </div>
+      </section>
+      <aside class="pane side" data-panel="sampler">
+        <h2>System</h2>
+        <textarea id="sys" class="sys">You are a helpful coding assistant.</textarea>
+        <h2>Sampler</h2>
+        <div class="row2">
+          <div><label>temperature</label><input type="number" id="temperature" step="0.05" value="0.2"/></div>
+          <div><label>top_k</label><input type="number" id="top_k" step="1" value="40"/></div>
+          <div><label>top_p</label><input type="number" id="top_p" step="0.05" value="0.95"/></div>
+          <div><label>min_p</label><input type="number" id="min_p" step="0.05" value="0.05"/></div>
+          <div><label>rep_penalty</label><input type="number" id="repetition_penalty" step="0.05" value="1.1"/></div>
+          <div><label>max_tokens</label><input type="number" id="max_tokens" step="16" value="256"/></div>
+          <div><label>seed</label><input type="number" id="seed" placeholder="random"/></div>
+        </div>
+        <button id="reset-defaults" class="sec-btn">Reset to coding defaults</button>
+        <h2>Session</h2>
+        <button id="clear" class="sec-btn">Clear history</button>
+        <div class="err" id="err"></div>
+      </aside>
+    </div>
+
+    <!-- Coder tab -->
+    <div class="tab-view tab-coder" data-tab-view="coder">
+      <aside class="pane coder-tree" data-panel="tree">
+        <div class="tree-bar">
+          <button id="tree-new" title="New file">+</button>
+          <button id="tree-refresh" title="Refresh tree">&#8635;</button>
+          <span class="tree-root" id="tree-root"></span>
+        </div>
+        <div class="tree-bar" style="border-top:0">
+          <span class="perm-mode" title="What the agent may do without asking. See PERMISSIONS.md.">
+            perms
+            <select id="perm-mode">
+              <option value="auto">auto</option>
+              <option value="ask">ask</option>
+              <option value="yolo">yolo</option>
+            </select>
+          </span>
+        </div>
+        <div id="tree-list"></div>
+      </aside>
+      <section class="pane" data-panel="editor">
+        <div class="coder-main">
+          <div class="coder-file-tabs" id="coder-file-tabs"></div>
+          <div class="ed-wrap" id="ed-body" data-panel="editor-body"></div>
+          <div class="ed-status" id="ed-status"></div>
+          <div class="plan-panel" id="plan-panel" data-panel="plan"></div>
+          <div class="coder-terminal" data-panel="terminal">
+            <div id="term-log"></div>
+            <div class="term-compose">
+              <input id="agent-input" placeholder="Ask the model to change this project…" />
+              <button id="agent-plan" title="Write a phase plan first, without touching code">Plan</button><button id="agent-send">Run</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="tab-view tab-brain" data-tab-view="brain">
+      <aside class="pane brain-list" data-panel="brain-list">
+        <div class="b-hdr">Memories (scope: session)</div>
+        <div class="item">(empty)</div>
+        <div class="b-hdr">Skills</div>
+        <div class="item">web-frontend</div>
+        <div class="item">html5-canvas</div>
+        <div class="item">threejs-3d</div>
+        <div class="item">web-anim</div>
+        <div class="item">sandbox-python</div>
+        <div class="item">sandbox-php</div>
+      </aside>
+      <section class="pane brain-main" data-panel="brain-detail">
+        Select a memory or skill on the left to inspect.
+        <br><br>
+        Full memory (Decision 12) + skill registry (Decision 11) wire here in v0.2 once
+        the runtime endpoints land.
+      </section>
+    </div>
+
+    <!-- Inspector tab -->
+    <div class="tab-view tab-inspector" data-tab-view="inspector">
+      <section class="pane" data-panel="inspector-main">
+        <div class="inspector">
+          <h3>Model dims</h3>
+          <div class="card"><pre id="insp-dims">loading…</pre></div>
+          <h3>KV slots</h3>
+          <div class="card"><pre id="insp-slots">loading…</pre></div>
+          <h3>Sampler chain (current defaults)</h3>
+          <div class="card"><pre id="insp-sampler">temp=0.2, top_k=40, top_p=0.95, min_p=0.05, rep_penalty=1.1, DRY on</pre></div>
+          <h3>Last request</h3>
+          <div class="card"><pre id="insp-last">no requests yet</pre></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Carousel overlay -->
+    <div class="carousel-overlay" id="carousel">
+      <button class="carousel-nav" id="car-prev">◀</button>
+      <div class="carousel-cards" id="car-cards"></div>
+      <button class="carousel-nav" id="car-next">▶</button>
+      <div class="carousel-hint">← → to navigate · ↑ to select · Esc to exit</div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// ---- Tab state --------------------------------------------------------------
+const TABS = [
+  { id: 'assistant', label: 'Assistant', desc: 'Chat with the model, tune the sampler.' },
+  { id: 'coder',     label: 'Coder',     desc: 'File tree, editor tabs, terminal — where multi-file model output lands.' },
+  { id: 'brain',     label: 'Brain',     desc: 'Memory browser + skills registry.' },
+  { id: 'inspector', label: 'Inspector', desc: 'Live model dims, KV slot usage, sampler config, last request.' },
+];
+const PANELS_PER_TAB = {
+  assistant: [ { id:'chat', label:'Chat' }, { id:'sampler', label:'Sampler & system' } ],
+  coder:     [ { id:'tree', label:'File tree' }, { id:'editor', label:'Editor tabs' }, { id:'editor-body', label:'Editor body' }, { id:'plan', label:'Plan' }, { id:'terminal', label:'Terminal' } ],
+  brain:     [ { id:'brain-list', label:'Memory + skills list' }, { id:'brain-detail', label:'Detail view' } ],
+  inspector: [ { id:'inspector-main', label:'Diagnostics' } ],
+};
+const layoutState = JSON.parse(localStorage.getItem('ultima-layout') || '{}');
+function panelVisible(tab, panel) {
+  const t = layoutState[tab] || {};
+  return t[panel] !== false;
+}
+function setPanelVisible(tab, panel, on) {
+  layoutState[tab] = layoutState[tab] || {};
+  layoutState[tab][panel] = on;
+  localStorage.setItem('ultima-layout', JSON.stringify(layoutState));
+  applyPanelVisibility(tab);
+}
+function applyPanelVisibility(tab) {
+  const view = document.querySelector(`[data-tab-view="${tab}"]`);
+  if (!view) return;
+  view.querySelectorAll('[data-panel]').forEach(el => {
+    const p = el.dataset.panel;
+    el.classList.toggle('pane-hidden', !panelVisible(tab, p));
+  });
+}
+function rebuildLayoutMenu(tab) {
+  const menu = $('layout-menu');
+  const panels = PANELS_PER_TAB[tab] || [];
+  menu.innerHTML = panels.map(p =>
+    `<label><input type="checkbox" data-panel-toggle="${p.id}" ${panelVisible(tab, p.id) ? 'checked' : ''}/> ${p.label}</label>`
+  ).join('') + '<div class="sep"></div><div class="m-btn" data-layout-reset>Reset layout for this tab</div>';
+  menu.querySelectorAll('input[data-panel-toggle]').forEach(cb => {
+    cb.onclick = () => setPanelVisible(tab, cb.dataset.panelToggle, cb.checked);
+  });
+  menu.querySelector('[data-layout-reset]').onclick = () => {
+    delete layoutState[tab];
+    localStorage.setItem('ultima-layout', JSON.stringify(layoutState));
+    applyPanelVisibility(tab);
+    rebuildLayoutMenu(tab);
+  };
+}
+
+// ---- Menu open/close --------------------------------------------------------
+document.querySelectorAll('.m-item').forEach(mi => {
+  mi.onclick = (e) => {
+    e.stopPropagation();
+    const wasOpen = mi.classList.contains('open');
+    document.querySelectorAll('.m-item').forEach(x => x.classList.remove('open'));
+    if (!wasOpen) mi.classList.add('open');
+  };
+});
+document.body.addEventListener('click', () => {
+  document.querySelectorAll('.m-item').forEach(x => x.classList.remove('open'));
+});
+
+// ---- Tab switching ----------------------------------------------------------
+let activeTab = 'assistant';
+function setActiveTab(id) {
+  activeTab = id;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === id));
+  document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.dataset.tabView === id));
+  rebuildLayoutMenu(id);
+  applyPanelVisibility(id);
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => setActiveTab(t.dataset.tab));
+
+// ---- Carousel ---------------------------------------------------------------
+let carouselOpen = false;
+let carouselIdx = 0;
+function openCarousel() {
+  carouselOpen = true;
+  $('carousel-toggle').classList.add('active');
+  const cards = TABS.map((t, i) => `
+    <div class="carousel-card ${i === carouselIdx ? 'focused' : ''}" data-idx="${i}">
+      <h4>${t.label}</h4>
+      <div class="desc">${t.desc}</div>
+    </div>`).join('');
+  $('car-cards').innerHTML = cards;
+  $('car-cards').querySelectorAll('.carousel-card').forEach(c => {
+    c.onclick = () => { carouselIdx = parseInt(c.dataset.idx); selectCarousel(); };
+  });
+  $('carousel').classList.add('active');
+}
+function closeCarousel() {
+  carouselOpen = false;
+  $('carousel-toggle').classList.remove('active');
+  $('carousel').classList.remove('active');
+}
+function refreshFocus() {
+  $('car-cards').querySelectorAll('.carousel-card').forEach((c, i) =>
+    c.classList.toggle('focused', i === carouselIdx));
+}
+function moveCarousel(dir) {
+  carouselIdx = Math.max(0, Math.min(TABS.length - 1, carouselIdx + dir));
+  refreshFocus();
+}
+function selectCarousel() {
+  setActiveTab(TABS[carouselIdx].id);
+  closeCarousel();
+}
+$('carousel-toggle').onclick = () => carouselOpen ? closeCarousel() : openCarousel();
+$('car-prev').onclick = () => moveCarousel(-1);
+$('car-next').onclick = () => moveCarousel(+1);
+document.addEventListener('keydown', (e) => {
+  if (e.altKey && e.key.toLowerCase() === 'c') { e.preventDefault(); carouselOpen ? closeCarousel() : openCarousel(); return; }
+  if (carouselOpen) {
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); moveCarousel(-1); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); moveCarousel(+1); }
+    if (e.key === 'ArrowUp')    { e.preventDefault(); selectCarousel(); }
+    if (e.key === 'Escape')     { e.preventDefault(); closeCarousel(); }
+  } else {
+    if (e.key === 'ArrowDown' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openCarousel(); }
+  }
+});
+
+// ---- Health poll ------------------------------------------------------------
+async function pollHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const j = await r.json();
+    $('hdr-model').innerHTML = `model: <b>${j.model}</b> (${j.arch})`;
+    $('hdr-slots').innerHTML = `slots: <b class="ok">${j.kv_slots.in_use}/${j.kv_slots.total}</b>`;
+    $('insp-slots').textContent = JSON.stringify(j.kv_slots, null, 2);
+    $('insp-dims').textContent  = 'arch: ' + j.arch + '\nmodel: ' + j.model;
+  } catch (e) {
+    $('hdr-model').innerHTML = 'model: <b class="err">unreachable</b>';
+  }
+}
+setInterval(pollHealth, 2000);
+pollHealth();
+
+// ---- Chat -------------------------------------------------------------------
+const state = { messages: [] };
+function addMessage(role, content, stats = null) {
+  const box = document.createElement('div');
+  box.className = 'msg ' + role;
+  box.innerHTML = `<div class="role">${role}</div><div class="content"></div>`;
+  box.querySelector('.content').textContent = content;
+  if (stats) {
+    const s = document.createElement('div');
+    s.className = 'stats';
+    s.textContent = stats;
+    box.appendChild(s);
+  }
+  $('log').appendChild(box);
+  $('log').scrollTop = $('log').scrollHeight;
+  return box;
+}
+function readParams() {
+  const num = (id) => { const v = $(id).value; return v === '' ? undefined : Number(v); };
+  const p = {
+    temperature: num('temperature'),
+    top_k: num('top_k'),
+    top_p: num('top_p'),
+    min_p: num('min_p'),
+    repetition_penalty: num('repetition_penalty'),
+    max_tokens: num('max_tokens'),
+  };
+  const s = num('seed');
+  if (s !== undefined) p.seed = s;
+  return p;
+}
+$('reset-defaults').onclick = () => {
+  $('temperature').value = 0.2; $('top_k').value = 40; $('top_p').value = 0.95;
+  $('min_p').value = 0.05; $('repetition_penalty').value = 1.1;
+  $('max_tokens').value = 256; $('seed').value = '';
+};
+$('clear').onclick = () => { state.messages = []; $('log').innerHTML = ''; };
+
+async function send() {
+  const text = $('input').value.trim();
+  if (!text) return;
+  $('input').value = '';
+  $('send').disabled = true;
+  $('err').textContent = '';
+
+  state.messages.push({ role: 'user', content: text });
+  addMessage('user', text);
+
+  const sysText = $('sys').value.trim();
+  const messages = sysText ? [{ role: 'system', content: sysText }, ...state.messages] : state.messages;
+
+  const body = { model: 'ultima', messages, stream: true, ...readParams() };
+  const started = performance.now();
+  const bubble = addMessage('assistant', '');
+  const contentEl = bubble.querySelector('.content');
+  let content = '';
+
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      let detail = '';
+      try { const j = await r.json(); detail = j.error || JSON.stringify(j); }
+      catch { detail = await r.text().catch(() => ''); }
+      throw new Error('HTTP ' + r.status + (detail ? ' — ' + detail : ''));
+    }
+    if (!r.body) throw new Error('no response body');
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let finalStats = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const raw = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        const dataLines = raw.split('\n').filter(l => l.startsWith('data: ')).map(l => l.slice(6));
+        if (!dataLines.length) continue;
+        const payload = dataLines.join('\n');
+        if (payload === '[DONE]') continue;
+        try {
+          const j = JSON.parse(payload);
+          const delta = j.choices?.[0]?.delta;
+          if (delta && typeof delta.content === 'string') {
+            content += delta.content;
+            contentEl.textContent = content;
+            $('log').scrollTop = $('log').scrollHeight;
+          }
+          if (j.usage || j.ultima) finalStats = j;
+        } catch { /* skip malformed */ }
+      }
+    }
+    let statsText = 'streamed';
+    if (finalStats?.ultima) {
+      const u = finalStats.ultima;
+      const wall = ((performance.now() - started) / 1000).toFixed(2);
+      statsText = `first ${u.first_token_ms?.toFixed?.(0) || '?'} ms · ${u.decode_toks || 0} tok · ${u.decode_tps?.toFixed?.(1) || '?'} tok/s · seed ${u.seed} · wall ${wall}s`;
+      $('insp-last').textContent = JSON.stringify(finalStats.ultima, null, 2);
+    }
+    const s = document.createElement('div');
+    s.className = 'stats';
+    s.textContent = statsText;
+    bubble.appendChild(s);
+    state.messages.push({ role: 'assistant', content });
+  } catch (e) {
+    $('err').textContent = 'error: ' + e.message;
+    contentEl.textContent = '(error — see sampler pane)';
+  } finally {
+    $('send').disabled = false;
+    $('input').focus();
+  }
+}
+$('send').onclick = send;
+$('input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+});
+
+
+// ---- Coder tab ---------------------------------------------------------------
+// A small IDE over the /api/fs/* endpoints from Decision 18. No dependencies:
+// the testpad is bundled into the binary and may not reference anything
+// external, so the editor and the highlighter are written here.
+const Coder = (() => {
+  const open = new Map();      // path -> { text, saved, lang }
+  let active = null;           // path of the focused tab
+  let tree = [];
+  let lastUserFocus = 0;       // so agent-created tabs do not steal focus
+
+  // ---- syntax highlighting --------------------------------------------------
+  // One combined regex per language, applied in a single pass. Ordering inside
+  // `rules` is the precedence: comments and strings come first so a keyword
+  // inside a string is not recolored.
+  const KW_JS = 'const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|'
+              + 'class|extends|super|new|this|null|undefined|true|false|async|await|try|catch|'
+              + 'finally|throw|typeof|instanceof|import|export|from|default|of|in|delete|void|'
+              + 'yield|static|get|set';
+  const KW_PY = 'def|class|return|if|elif|else|for|while|break|continue|import|from|as|pass|'
+              + 'raise|try|except|finally|with|lambda|None|True|False|and|or|not|is|in|global|'
+              + 'nonlocal|assert|yield|async|await|del';
+
+  const LANGS = {
+    js: [ ['cmt', String.raw`//[^\n]*|/\*[\s\S]*?\*/`],
+          // \x60 is a backtick: a literal one cannot appear inside String.raw.
+          ['str', String.raw`\x60(?:\\[\s\S]|[^\x60\\])*\x60|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'`],
+          ['num', String.raw`\b\d[\w.]*\b`],
+          ['kw',  String.raw`\b(?:` + KW_JS + String.raw`)\b`] ],
+    py: [ ['cmt', String.raw`#[^\n]*`],
+          ['str', String.raw`"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'`],
+          ['num', String.raw`\b\d[\w.]*\b`],
+          ['kw',  String.raw`\b(?:` + KW_PY + String.raw`)\b`] ],
+    css:[ ['cmt', String.raw`/\*[\s\S]*?\*/`],
+          ['str', String.raw`"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'`],
+          ['num', String.raw`[-+]?\b\d[\w.%]*\b`],
+          ['kw',  String.raw`@[a-zA-Z-]+|[.#][\w-]+`] ],
+    html:[ ['cmt', String.raw`<!--[\s\S]*?-->`],
+           ['str', String.raw`"(?:[^"]*)"|'(?:[^']*)'`],
+           ['tag', String.raw`</?[a-zA-Z][\w:-]*|/?>`],
+           ['atr', String.raw`\b[a-zA-Z-]+(?==)`] ],
+    json:[ ['str', String.raw`"(?:\\.|[^"\\\n])*"`],
+           ['num', String.raw`-?\b\d[\w.+-]*\b`],
+           ['kw',  String.raw`\b(?:true|false|null)\b`] ],
+    md: [ ['cmt', String.raw`\x60\x60\x60[\s\S]*?\x60\x60\x60|\x60[^\x60\n]*\x60`],
+          ['hd',  String.raw`^#{1,6} [^\n]*`],
+          ['kw',  String.raw`\*\*[^*\n]+\*\*|\[[^\]\n]*\]\([^)\n]*\)`] ],
+  };
+  const COMPILED = {};
+  for (const [lang, rules] of Object.entries(LANGS)) {
+    COMPILED[lang] = {
+      re: new RegExp(rules.map(r => '(' + r[1] + ')').join('|'), 'gm'),
+      cls: rules.map(r => r[0]),
+    };
+  }
+
+  function langFor(path) {
+    const m = /\.([a-z0-9]+)$/i.exec(path || '');
+    const ext = m ? m[1].toLowerCase() : '';
+    if (['js','mjs','cjs','ts','tsx','jsx'].includes(ext)) return 'js';
+    if (['py'].includes(ext)) return 'py';
+    if (['css','scss','less'].includes(ext)) return 'css';
+    if (['html','htm','xml','svg','vue'].includes(ext)) return 'html';
+    if (['json'].includes(ext)) return 'json';
+    if (['md','markdown'].includes(ext)) return 'md';
+    return null;
+  }
+  const esc = (s) => s.replace(/[&<>]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
+
+  function highlight(code, lang) {
+    const spec = COMPILED[lang];
+    if (!spec) return esc(code);
+    let out = '', last = 0;
+    spec.re.lastIndex = 0;
+    let m;
+    while ((m = spec.re.exec(code)) !== null) {
+      // A zero-length match would spin forever; step past it.
+      if (m[0] === '') { spec.re.lastIndex++; continue; }
+      out += esc(code.slice(last, m.index));
+      let cls = null;
+      for (let g = 1; g < m.length; g++) { if (m[g] !== undefined) { cls = spec.cls[g-1]; break; } }
+      out += '<span class="t-' + cls + '">' + esc(m[0]) + '</span>';
+      last = m.index + m[0].length;
+    }
+    return out + esc(code.slice(last));
+  }
+
+  // ---- editor ---------------------------------------------------------------
+  const ta = () => $('ed-ta'), hl = () => $('ed-hl'), gutter = () => $('ed-gutter');
+
+  function render() {
+    const doc = active ? open.get(active) : null;
+    const wrap = $('ed-body');
+    if (!doc) {
+      wrap.innerHTML = '<div class="ed-empty">No file open.<br>Pick one from the tree, or ask the model below to create one.</div>';
+      renderStatus();
+      return;
+    }
+    if (!$('ed-ta')) {
+      wrap.innerHTML =
+        '<div class="ed-gutter-clip"><div class="ed-gutter" id="ed-gutter"></div></div>' +
+        '<div class="ed-scroll" id="ed-scroll"><div class="ed-inner">' +
+        '<pre class="ed-hl" id="ed-hl"></pre>' +
+        '<textarea class="ed-ta" id="ed-ta" spellcheck="false" wrap="off"></textarea>' +
+        '</div></div>';
+      wireEditor();
+    }
+    ta().value = doc.text;
+    paint();
+  }
+
+  // Repaint the highlight layer and gutter from the textarea's current value.
+  function paint() {
+    const doc = active ? open.get(active) : null;
+    if (!doc || !$('ed-ta')) return;
+    const text = ta().value;
+    // The trailing newline keeps the <pre> one line taller than the text, so
+    // the caret on the last line still has a painted row under it.
+    hl().innerHTML = highlight(text, doc.lang) + '\n';
+    const lines = text.split('\n').length;
+    let g = '';
+    for (let i = 1; i <= lines; i++) g += i + '\n';
+    gutter().textContent = g;
+    renderStatus();
+  }
+
+  function wireEditor() {
+    const t = ta();
+    t.addEventListener('input', () => {
+      const doc = open.get(active);
+      if (!doc) return;
+      doc.text = t.value;
+      paint();
+      renderTabs();
+    });
+    t.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const s = t.selectionStart, en = t.selectionEnd;
+        t.value = t.value.slice(0, s) + '  ' + t.value.slice(en);
+        t.selectionStart = t.selectionEnd = s + 2;
+        t.dispatchEvent(new Event('input'));
+      } else if (e.key === 's' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        save();
+      }
+    });
+    t.addEventListener('focus', () => { lastUserFocus = Date.now(); });
+    // The gutter has no scrollbar of its own; slide it to match.
+    $('ed-scroll').addEventListener('scroll', () => {
+      gutter().style.transform = 'translateY(' + (-$('ed-scroll').scrollTop) + 'px)';
+    });
+  }
+
+  function renderStatus() {
+    const doc = active ? open.get(active) : null;
+    const el = $('ed-status');
+    if (!doc) { el.textContent = ''; return; }
+    const lines = doc.text.split('\n').length;
+    el.innerHTML = '<span>' + esc(active) + '</span>' +
+                   '<span>' + (doc.lang || 'text') + '</span>' +
+                   '<span>' + lines + ' lines</span>' +
+                   '<span>' + doc.text.length + ' chars</span>' +
+                   '<span>' + (doc.text === doc.saved ? 'saved' : 'unsaved — Ctrl+S') + '</span>';
+  }
+
+  // ---- tabs -----------------------------------------------------------------
+  function renderTabs() {
+    const bar = $('coder-file-tabs');
+    if (open.size === 0) { bar.innerHTML = '<div class="ft-none">no files open</div>'; return; }
+    bar.innerHTML = '';
+    for (const [path, doc] of open) {
+      const el = document.createElement('div');
+      el.className = 'ft' + (path === active ? ' active' : '') +
+                     (doc.text !== doc.saved ? ' dirty' : '');
+      el.innerHTML = '<span class="nm"></span><span class="x">✕</span>';
+      el.querySelector('.nm').textContent = path.split('/').pop();
+      el.title = path;
+      el.onclick = (e) => {
+        lastUserFocus = Date.now();
+        if (e.target.classList.contains('x')) { close(path); return; }
+        active = path; render(); renderTabs(); renderTree();
+      };
+      el.onauxclick = (e) => { if (e.button === 1) { e.preventDefault(); close(path); } };
+      bar.appendChild(el);
+    }
+  }
+
+  function close(path) {
+    const doc = open.get(path);
+    if (doc && doc.text !== doc.saved &&
+        !confirm(path + ' has unsaved changes. Close anyway?')) return;
+    open.delete(path);
+    if (active === path) active = open.size ? [...open.keys()][open.size - 1] : null;
+    // The textarea belongs to the closed document; drop it so render() rebuilds.
+    $('ed-body').innerHTML = '';
+    render(); renderTabs(); renderTree();
+  }
+
+  // ---- file operations ------------------------------------------------------
+  async function api(path, opts) {
+    const r = await fetch(path, opts);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+    return body;
+  }
+
+  async function openFile(path, focus = true) {
+    if (open.has(path)) {
+      if (focus) { active = path; render(); renderTabs(); renderTree(); }
+      return;
+    }
+    try {
+      const b = await api('/api/fs/file?path=' + encodeURIComponent(path));
+      open.set(path, { text: b.content, saved: b.content, lang: langFor(path) });
+      if (focus) active = path;
+      $('ed-body').innerHTML = '';
+      render(); renderTabs(); renderTree();
+      if (b.truncated) term('! ' + path + ' was truncated at 2 MB; saving would lose the rest', 'bad');
+    } catch (e) {
+      term('! cannot open ' + path + ': ' + e.message, 'bad');
+    }
+  }
+
+  async function save() {
+    if (!active) return;
+    const doc = open.get(active);
+    if (!doc || doc.text === doc.saved) return;
+    try {
+      await api('/api/fs/file', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: active, content: doc.text }),
+      });
+      doc.saved = doc.text;
+      renderTabs(); renderStatus();
+      term('saved ' + active, 'ok');
+      refreshTree();
+    } catch (e) {
+      term('! save failed: ' + e.message, 'bad');
+    }
+  }
+
+  async function refreshTree() {
+    try {
+      const b = await api('/api/fs/tree?recursive=1');
+      tree = b.entries || [];
+      $('tree-root').textContent = b.root || '';
+      $('tree-root').title = b.root || '';
+      renderTree();
+    } catch (e) {
+      $('tree-list').innerHTML = '<div class="tree-empty">' + esc(e.message) + '</div>';
+    }
+  }
+
+  function renderTree() {
+    const list = $('tree-list');
+    if (!tree.length) {
+      list.innerHTML = '<div class="tree-empty">Empty workspace.<br>Use + to add a file.</div>';
+      return;
+    }
+    list.innerHTML = '';
+    for (const e of tree) {
+      const row = document.createElement('div');
+      row.className = 'item' + (e.path === active ? ' active' : '');
+      const depth = (e.path.match(/\//g) || []).length;
+      row.style.paddingLeft = (10 + depth * 10) + 'px';
+      row.innerHTML = '<span class="nm"></span>' +
+                      '<span class="act" data-act="ren" title="Rename">✎</span>' +
+                      '<span class="act" data-act="del" title="Delete">🗑</span>';
+      row.querySelector('.nm').textContent = e.path.split('/').pop();
+      row.title = e.path + '  (' + e.size + ' bytes)';
+      row.onclick = (ev) => {
+        const act = ev.target.dataset && ev.target.dataset.act;
+        if (act === 'ren') { ev.stopPropagation(); rename(e.path); return; }
+        if (act === 'del') { ev.stopPropagation(); remove(e.path); return; }
+        lastUserFocus = Date.now();
+        openFile(e.path);
+      };
+      list.appendChild(row);
+    }
+  }
+
+  async function rename(path) {
+    const to = prompt('Rename to:', path);
+    if (!to || to === path) return;
+    try {
+      await api('/api/fs/rename', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: path, to }),
+      });
+      if (open.has(path)) {
+        const doc = open.get(path);
+        open.delete(path);
+        open.set(to, { ...doc, lang: langFor(to) });
+        if (active === path) active = to;
+      }
+      term('renamed ' + path + ' -> ' + to, 'ok');
+      await refreshTree(); renderTabs(); render();
+    } catch (e) { term('! rename failed: ' + e.message, 'bad'); }
+  }
+
+  async function remove(path) {
+    if (!confirm('Delete ' + path + '?')) return;
+    try {
+      await api('/api/fs/file?path=' + encodeURIComponent(path), { method: 'DELETE' });
+      open.delete(path);
+      if (active === path) { active = open.size ? [...open.keys()][0] : null; $('ed-body').innerHTML = ''; }
+      term('deleted ' + path, 'ok');
+      await refreshTree(); renderTabs(); render();
+    } catch (e) { term('! delete failed: ' + e.message, 'bad'); }
+  }
+
+  async function newFile() {
+    const path = prompt('New file path (relative to the workspace):', 'index.html');
+    if (!path) return;
+    try {
+      await api('/api/fs/file', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, content: '' }),
+      });
+      await refreshTree();
+      openFile(path);
+    } catch (e) { term('! create failed: ' + e.message, 'bad'); }
+  }
+
+  // ---- plan panel -----------------------------------------------------------
+  // Renders .ultima/plan.md. One phase is in flight at a time, so the active
+  // one is highlighted and the rest are deliberately quiet.
+  let plan = null;
+
+  function renderPlan() {
+    const el = $('plan-panel');
+    if (!plan || !plan.phases || !plan.phases.length) {
+      el.innerHTML = '<div class="plan-empty">No plan yet. For anything bigger than a '
+                   + 'one-file change, press <b>Plan</b> and the model will break it into '
+                   + 'phases before writing code.</div>';
+      return;
+    }
+    let h = '<div class="plan-hdr"><span class="ttl"></span>'
+          + '<span class="prog">' + plan.done + ' / ' + plan.phases.length + ' done</span></div>';
+    el.innerHTML = h;
+    el.querySelector('.ttl').textContent = plan.title || 'Untitled project';
+
+    for (const p of plan.phases) {
+      const row = document.createElement('div');
+      row.className = 'ph' + (p.done ? ' done' : '') + (p.number === plan.active ? ' active' : '');
+      row.innerHTML = '<span class="box">' + (p.done ? '\u2611' : '\u2610') + '</span>'
+                    + '<span class="n">' + p.number + '.</span><span class="tx"></span>';
+      row.querySelector('.tx').textContent = p.text;
+      row.querySelector('.box').onclick = () => togglePhase(p.number, !p.done);
+      el.appendChild(row);
+
+      if (p.todos && p.todos.length) {
+        const box = document.createElement('div');
+        box.className = 'ph-todos';
+        for (const t of p.todos) {
+          const d = document.createElement('div');
+          d.className = 'td' + (t.done ? ' done' : '');
+          d.textContent = (t.done ? '\u2713 ' : '\u00b7 ') + t.text;
+          box.appendChild(d);
+        }
+        el.appendChild(box);
+      }
+    }
+  }
+
+  async function refreshPlan() {
+    try { plan = await api('/api/plan'); } catch { plan = null; }
+    renderPlan();
+  }
+
+  async function togglePhase(number, done) {
+    try {
+      plan = await api('/api/plan/phase', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phase: number, done }),
+      });
+      renderPlan();
+      term((done ? 'checked off' : 'reopened') + ' phase ' + number, 'ok');
+    } catch (e) { term('! ' + e.message, 'bad'); }
+  }
+
+  // ---- terminal panel -------------------------------------------------------
+  function term(line, cls) {
+    const log = $('term-log');
+    const d = document.createElement('div');
+    if (cls) d.className = 't-' + cls;
+    d.textContent = line;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // ---- permissions ----------------------------------------------------------
+  // A prompt arrives on the agent stream and is answered by a separate POST.
+  // The generating turn is parked until then, so the buttons are the only way
+  // forward and an unanswered prompt eventually times out as a denial.
+  function renderPermission(d) {
+    const log = $('term-log');
+    const box = document.createElement('div');
+    box.className = 'perm';
+    box.dataset.permId = d.id;
+    box.innerHTML =
+      '<div class="hd">Permission needed \u2014 ' + d.risk + '</div>' +
+      '<div class="cl"></div><div class="wy"></div>' +
+      '<div class="bs">' +
+        '<button class="ok" data-a="allow">Allow</button>' +
+        '<button data-a="always">Always allow this kind</button>' +
+        '<button class="no" data-a="deny">Deny</button>' +
+      '</div>';
+    const subject = d.subject ? '(' + d.subject + ')' : '';
+    box.querySelector('.cl').textContent = d.tool + ' ' + subject;
+    box.querySelector('.wy').textContent = d.reason;
+    box.querySelectorAll('button').forEach(b => {
+      b.onclick = () => answerPermission(d.id, b.dataset.a);
+    });
+    log.appendChild(box);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function answerPermission(id, decision) {
+    try {
+      await api('/api/permission', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, decision }),
+      });
+    } catch (e) { term('! ' + e.message, 'bad'); }
+    if (decision === 'always') refreshPermissions();
+  }
+
+  function settlePermission(id, decision) {
+    const box = document.querySelector('[data-perm-id="' + id + '"]');
+    if (!box) return;
+    box.classList.add('settled');
+    const hd = box.querySelector('.hd');
+    hd.textContent = hd.textContent + ' \u2014 ' +
+      (decision === 'deny' ? 'denied' : decision === 'always' ? 'always allowed' : 'allowed');
+  }
+
+  async function refreshPermissions() {
+    try {
+      const p = await api('/api/permissions');
+      const sel = $('perm-mode');
+      sel.value = p.mode;
+      sel.classList.toggle('yolo', p.mode === 'yolo');
+    } catch { /* server without the endpoint: leave the selector alone */ }
+  }
+
+  async function setPermissionMode(mode) {
+    if (mode === 'yolo' &&
+        !confirm('YOLO mode runs every action without asking \u2014 including deletes '
+               + 'and commands. Continue?')) {
+      refreshPermissions();
+      return;
+    }
+    try {
+      await api('/api/permissions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      term('permission mode: ' + mode, mode === 'yolo' ? 'bad' : 'ok');
+    } catch (e) { term('! ' + e.message, 'bad'); }
+    refreshPermissions();
+  }
+
+  // ---- agent run ------------------------------------------------------------
+  // Drives POST /api/agent/chat from Phase 2 and lands its `file` events as
+  // tabs, which is the whole point of the tool layer having a UI.
+  async function runAgent(mode) {
+    const input = $('agent-input');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    $('agent-send').disabled = true;
+    $('agent-plan').disabled = true;
+    term((mode === 'plan' ? '[plan] ' : '> ') + text, 'run');
+
+    try {
+      const res = await fetch('/api/agent/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: text }],
+                               mode: mode || 'auto',
+                               max_tokens: 700, max_rounds: 6, temperature: 0.2 }),
+      });
+      if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder('utf-8');
+      let buf = '', event = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trimEnd();
+          buf = buf.slice(nl + 1);
+          if (line.startsWith('event: ')) { event = line.slice(7); continue; }
+          if (!line.startsWith('data: ')) continue;
+          let d; try { d = JSON.parse(line.slice(6)); } catch { continue; }
+
+          if (event === 'tool_call') {
+            const a = d.arguments || {};
+            term('  ' + d.name + '(' + (a.path || a.from || a.glob || '') + ')', 'dim');
+          } else if (event === 'tool_result') {
+            term('  ' + (d.ok ? '✓ ' : '✗ ') + d.content.split('\n')[0].slice(0, 120),
+                 d.ok ? 'ok' : 'bad');
+          } else if (event === 'file') {
+            await refreshTree();
+            // Reload an open file the model just changed, unless the user is
+            // mid-edit in it — clobbering their typing would be worse than a
+            // stale tab.
+            const doc = open.get(d.path);
+            const busy = doc && doc.text !== doc.saved;
+            if (busy) { term('  (' + d.path + ' changed on disk; your tab has unsaved edits)', 'bad'); }
+            else {
+              open.delete(d.path);
+              const stealFocus = Date.now() - lastUserFocus > 5000;
+              await openFile(d.path, stealFocus || !active);
+            }
+          } else if (event === 'permission_request') {
+            renderPermission(d);
+          } else if (event === 'permission_result') {
+            settlePermission(d.id, d.decision);
+          } else if (event === 'warning') {
+            term('  ! ' + d.reason, 'bad');
+          } else if (event === 'plan') {
+            plan = d; renderPlan();
+          } else if (event === 'done') {
+            term('  [' + d.rounds + ' round(s), ' + d.tool_calls + ' tool call(s), ' + d.stop + ']', 'dim');
+          } else if (event === 'error') {
+            term('  ! ' + d.error, 'bad');
+          }
+        }
+      }
+    } catch (e) {
+      term('! ' + e.message, 'bad');
+    } finally {
+      $('agent-send').disabled = false;
+      $('agent-plan').disabled = false;
+      refreshPlan();
+    }
+  }
+
+  function init() {
+    $('tree-refresh').onclick = refreshTree;
+    $('tree-new').onclick = newFile;
+    $('agent-send').onclick = () => runAgent('auto');
+    $('agent-plan').onclick = () => runAgent('plan');
+    $('perm-mode').onchange = (e) => setPermissionMode(e.target.value);
+    $('agent-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runAgent(); }
+    });
+    renderTabs(); render(); refreshTree(); refreshPlan(); refreshPermissions();
+  }
+
+  return { init, openFile, save, refreshTree, highlight, langFor };
+})();
+
+// ---- Init -------------------------------------------------------------------
+setActiveTab('assistant');
+Coder.init();
+</script>
+</body>
+</html>

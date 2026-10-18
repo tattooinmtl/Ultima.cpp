@@ -41,6 +41,14 @@ if(ULTIMA_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+# ---- Benchmarks ----------------------------------------------------------------
+# Off by default: these are for answering a specific performance question,
+# not part of a normal build.
+option(ULTIMA_BUILD_BENCHMARKS "Build micro-benchmarks" OFF)
+if(ULTIMA_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+
 # ---- Status banner -----------------------------------------------------------
 message(STATUS "")
 message(STATUS "Ultima.cpp ${PROJECT_VERSION}")
