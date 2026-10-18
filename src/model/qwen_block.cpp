@@ -213,7 +213,7 @@ ffn_fused(BlockScratch& s, const ModelTensors::Block& b,
 Result<void>
 ffn_moe_one(BlockScratch& s, const ModelTensors::Block& b,
             const ModelDims& d, const ArchParams& p, std::size_t t,
-            runtime::ThreadPool& pool) {
+            std::size_t layer, runtime::ThreadPool& pool) {
     const float* x_norm_t = s.x_norm.data() + t * d.hidden;
     float*       x_t      = s.x.data()      + t * d.hidden;
 
@@ -254,6 +254,45 @@ ffn_moe_one(BlockScratch& s, const ModelTensors::Block& b,
         for (std::size_t j = 0; j < d.hidden; ++j) s.moe_accum[j] += w * s.expert_out[j];
     }
 
+    trace("ffn_moe_out", layer, s.moe_accum.data(), d.hidden);
+
+    // The shared expert sees every token. Its own router is a single row, so
+    // it produces one logit; sigmoid of that scales the whole contribution
+    // before it joins the routed sum. Unlike the routed weights this gate is
+    // not part of the renormalized top-k mass — it is an independent scale,
+    // which is why the shared expert can push the block's output past what
+    // the routed experts alone would give.
+    if (p.expert_shared_ffn > 0) {
+        const std::size_t sf = p.expert_shared_ffn;
+
+        if (auto r = matvec_dispatch_threaded(pool, b.ffn_gate_shexp.dtype,
+                                              b.ffn_gate_shexp.data,
+                                              x_norm_t, s.gate.data(),
+                                              sf, d.hidden); !r) return r;
+        if (auto r = matvec_dispatch_threaded(pool, b.ffn_up_shexp.dtype,
+                                              b.ffn_up_shexp.data,
+                                              x_norm_t, s.up.data(),
+                                              sf, d.hidden); !r) return r;
+        gated_act(p.ffn_act, s.gate.data(), s.up.data(), s.gate.data(), sf);
+
+        if (auto r = matvec_dispatch_threaded(pool, b.ffn_down_shexp.dtype,
+                                              b.ffn_down_shexp.data,
+                                              s.gate.data(), s.expert_out.data(),
+                                              d.hidden, sf); !r) return r;
+        trace("ffn_shexp", layer, s.expert_out.data(), d.hidden);
+
+        float gate_logit = 0.0f;
+        if (auto r = matvec_dispatch(b.ffn_gate_inp_shexp.dtype,
+                                     b.ffn_gate_inp_shexp.data,
+                                     x_norm_t, &gate_logit,
+                                     1, d.hidden); !r) return r;
+        const float g = 1.0f / (1.0f + std::exp(-gate_logit));
+        trace("shared_expert_gate_sigmoid", layer, &g, 1);
+
+        for (std::size_t j = 0; j < d.hidden; ++j) s.moe_accum[j] += g * s.expert_out[j];
+    }
+
+    trace("ffn_out", layer, s.moe_accum.data(), d.hidden);
     std::copy_n(s.moe_accum.begin(), d.hidden, x_t);
     return {};
 }
@@ -457,9 +496,12 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p,
         // ffn_down, so it needs the second buffer too once batched.
         up.assign(B * d.ffn_hidden, 0.0f);
         break;
-    case FfnKind::SparseMoE:
-        gate.assign(p.expert_ffn, 0.0f);
-        up.assign(p.expert_ffn, 0.0f);
+    case FfnKind::SparseMoE: {
+        // One token at a time, at whichever of the two expert widths is
+        // larger — the routed experts and the shared one reuse these in turn.
+        const std::size_t ew = std::max(p.expert_ffn, p.expert_shared_ffn);
+        gate.assign(ew, 0.0f);
+        up.assign(ew, 0.0f);
         router_probs.assign(p.n_expert, 0.0f);
         expert_ids.assign(p.n_expert_used, 0u);
         expert_weights.assign(p.n_expert_used, 0.0f);
@@ -467,12 +509,15 @@ void BlockScratch::init(const ModelDims& d, const ArchParams& p,
         moe_accum.assign(d.hidden, 0.0f);
         break;
     }
+    }
 
     // One buffer wide enough for any folded activation in this model.
     {
         std::size_t w = std::max({d.hidden, d.q_dim, d.ffn_hidden});
         if (p.delta.active()) w = std::max(w, p.delta.value_dim());
-        if (p.ffn == FfnKind::SparseMoE) w = std::max(w, p.expert_ffn);
+        if (p.ffn == FfnKind::SparseMoE) {
+            w = std::max({w, p.expert_ffn, p.expert_shared_ffn});
+        }
         fold_buf.assign(B * w, 0.0f);
         if (p.delta.active()) fold_perm.assign(B * p.delta.value_dim(), 0.0f);
     }
@@ -736,6 +781,7 @@ block_forward(BlockScratch& s,
     // 7. Attention (or delta-net) residual add.
     scale_in_place(s.x.data(), params.residual_scale, n_tok * H);
     kernels::add_f32(s.x.data(), s.residual.data(), s.x.data(), n_tok * H);
+    trace("attn_residual", layer, s.x.data(), H);
 
     // 8. FFN pre-norm.
     std::copy_n(s.x.begin(), n_tok * H, s.residual.begin());
@@ -744,6 +790,7 @@ block_forward(BlockScratch& s,
                              s.ffn_norm.data() + layer * H,
                              s.x_norm.data() + t * H, H, dims.rms_eps);
     }
+    trace("attn_post_norm", layer, s.x_norm.data(), H);
 
     // 9. Feed-forward, writing its output into s.x.
     switch (params.ffn) {
@@ -755,7 +802,7 @@ block_forward(BlockScratch& s,
         break;
     case FfnKind::SparseMoE:
         for (std::size_t t = 0; t < n_tok; ++t) {
-            if (auto r = ffn_moe_one(s, block, dims, params, t, pool); !r) return r;
+            if (auto r = ffn_moe_one(s, block, dims, params, t, layer, pool); !r) return r;
         }
         break;
     }

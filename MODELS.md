@@ -17,7 +17,7 @@ GGUFs and reports each file individually.
 | `spark2_5`   | runnable | Fused QKV, per-head sigmoid attention gate, GEGLU FFN, 3-of-4 sliding-window layers with their own RoPE dim and base |
 | `gemma4`     | not yet  | per-layer KV head counts, alternating sliding-window attention, dual RoPE bases, post-attention/post-FFN norms, final logit softcapping |
 | `qwen35`     | runnable | Qwen3.5 / Qwen3-Next hybrid: gated delta-net linear attention on 3 of every 4 blocks, full attention with a per-element output gate on the fourth. No KV for the recurrent layers. Covers the ternary Bonsai builds too |
-| `qwen35moe`  | not yet  | the `qwen35` delta-net hybrid plus MoE with shared experts (the one local file is blocked on shared experts, not on the hybrid) |
+| `qwen35moe`  | runnable | the `qwen35` delta-net hybrid with MoE: top-k routed experts plus a shared expert on every token, scaled by its own sigmoid gate. Covers MiniCPM-V-4.7-35B-A3B (text; the vision tower lives in a separate `mmproj` file and is not wired up yet) |
 | `deepseek2`  | not yet  | multi-head latent attention (compressed KV) and MoE with grouped routing, shared experts, expert bias |
 | `dspark`     | not yet  | **not a standalone model**: a diffusion drafter that attaches to a host. `Ternary-Bonsai-27B-dspark` is 6 blocks / 3.6B, has no tokenizer, and its `target_layers` [1,16,31,46,61] index a 64-layer host — its dims match `Ternary-Bonsai-2-27B` exactly. Needs a block-denoising speculative loop plus `Q2_0` |
 | `dflash-draft` | never* | speculative-decoding draft head: no tokenizer, no `token_embd`, no output head. Only usable attached to its target model |

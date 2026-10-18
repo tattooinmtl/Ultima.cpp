@@ -251,6 +251,19 @@ resolve_model_tensors(const LoadedModel& gguf,
             if (auto r = resolve_experts(gguf, pfx + "ffn_down_exps.weight",
                                          d.hidden, p.expert_ffn, p.n_expert); r) b.ffn_down_exps = *r;
             else return Failure{r.error()};
+
+            if (const std::size_t sf = p.expert_shared_ffn; sf > 0) {
+                // The shared router is one row, stored 1D: one logit per
+                // token, not one per expert.
+                if (auto r = get("ffn_gate_inp_shexp.weight", d.hidden, 0, b.ffn_gate_inp_shexp); !r)
+                    return Failure{r.error()};
+                if (auto r = get("ffn_gate_shexp.weight", sf, d.hidden, b.ffn_gate_shexp); !r)
+                    return Failure{r.error()};
+                if (auto r = get("ffn_up_shexp.weight",   sf, d.hidden, b.ffn_up_shexp);   !r)
+                    return Failure{r.error()};
+                if (auto r = get("ffn_down_shexp.weight", d.hidden, sf, b.ffn_down_shexp); !r)
+                    return Failure{r.error()};
+            }
             break;
         }
         }

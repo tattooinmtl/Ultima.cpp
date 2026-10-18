@@ -262,6 +262,87 @@ TEST_CASE("nextn prediction blocks are trimmed off the trunk") {
     CHECK(p.layer_is_recurrent.size() == 32);
 }
 
+// ---- qwen35moe: the hybrid with routed + shared experts ---------------------
+
+namespace {
+
+// Mirrors MiniCPM-V-4.7-35B-A3B: 40 blocks, 256 experts of width 512 with
+// top-8 routing, a 512-wide shared expert, and — deliberately — no
+// `feed_forward_length`, because a pure-MoE block has no dense FFN.
+ultima::model::MetadataStore build_qwen35moe_metadata() {
+    ultima::model::MetadataStore md;
+    md.insert("general.architecture", MetadataValue{std::string{"qwen35moe"}});
+    md.insert("qwen35moe.context_length",          MetadataValue{std::uint64_t{262144}});
+    md.insert("qwen35moe.embedding_length",        MetadataValue{std::uint64_t{2048}});
+    md.insert("qwen35moe.block_count",             MetadataValue{std::uint64_t{40}});
+    md.insert("qwen35moe.attention.head_count",    MetadataValue{std::uint64_t{16}});
+    md.insert("qwen35moe.attention.head_count_kv", MetadataValue{std::uint64_t{2}});
+    md.insert("qwen35moe.attention.key_length",    MetadataValue{std::uint64_t{256}});
+    md.insert("qwen35moe.full_attention_interval", MetadataValue{std::uint64_t{4}});
+    md.insert("qwen35moe.expert_count",            MetadataValue{std::uint64_t{256}});
+    md.insert("qwen35moe.expert_used_count",       MetadataValue{std::uint64_t{8}});
+    md.insert("qwen35moe.expert_feed_forward_length",
+              MetadataValue{std::uint64_t{512}});
+    md.insert("qwen35moe.expert_shared_feed_forward_length",
+              MetadataValue{std::uint64_t{512}});
+    md.insert("qwen35moe.ssm.conv_kernel",    MetadataValue{std::uint64_t{4}});
+    md.insert("qwen35moe.ssm.inner_size",     MetadataValue{std::uint64_t{4096}});
+    md.insert("qwen35moe.ssm.state_size",     MetadataValue{std::uint64_t{128}});
+    md.insert("qwen35moe.ssm.group_count",    MetadataValue{std::uint64_t{16}});
+    md.insert("qwen35moe.ssm.time_step_rank", MetadataValue{std::uint64_t{32}});
+    md.insert("tokenizer.ggml.tokens",
+              MetadataValue{std::vector<std::string>(248144, std::string{"x"})});
+    return md;
+}
+
+} // namespace
+
+TEST_CASE("qwen35moe parses routed and shared expert widths") {
+    FakeModel m{"qwen35moe", build_qwen35moe_metadata()};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    REQUIRE(parse_as(m, "qwen35moe", d, r, p).has_value());
+
+    CHECK(p.ffn == ultima::model::FfnKind::SparseMoE);
+    CHECK(p.n_expert         == 256);
+    CHECK(p.n_expert_used    == 8);
+    CHECK(p.expert_ffn       == 512);
+    CHECK(p.expert_shared_ffn == 512);
+    // A pure-MoE block carries no dense feed-forward width, and the file
+    // does not declare one.
+    CHECK(d.ffn_hidden == 0);
+    // Still the qwen35 hybrid underneath.
+    CHECK(p.delta.active());
+    CHECK(p.n_attention_layers(40) == 10);
+}
+
+TEST_CASE("an MoE architecture without a shared expert leaves the width at zero") {
+    auto md = build_qwen35moe_metadata();
+    md.insert("qwen35moe.expert_shared_feed_forward_length",
+              MetadataValue{std::uint64_t{0}});
+    FakeModel m{"qwen35moe", std::move(md)};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    REQUIRE(parse_as(m, "qwen35moe", d, r, p).has_value());
+    // Zero is what the forward pass branches on to skip the shexp tensors
+    // entirely, so a declared-but-empty shared expert must not arm it.
+    CHECK(p.expert_shared_ffn == 0);
+}
+
+TEST_CASE("qwen35moe still requires the routed expert counts") {
+    auto md = build_qwen35moe_metadata();
+    md.insert("qwen35moe.expert_used_count", MetadataValue{std::uint64_t{512}});
+    FakeModel m{"qwen35moe", std::move(md)};
+    ultima::model::ModelDims  d{};
+    ultima::model::RopeConfig r{};
+    ultima::model::ArchParams p{};
+    auto res = parse_as(m, "qwen35moe", d, r, p);
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error().message.find("exceeds expert_count") != std::string::npos);
+}
+
 TEST_CASE("qwen35 rotates only part of each head") {
     auto md = build_qwen35_metadata();
     md.insert("qwen35.rope.dimension_count", MetadataValue{std::uint64_t{64}});

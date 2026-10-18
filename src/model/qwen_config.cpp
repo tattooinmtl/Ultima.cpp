@@ -218,15 +218,12 @@ parse_arch_config(const LoadedModel& gguf,
                                     p.n_expert_used, p.n_expert),
                         "arch_config");
         }
-        // A shared expert alongside the routed ones is a separate code path
-        // (ffn_*_shexp); reject rather than silently dropping its contribution.
+        // A shared expert alongside the routed ones: an ordinary SwiGLU at
+        // its own width, gated by a single sigmoid per token, added to the
+        // routed sum. Absent in qwen3moe, present in qwen35moe.
         if (auto se = get_uint_any(md, {arch + ".expert_shared_feed_forward_length"});
             se && *se > 0) {
-            return fail(ErrorCode::InvalidModel,
-                        fmt::format("'{}' declares a shared expert "
-                                    "(expert_shared_feed_forward_length={}), "
-                                    "which is not implemented", arch, *se),
-                        "arch_config");
+            p.expert_shared_ffn = static_cast<std::size_t>(*se);
         }
     }
 

@@ -56,9 +56,10 @@ constexpr std::array<ArchSpec, 14> k_archs{{
      "every 4 blocks, full attention with a per-element output gate on the "
      "fourth. No KV for the recurrent layers, so context is cheap"},
 
-    {"qwen35moe", false, FfnKind::SparseMoE, FfnAct::SiLU, QkvKind::SeparateQGate,
+    {"qwen35moe", true, FfnKind::SparseMoE, FfnAct::SiLU, QkvKind::SeparateQGate,
      RopeStyle::NeoX, /*attn_gate=*/false, /*hybrid_recurrent=*/true,
-     "the qwen35 delta-net hybrid plus MoE routing with shared experts"},
+     "the qwen35 delta-net hybrid with MoE routing: top-k experts plus a "
+     "shared expert on every token, scaled by its own sigmoid gate"},
 
     {"deepseek2", false, {}, {}, {}, {}, {}, false,
      "needs multi-head latent attention (compressed KV, q_a/q_b/kv_a/kv_b "

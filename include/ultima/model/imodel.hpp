@@ -48,6 +48,11 @@ struct ArchParams {
     std::size_t n_expert_used = 0;   // top-k actually evaluated
     std::size_t expert_ffn    = 0;   // per-expert FFN width
 
+    // A shared expert running on every token alongside the routed top-k,
+    // its output scaled by its own sigmoid gate (qwen35moe). Zero means the
+    // architecture has none and the shexp tensors are absent.
+    std::size_t expert_shared_ffn = 0;
+
     // Granite's explicit scalar corrections. Defaults are the identity, so
     // architectures that do not set them behave exactly as before.
     float embedding_scale = 1.0f;   // multiplies the token embedding

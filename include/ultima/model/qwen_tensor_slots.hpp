@@ -77,6 +77,14 @@ struct ModelTensors {
         WeightRef ffn_up_exps;     // per expert: [expert_ffn, hidden]
         WeightRef ffn_down_exps;   // per expert: [hidden, expert_ffn]
 
+        // The shared expert, when ArchParams::expert_shared_ffn is non-zero.
+        // It is an ordinary SwiGLU feed-forward at its own width, plus a
+        // router that emits one scalar per token rather than one per expert.
+        WeightRef ffn_gate_inp_shexp;  // [hidden] — a single gate logit
+        WeightRef ffn_gate_shexp;      // [shared_ffn, hidden]
+        WeightRef ffn_up_shexp;        // [shared_ffn, hidden]
+        WeightRef ffn_down_shexp;      // [hidden, shared_ffn]
+
         // Optional biases (present in some Qwen2 variants; absent in Qwen3).
         std::optional<WeightRef> attn_q_bias;
         std::optional<WeightRef> attn_k_bias;
