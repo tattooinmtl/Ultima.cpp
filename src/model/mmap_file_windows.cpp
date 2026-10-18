@@ -115,6 +115,37 @@ Result<MmapFile> MmapFile::open(const std::filesystem::path& path) {
                     "mmap");
     }
 
+    // Pull the whole mapping into the page cache up front.
+    //
+    // Without this the first forward pass faults the file in one 4 KiB page
+    // at a time, in whatever order the graph happens to touch weights — and
+    // for a sparse-MoE model that order is driven by expert routing, so it
+    // is close to random over tens of GB. FILE_FLAG_RANDOM_ACCESS above
+    // (correct for steady state, where a token touches 8 of 256 experts)
+    // also tells Windows not to read ahead, so nothing coalesces those
+    // faults. The result is a model that decodes at a fraction of its real
+    // speed until the cache incidentally fills: measured 0.29 tok/s on the
+    // first request against 4.1 tok/s warm, same process, same prompt.
+    //
+    // One PrefetchVirtualMemory call turns that into large sequential I/O.
+    // It is advisory — the OS may prefetch less under memory pressure, and
+    // a failure is not an error — so the return value is deliberately
+    // ignored. Win8+ only, hence the runtime lookup rather than a link-time
+    // import. This is what llama.cpp does (src/llama-mmap.cpp), which is why
+    // it reaches a stable rate immediately and Ultima did not.
+    if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+        using prefetch_fn = BOOL(WINAPI*)(HANDLE, ULONG_PTR,
+                                          PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+        auto prefetch = reinterpret_cast<prefetch_fn>(
+            reinterpret_cast<void*>(GetProcAddress(k32, "PrefetchVirtualMemory")));
+        if (prefetch) {
+            WIN32_MEMORY_RANGE_ENTRY range{};
+            range.VirtualAddress = base;
+            range.NumberOfBytes  = static_cast<SIZE_T>(sz.QuadPart);
+            prefetch(GetCurrentProcess(), 1, &range, 0);
+        }
+    }
+
     MmapFile out;
     out.base_              = base;
     out.size_              = static_cast<std::size_t>(sz.QuadPart);
