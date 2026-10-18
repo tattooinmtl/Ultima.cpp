@@ -23,6 +23,7 @@ GGUFs and reports each file individually.
 | `dflash-draft` | never* | speculative-decoding draft head: no tokenizer, no `token_embd`, no output head. Only usable attached to its target model |
 | `llama`      | not yet  | Norm-style RoPE validation and llama-specific tensor aliases |
 | `bert`       | not yet  | encoder-only; needs a pooling path rather than causal prefill/decode |
+| `clip`       | not yet  | **not a standalone model**: the vision half of a VLM (`mmproj`), no tokenizer or output head. `mmproj-model-f16.gguf` pairs with MiniCPM-V-4.7-35B-A3B. Needs an image decoder, a bidirectional ViT, two 2×2 mergers, real mRoPE, and an embedding-injection prefill seam — see Decision 19 |
 
 \* "never" means not under the current `IModel` prefill/decode seam, not that
 the file is broken. Both would need a different execution model.

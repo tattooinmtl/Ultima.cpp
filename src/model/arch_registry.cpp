@@ -10,7 +10,7 @@ namespace {
 // execute. The `notes` on an unsupported entry is what the user sees when
 // they point Ultima at such a file, so it names the missing engine work
 // rather than just saying no.
-constexpr std::array<ArchSpec, 14> k_archs{{
+constexpr std::array<ArchSpec, 15> k_archs{{
     // ---- Supported ---------------------------------------------------------
     {"qwen2", true, FfnKind::DenseSwiGLU, FfnAct::SiLU, QkvKind::Separate, RopeStyle::NeoX, false, false,
      "Qwen2 / Qwen2.5 dense, separate QKV with biases"},
@@ -81,6 +81,17 @@ constexpr std::array<ArchSpec, 14> k_archs{{
     {"bert", false, {}, {}, {}, {}, {}, false,
      "encoder-only embedding model; needs a pooling path rather than "
      "causal prefill/decode"},
+
+    // Not a standalone model either: an mmproj file is the vision half of a
+    // VLM and carries no tokenizer, no token_embd and no output head. It
+    // pairs with a text GGUF — mmproj-model-f16.gguf goes with
+    // MiniCPM-V-4.7-35B-A3B, which runs as text today. Decision 19 specs
+    // the work and names the two questions still open.
+    {"clip", false, {}, {}, {}, {}, {}, false,
+     "vision projector (mmproj), not a standalone model: pairs with a text "
+     "GGUF and has no tokenizer or output head. Needs an image decoder, a "
+     "bidirectional ViT, the two 2x2 mergers, real mRoPE and an "
+     "embedding-injection prefill seam — see Decision 19"},
 }};
 
 } // namespace
