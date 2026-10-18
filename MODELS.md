@@ -35,7 +35,7 @@ Unless noted, a supported dtype works in matvec, row reads and 1-D dequant.
 |--------|-------|-------|-------|
 | F32    | 1     | 4     | |
 | F16    | 1     | 2     | dequant only — no matvec kernel |
-| BF16   | 1     | 2     | dequant only — no matvec kernel; top 16 bits of an f32 |
+| BF16   | 1     | 2     | top 16 bits of an f32; matvec + threaded matvec present |
 | Q4_0   | 32    | 18    | **not implemented** |
 | Q4_1   | 32    | 20    | affine 4-bit |
 | Q5_0   | 32    | 22    | |

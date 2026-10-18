@@ -2243,6 +2243,185 @@ integration, an LSP, and drag-to-dock panels (Decision 17 §17.4).
 
 ---
 
+# Decision 19 — Vision input (the `clip` mmproj path)
+
+## Scope
+
+`qwen35moe` text decode landed and matches the reference, so
+MiniCPM-V-4.7-35B-A3B runs — as a text model. The name says V, and the
+vision half is a *second* GGUF: `C:/models/mmproj-model-f16.gguf`, 460
+tensors, `general.architecture = "clip"`, `general.type = "mmproj"`. Nothing
+in Ultima reads that file today. This decision specifies what it would take.
+
+It is a new subsystem, not an architecture entry. Everything Ultima has
+assumed so far — one file, one token stream, causal attention — stops being
+true: two files load into one runtime, a bidirectional encoder runs over
+pixels, and its output is spliced into the residual stream in place of
+placeholder tokens.
+
+## 19.1 — What the file actually contains
+
+Read off the mmproj, not guessed:
+
+| Key | Value |
+|---|---|
+| `clip.projector_type` | `minicpmv4_7` |
+| `clip.vision.image_size` | 448 |
+| `clip.vision.patch_size` | 14 |
+| `clip.vision.embedding_length` | 1152 |
+| `clip.vision.block_count` | 27 |
+| `clip.vision.attention.head_count` | 16 (d_head 72) |
+| `clip.vision.feed_forward_length` | 4304 |
+| `clip.vision.projection_dim` | 2048 — the LM's `embedding_length` |
+| `clip.vision.projector.scale_factor` | 4 |
+| `clip.vision.max_slice_nums` | 9 |
+| `clip.vision.wa_layer_indexes` | `[6]` — where the merger is spliced in |
+| `clip.vision.image_mean` / `image_std` | `[0.5,0.5,0.5]` both |
+| `clip.use_gelu` | true |
+| `clip.vision.attention.layer_norm_epsilon` | 1e-6 |
+
+Tensors: a SigLIP-shaped ViT (`v.patch_embd` as a 4D conv kernel
+`[14,14,3,1152]`, `v.position_embd` `[1152, 4900]` = a 70×70 patch grid,
+27 blocks of `ln1 / attn_q,k,v,out / ln2 / ffn_up, ffn_down` — all with
+biases, all LayerNorm, no gating), then `v.post_ln`, then two mergers, then
+`v.tok_embd_sep [2048, 4]`. Weights are **BF16** with F32 norms and biases.
+
+## 19.2 — The one unknown, and why it blocks implementation
+
+Local llama.cpp master (`2b18470`) implements `minicpmv4_6` and **does not
+know `minicpmv4_7`**. The 4_6 path loads exactly the tensor set this file
+has — `vit_merger_*`, `mm.input_norm`, `mm.up`, `mm.down`, `n_merge` from
+`scale_factor` — so 4_6 is almost certainly the right graph. "Almost
+certainly" is not the bar this project uses for an unfamiliar architecture
+(see `spark2_5`: one wrong activation, eight ablations, fluent garbage).
+
+A second, sharper discrepancy: the **image marker convention is
+contradictory**. llama.cpp's 4_6 path wraps image embeddings in
+`<image>`/`</image>` with `<slice>`/`</slice>` per slice row (tokens 248078,
+248079, 248088, 248089 — all present in this vocab). But the LM's own
+`tokenizer.chat_template` emits `<|image_pad|>` (248056), the Qwen-VL
+convention, and never mentions `<image>`. Both token sets exist in the
+vocab. Picking wrong yields a model that answers *about an image* fluently
+and wrongly — the exact failure this project refuses to ship.
+
+**Gate on this before writing code:** find the upstream PR that adds
+`minicpmv4_7` (`gh pr list --repo ggml-org/llama.cpp --search minicpmv`,
+then `gh pr diff <n>`), and settle (a) whether 4_7 reuses the 4_6 graph and
+(b) which markers wrap the embeddings. Until both are answered, this
+decision is specification only.
+
+## 19.3 — The forward pass (from llama.cpp `models/minicpmv.cpp`)
+
+With `scale_factor = 4` the graph is the non-`is_4x` branch, and the 2×2
+merge happens **twice** — 4× spatial reduction per dimension:
+
+1. Patch-embed via the 4D conv, add `v.position_embd` rows at the patch
+   positions (bicubic-interpolated from the 70×70 grid for other sizes).
+2. ViT blocks `0..6` inclusive (`wa_layer_indexes[0] = 6`): pre-LayerNorm,
+   bidirectional MHA with q/k/v/o biases, post-LayerNorm, GELU MLP. No
+   causal mask, no RoPE, no QK-norm. Bidirectional attention is new — every
+   attention path in Ultima today is causal.
+3. **ViT merger, window attention.** Reorder tokens window-major (4 per
+   window contiguous), attend with a block-diagonal mask so each group of 4
+   sees only itself, scatter back by the inverse permutation, add residual.
+4. **ViT merger, 2×2 downsample.** Gather the 4 tokens of each 2×2 patch
+   block; keep their mean as a residual; concat them to 4608; LayerNorm
+   (`ds_ln`); MLP 4608→17216→1152 with **tanh-approximation GELU**; add the
+   mean residual.
+5. ViT blocks `7..26` over the now 4×-fewer tokens.
+6. `v.post_ln`.
+7. **Final merger.** Another 2×2 gather, concat to 4608, `mm.input_norm`,
+   MLP 4608→4608→2048 with **exact erf GELU**. No mean residual this time.
+
+Two GELU flavors in one file, and they are not interchangeable. Ultima's
+`geglu_f32` is exact erf (deliberately, for Spark-X2.5); step 4 needs the
+tanh approximation added alongside it.
+
+## 19.4 — Preprocessing
+
+`llava_uhd` slicing as specialized by `mtmd_image_preprocessor_minicpmv`:
+one 448×448 overview thumbnail first (`ov_img_first = true`), then up to
+`max_slice_nums = 9` slices on a grid chosen from the source aspect ratio,
+each resized to the patch grid. Normalize to `(x/255 - 0.5) / 0.5`, i.e.
+straight to [-1, 1]. Channel-first f32.
+
+This needs an **image decoder**, which Ultima does not have in any form.
+`stb_image.h` (public domain, single header, no build system) is the
+obvious answer under Decision 02's vendoring policy and covers PNG/JPEG/BMP.
+Resizing wants `stb_image_resize2.h` for a correct bicubic; a hand-rolled
+bilinear would be a visible quality regression on downscales this large.
+
+## 19.5 — Splicing into the LM
+
+The LM side is where this stops being self-contained:
+
+- **Embedding injection.** Prefill currently maps token ids to
+  `token_embd` rows. It needs a path that accepts precomputed f32
+  embeddings for a span of positions. That is a change to the prefill seam,
+  not an addition beside it.
+- **mRoPE.** `rope.dimension_sections = [11,11,10,0]` with
+  `section_order = "zyxt"`. Text collapses this to plain RoPE because all
+  three channels carry the same position — which is why text works today.
+  Images do **not** collapse: the t/y/x channels carry distinct per-patch
+  coordinates. The real mRoPE has to exist before an image is positioned
+  correctly, and a wrong mRoPE is another fluent-wrong failure.
+- **`v.tok_embd_sep [2048, 4]`.** Four learned embeddings, already in the
+  LM's width, spliced around slices. Which of the four goes where is part of
+  the §19.2 marker question.
+- **Recurrent layers.** 30 of 40 blocks are delta-net. `supports_prefix_reuse()`
+  already reports false for hybrids, so an image turn re-prefills from zero.
+  Correct, and worth stating: there is no image-embedding cache to be had
+  here, unlike a pure-attention VLM.
+- **Server + template.** `/v1/chat/completions` needs `image_url` content
+  parts (base64 and file path), and the chat-template renderer needs to
+  handle array-valued `content` — today it assumes a string.
+
+## 19.6 — Order of work
+
+Each step is verifiable on its own, which is the only reason this is
+tractable:
+
+1. Resolve §19.2. No code before this.
+2. `stb_image` + `stb_image_resize2` vendored; `ultima --inspect` on an
+   image prints dimensions and the slice plan. Pure CPU, no model.
+3. mmproj loader: a second `LoadedModel`, `clip` config parse, BF16 tensor
+   resolution. `ultima --inspect` on the mmproj prints the ViT shape.
+4. BF16 is already covered — `matvec_bf16_f32` and its threaded form exist
+   in `weight_dispatch.cpp` (`MODELS.md` said otherwise and was stale;
+   fixed). Nothing to do here, which removes the one dtype risk.
+5. ViT forward with a bidirectional attention path and both GELUs, diffed
+   per-tensor against `llama-eval-callback` on the mmproj. The reference
+   `cb()` names in §19.3 are the diff targets.
+6. Both mergers, then the projector. Output: 2048-wide embeddings per
+   merged patch.
+7. mRoPE for 3 position channels; verify text output is unchanged
+   (it must be — same-value channels must still collapse).
+8. Prefill embedding-injection seam, markers, `tok_embd_sep`.
+9. Server content parts + template arrays.
+10. End-to-end diff against `llama-mtmd-cli` on a fixed image at `--temp 0`.
+
+Step 10 needs the `mtmd` target built — the local llama.cpp build has only
+`llama-completion`, `llama-eval-callback` and `llama-tokenize`, and the
+prebuilt `llama-b10988` predates this projector entirely.
+
+## 19.7 — Cross-backend note
+
+The ViT is the first genuinely compute-bound part of this runtime: 27 blocks
+of dense bidirectional attention over ~1000 patches, all BF16, with no
+autoregressive dependency. It is embarrassingly parallel and it is the one
+piece where a Vulkan backend (v0.2) would pay off immediately on the
+reference box's iGPU — unlike decode, which is bandwidth-bound and shares
+the APU's single memory bus. Worth keeping the ViT forward behind the same
+dispatch seam as the LM kernels so that port is a backend swap.
+
+## 19.8 — Status
+
+**Specified, not decided.** §19.2 is an open question with two concrete
+sub-questions, and the answer changes §19.3 and §19.5. Nothing in §19.6
+step 2 onward should start until it is closed.
+
+---
+
 ## Future decisions (not written yet)
 
 - Decision 06 — Model architecture layer (`IModel`, Qwen2Model, Qwen3Model dispatch) — required before M4
